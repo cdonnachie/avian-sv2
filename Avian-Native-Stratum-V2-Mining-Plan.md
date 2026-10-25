@@ -265,15 +265,22 @@ better found in solo mode than in pooled mode will be found in solo mode.
 
 ### Where the payout address comes from
 
-The natural carrier is `user_identity` in `OpenStandardMiningChannel`. Treat
-that as unsettled: it is actively churning upstream, with a TLV truncation to
-32 bytes landed as an acknowledged temporary patch and the maintainers saying
-it is mutated through the channel bootstrap flow and needs a deeper look. An
-Avian address is 34 characters and would not survive a 32-byte cap.
+The natural carrier is `user_identity` in `OpenStandardMiningChannel`, and it
+fits: that field is `STR0_255` and an Avian address is 34 characters.
 
-Confirm it before building on it. The fallback is an account mapping held by
-the pool, which is more work and insulates the operator from an upstream
-redesign.
+An earlier draft of this section said the 32-byte truncation landing upstream
+would not hold an address. It would not, but it does not apply here. The
+maintainers were explicit that it "only affects identities parsed via the TLV,
+not the usual channel-opening identification, which still supports up to 255
+bytes", and the TLV path belongs to extension `0x0002`, which this project
+does not use.
+
+What remains true is the churn: `user_identity` is described upstream as
+mutated through the channel bootstrap flow and in need of a deeper look, and
+that issue is open. So build on the channel-opening field, and watch the issue
+rather than the truncation. The fallback, if it moves, is an account mapping
+held by the pool, which is more work and insulates the operator from an
+upstream redesign.
 
 ### Decided: solo over Stratum v2 only
 
