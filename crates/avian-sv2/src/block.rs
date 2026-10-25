@@ -25,6 +25,23 @@ pub fn sha256d(parts: &[&[u8]]) -> [u8; 32] {
     sha256::Hash::hash(&first).to_byte_array()
 }
 
+/// Folds a merkle path onto a leaf.
+///
+/// The coinbase is always the leftmost leaf, so every sibling in the path is a
+/// right-hand one and the order never varies. `solution_check.cpp` does the
+/// same thing with the same orientation.
+///
+/// In the library because both ends need it: a pool folding the path onto a
+/// coinbase it built, and a miner on an extended channel folding it onto one
+/// it assembled itself.
+pub fn merkle_root(leaf: &[u8; 32], path: &[[u8; 32]]) -> [u8; 32] {
+    let mut current = *leaf;
+    for sibling in path {
+        current = sha256d(&[&current, sibling]);
+    }
+    current
+}
+
 /// The 80 bytes a proof-of-work hash is computed over.
 pub fn header(
     version: u32,
@@ -99,6 +116,23 @@ mod tests {
         assert_eq!(
             crate::wire::hex(&sha256d(&[b""])),
             "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456"
+        );
+    }
+
+    #[test]
+    fn an_empty_path_leaves_the_leaf_as_the_root() {
+        let leaf = [7u8; 32];
+        assert_eq!(merkle_root(&leaf, &[]), leaf);
+    }
+
+    #[test]
+    fn the_leaf_is_always_on_the_left() {
+        let leaf = [1u8; 32];
+        let sibling = [2u8; 32];
+        assert_eq!(
+            merkle_root(&leaf, &[sibling]),
+            sha256d(&[&leaf, &sibling]),
+            "the sibling must be concatenated on the right"
         );
     }
 

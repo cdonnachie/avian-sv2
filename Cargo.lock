@@ -97,6 +97,8 @@ dependencies = [
 name = "avian-tdp"
 version = "0.1.0"
 dependencies = [
+ "avian-pow",
+ "avian-regtest",
  "avian-sv2",
  "binary_sv2",
  "codec_sv2",

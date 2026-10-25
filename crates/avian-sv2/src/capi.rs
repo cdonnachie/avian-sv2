@@ -73,6 +73,12 @@ pub struct AvianMiningJob {
     pub ntime_max: c_uint,
     pub nbits: c_uint,
     pub share_target: [u8; 32],
+    /// 1 on an extended channel, where the miner assembles the coinbase
+    /// itself and `merkle_root` is not set. 0 on a standard one.
+    pub extended: c_int,
+    /// How many extranonce bytes the miner may roll, on an extended channel.
+    /// 0 on a standard one.
+    pub extranonce_size: c_uint,
 }
 
 impl AvianMiningJob {
@@ -89,6 +95,8 @@ impl AvianMiningJob {
             ntime_max: 0,
             nbits: 0,
             share_target: [0; 32],
+            extended: 0,
+            extranonce_size: 0,
         }
     }
 
@@ -105,6 +113,11 @@ impl AvianMiningJob {
             ntime_max: job.ntime_max,
             nbits: job.nbits,
             share_target: job.share_target,
+            extended: job.is_extended() as c_int,
+            extranonce_size: job
+                .extended
+                .as_ref()
+                .map_or(0, |e| e.extranonce_size as c_uint),
         }
     }
 }
@@ -167,6 +180,13 @@ pub struct AvianSv2ClientConfig {
     pub backoff_max_ms: c_uint,
     /// 0 retries forever, which is what a miner wants.
     pub max_reconnects: c_uint,
+    /// Non-zero for an extended channel, where the miner assembles the
+    /// coinbase itself and can see what it is committing to. Zero for a
+    /// standard one, where it takes the pool's word for a merkle root.
+    pub extended: c_int,
+    /// The least extranonce to ask for on an extended channel. 0 for the
+    /// default of 8.
+    pub min_extranonce_size: c_uint,
 }
 
 /// The opaque handle. A `MiningClient` plus the last error, since a C caller
@@ -234,6 +254,10 @@ fn build_config(raw: &AvianSv2ClientConfig) -> Result<ClientConfig, &'static str
         backoff.max_attempts = Some(raw.max_reconnects);
     }
     config.reconnect = backoff;
+    config.extended = raw.extended != 0;
+    if raw.min_extranonce_size > 0 {
+        config.min_extranonce_size = raw.min_extranonce_size.min(u16::MAX as c_uint) as u16;
+    }
     Ok(config)
 }
 
@@ -451,6 +475,160 @@ pub unsafe extern "C" fn avian_sv2_client_submit(
     }
 }
 
+/// Submits a share for an extended job, naming the extranonce that was hashed.
+///
+/// On an extended channel the merkle root depends on the extranonce, so the
+/// pool has to be told which one: it reassembles the same coinbase and folds
+/// the same path. Pass `extranonce_len` 0 on a standard channel, or use
+/// [`avian_sv2_client_submit`].
+///
+/// # Safety
+/// `client` must be a live handle, `job` a job from
+/// [`avian_sv2_client_poll`], and `extranonce` must point to `extranonce_len`
+/// readable bytes or be null when that is zero.
+#[no_mangle]
+pub unsafe extern "C" fn avian_sv2_client_submit_extended(
+    client: *mut AvianSv2Client,
+    job: *const AvianMiningJob,
+    nonce: c_uint,
+    ntime: c_uint,
+    extranonce: *const u8,
+    extranonce_len: usize,
+) -> c_int {
+    if client.is_null() || job.is_null() || (extranonce.is_null() && extranonce_len > 0) {
+        return AVIAN_SV2_INVALID_ARGUMENT;
+    }
+    let handle = &mut *client;
+    let bytes = if extranonce_len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(extranonce, extranonce_len).to_vec()
+    };
+    let Some(known) = handle
+        .client
+        .job((*job).job_id)
+        .cloned()
+        .filter(|known| known.generation == (*job).generation && known.job_id == (*job).job_id)
+    else {
+        handle.set_error("that job is not current on this connection");
+        return AVIAN_SV2_INVALID_ARGUMENT;
+    };
+    match catch_unwind(AssertUnwindSafe(|| {
+        handle.client.submit_with(&known, nonce, ntime, &bytes)
+    })) {
+        Ok(Ok(_)) => AVIAN_SV2_OK,
+        Ok(Err(e)) => {
+            handle.set_error(&e.to_string());
+            if handle.client.is_connected() {
+                AVIAN_SV2_INVALID_ARGUMENT
+            } else {
+                AVIAN_SV2_DISCONNECTED
+            }
+        }
+        Err(_) => {
+            handle.set_error("panicked while submitting");
+            AVIAN_SV2_ERROR
+        }
+    }
+}
+
+/// The 80 header bytes for a job at an extranonce, ntime and nonce.
+///
+/// Works for both kinds of channel: on a standard one the extranonce is
+/// ignored and the pool's merkle root is used, on an extended one the coinbase
+/// is assembled and the path folded. Does not hash.
+///
+/// # Safety
+/// `client` must be a live handle, and `out` must point to 80 writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn avian_sv2_client_job_header(
+    client: *mut AvianSv2Client,
+    job_id: c_uint,
+    extranonce: *const u8,
+    extranonce_len: usize,
+    ntime: c_uint,
+    nonce: c_uint,
+    out: *mut u8,
+) -> c_int {
+    if client.is_null() || out.is_null() || (extranonce.is_null() && extranonce_len > 0) {
+        return AVIAN_SV2_INVALID_ARGUMENT;
+    }
+    let handle = &mut *client;
+    let bytes = if extranonce_len == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(extranonce, extranonce_len)
+    };
+    let Some(job) = handle.client.job(job_id) else {
+        handle.set_error("no such job on this connection");
+        return AVIAN_SV2_INVALID_ARGUMENT;
+    };
+    match job.header_for(bytes, ntime, nonce) {
+        Some(header) => {
+            std::ptr::copy_nonoverlapping(header.as_ptr(), out, header.len());
+            AVIAN_SV2_OK
+        }
+        None => {
+            handle.set_error("the extranonce is the wrong length for this channel");
+            AVIAN_SV2_INVALID_ARGUMENT
+        }
+    }
+}
+
+/// The coinbase an extended job commits to, without witness.
+///
+/// This is what extended channels are for: a miner can read the outputs it is
+/// committing to instead of taking the pool's word for a merkle root. Writes
+/// at most `capacity` bytes and sets `*written` to the full length, so a
+/// caller can size a buffer by calling once with `capacity` 0.
+///
+/// # Safety
+/// `client` must be a live handle, `written` must be writable, and `out` must
+/// point to `capacity` writable bytes or be null when that is zero.
+#[no_mangle]
+pub unsafe extern "C" fn avian_sv2_client_job_coinbase(
+    client: *mut AvianSv2Client,
+    job_id: c_uint,
+    extranonce: *const u8,
+    extranonce_len: usize,
+    out: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> c_int {
+    if client.is_null()
+        || written.is_null()
+        || (out.is_null() && capacity > 0)
+        || (extranonce.is_null() && extranonce_len > 0)
+    {
+        return AVIAN_SV2_INVALID_ARGUMENT;
+    }
+    let handle = &mut *client;
+    let bytes = if extranonce_len == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(extranonce, extranonce_len)
+    };
+    let Some(job) = handle.client.job(job_id) else {
+        handle.set_error("no such job on this connection");
+        return AVIAN_SV2_INVALID_ARGUMENT;
+    };
+    let Some(extended) = job.extended.as_ref() else {
+        handle.set_error("a standard channel's coinbase is the pool's and is not sent");
+        return AVIAN_SV2_INVALID_ARGUMENT;
+    };
+    let Some(coinbase) = extended.coinbase(bytes) else {
+        handle.set_error("the extranonce is the wrong length for this channel");
+        return AVIAN_SV2_INVALID_ARGUMENT;
+    };
+    *written = coinbase.len();
+    if capacity >= coinbase.len() {
+        std::ptr::copy_nonoverlapping(coinbase.as_ptr(), out, coinbase.len());
+        AVIAN_SV2_OK
+    } else {
+        AVIAN_SV2_INVALID_ARGUMENT
+    }
+}
+
 /// Closes the connection, so the next poll reconnects. For failover, and for
 /// a test that wants to watch a real reconnection.
 ///
@@ -562,6 +740,36 @@ impl AvianSv2Client {
 // Keeps the unused-import warning away on a build with no tests.
 const _: Option<*const c_void> = None;
 
+/// Checks that a C caller's header agrees with this module about struct
+/// layout.
+///
+/// The header is written by hand. A field added here in the wrong place would
+/// make every member after it read the wrong bytes on the C side, and a job
+/// whose `ntime` or `share_target` silently shifted would mine garbage rather
+/// than fail — which is the failure shape this project keeps running into. So
+/// a C caller passes `sizeof` and `offsetof` once at startup and finds out
+/// immediately.
+///
+/// Two structs and one offset each is enough: the offset catches a field
+/// inserted anywhere before it, and the size catches one appended after.
+#[no_mangle]
+pub extern "C" fn avian_sv2_abi_check(
+    job_size: usize,
+    job_extranonce_size_offset: usize,
+    event_size: usize,
+    event_message_offset: usize,
+) -> c_int {
+    let ok = job_size == std::mem::size_of::<AvianMiningJob>()
+        && job_extranonce_size_offset == std::mem::offset_of!(AvianMiningJob, extranonce_size)
+        && event_size == std::mem::size_of::<AvianSv2Event>()
+        && event_message_offset == std::mem::offset_of!(AvianSv2Event, message);
+    if ok {
+        AVIAN_SV2_OK
+    } else {
+        AVIAN_SV2_ERROR
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +813,8 @@ mod tests {
             backoff_initial_ms: 0,
             backoff_max_ms: 0,
             max_reconnects: 1,
+            extended: 0,
+            min_extranonce_size: 0,
         };
         let mut status = AVIAN_SV2_OK;
         let handle = unsafe { avian_sv2_client_connect(&config, &mut status) };

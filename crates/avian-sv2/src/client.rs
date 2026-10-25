@@ -20,12 +20,16 @@ use common_messages_sv2::{
     MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
 };
 use mining_sv2::{
-    OpenStandardMiningChannel, SubmitSharesStandard, CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL,
+    OpenExtendedMiningChannel, OpenStandardMiningChannel, SubmitSharesExtended,
+    SubmitSharesStandard, CHANNEL_BIT_OPEN_EXTENDED_MINING_CHANNEL,
+    CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL, CHANNEL_BIT_SUBMIT_SHARES_EXTENDED,
     CHANNEL_BIT_SUBMIT_SHARES_STANDARD, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
-    MESSAGE_TYPE_NEW_MINING_JOB, MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
-    MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
-    MESSAGE_TYPE_SET_TARGET, MESSAGE_TYPE_SUBMIT_SHARES_ERROR, MESSAGE_TYPE_SUBMIT_SHARES_STANDARD,
-    MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+    MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, MESSAGE_TYPE_NEW_MINING_JOB,
+    MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+    MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
+    MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MESSAGE_TYPE_SET_TARGET,
+    MESSAGE_TYPE_SUBMIT_SHARES_ERROR, MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+    MESSAGE_TYPE_SUBMIT_SHARES_STANDARD, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
 };
 use secp256k1::XOnlyPublicKey;
 
@@ -65,6 +69,17 @@ pub struct ClientConfig {
     pub max_target: [u8; 32],
     pub timeout: Duration,
     pub reconnect: Backoff,
+    /// Which kind of channel to open.
+    ///
+    /// Extended by default, and deliberately: on a standard channel the pool
+    /// hands down a finished merkle root and a miner can only take its word
+    /// for what is in the block. On an extended channel it assembles the
+    /// coinbase itself and can see what it is committing to. For solo mining
+    /// that verification is the point.
+    pub extended: bool,
+    /// The least extranonce a miner wants on an extended channel. The pool may
+    /// give more and will refuse the channel if it cannot give this much.
+    pub min_extranonce_size: u16,
 }
 
 impl ClientConfig {
@@ -78,6 +93,8 @@ impl ClientConfig {
             max_target: [0xff; 32],
             timeout: Duration::from_secs(30),
             reconnect: Backoff::default(),
+            extended: true,
+            min_extranonce_size: 8,
         }
     }
 }
@@ -102,19 +119,119 @@ pub struct MiningJob {
     pub ntime_max: u32,
     pub nbits: u32,
     pub share_target: [u8; 32],
+    /// On an extended channel, what the miner needs to build the coinbase and
+    /// the merkle root itself. `None` on a standard channel, where
+    /// `merkle_root` is all the pool gave.
+    pub extended: Option<ExtendedWork>,
+}
+
+/// The coinbase an extended channel hands down, in two halves.
+///
+/// Having the suffix is the difference that matters: every output the block
+/// commits to is in it, so a miner can check it is being paid rather than
+/// taking the pool's word for a merkle root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendedWork {
+    pub coinbase_prefix: Vec<u8>,
+    pub coinbase_suffix: Vec<u8>,
+    pub merkle_path: Vec<[u8; 32]>,
+    /// The pool's half, which goes before the miner's.
+    pub extranonce_prefix: Vec<u8>,
+    /// How many bytes the miner may roll.
+    pub extranonce_size: usize,
+}
+
+impl ExtendedWork {
+    /// The coinbase the miner is committing to, without witness, which is what
+    /// its txid hashes.
+    pub fn coinbase(&self, extranonce: &[u8]) -> Option<Vec<u8>> {
+        if extranonce.len() != self.extranonce_size {
+            return None;
+        }
+        let mut out = Vec::with_capacity(
+            self.coinbase_prefix.len()
+                + self.extranonce_prefix.len()
+                + extranonce.len()
+                + self.coinbase_suffix.len(),
+        );
+        out.extend_from_slice(&self.coinbase_prefix);
+        out.extend_from_slice(&self.extranonce_prefix);
+        out.extend_from_slice(extranonce);
+        out.extend_from_slice(&self.coinbase_suffix);
+        Some(out)
+    }
+
+    /// Whether a script appears among the outputs this block commits to.
+    ///
+    /// What extended channels are for: a solo miner can confirm its own payout
+    /// script is really in the coinbase, and a pool saying otherwise is caught
+    /// rather than believed.
+    pub fn commits_to_script(&self, script: &[u8]) -> bool {
+        !script.is_empty()
+            && self
+                .coinbase_suffix
+                .windows(script.len())
+                .any(|window| window == script)
+    }
+
+    /// Whether a txid is among the merkle path, meaning that transaction is in
+    /// this block.
+    ///
+    /// The path holds the siblings needed to fold the coinbase to the root. In
+    /// a block of two transactions the single sibling *is* the other
+    /// transaction's txid, so a miner can confirm a specific transaction is
+    /// included. In a larger block the siblings are interior nodes and this
+    /// answers only for those that happen to be leaves, which is why it is
+    /// phrased as a question about the path rather than about the block.
+    pub fn path_contains(&self, txid: &[u8; 32]) -> bool {
+        self.merkle_path.iter().any(|hash| hash == txid)
+    }
 }
 
 impl MiningJob {
-    /// The 80 bytes to hash. Does not hash them.
-    pub fn header(&self, ntime: u32, nonce: u32) -> [u8; 80] {
-        block::header(
+    /// The merkle root for an extranonce.
+    ///
+    /// On a standard channel the pool chose the whole coinbase and this is the
+    /// root it sent, whatever is passed. On an extended channel the miner
+    /// assembles the coinbase itself, so the root depends on the extranonce
+    /// and is computed here.
+    pub fn merkle_root_for(&self, extranonce: &[u8]) -> Option<[u8; 32]> {
+        match &self.extended {
+            None => Some(self.merkle_root),
+            Some(extended) => {
+                let coinbase = extended.coinbase(extranonce)?;
+                let txid = block::sha256d(&[&coinbase]);
+                Some(block::merkle_root(&txid, &extended.merkle_path))
+            }
+        }
+    }
+
+    /// The 80 bytes to hash, for an extended job's extranonce. Does not hash
+    /// them.
+    pub fn header_for(&self, extranonce: &[u8], ntime: u32, nonce: u32) -> Option<[u8; 80]> {
+        Some(block::header(
             self.version,
             &self.prev_hash,
-            &self.merkle_root,
+            &self.merkle_root_for(extranonce)?,
             ntime,
             self.nbits,
             nonce,
-        )
+        ))
+    }
+
+    /// The 80 bytes to hash on a standard channel. Does not hash them.
+    ///
+    /// On an extended job this uses an all-zero extranonce, which is a valid
+    /// one but almost certainly not the one a miner means; use
+    /// [`Self::header_for`] there.
+    pub fn header(&self, ntime: u32, nonce: u32) -> [u8; 80] {
+        let extranonce = vec![0u8; self.extended.as_ref().map_or(0, |e| e.extranonce_size)];
+        self.header_for(&extranonce, ntime, nonce)
+            .expect("an all-zero extranonce of the right length is always valid")
+    }
+
+    pub fn is_extended(&self) -> bool {
+        self.extended.is_some()
     }
 
     pub fn meets_share_target(&self, hash: &[u8; 32]) -> bool {
@@ -132,6 +249,12 @@ impl MiningJob {
 }
 
 /// What a `poll` produced.
+///
+/// The job variant is much larger than the rest now that it carries the
+/// coinbase halves, and boxing it would move an allocation onto the path a
+/// miner walks most: a job arrives on every tip change and refresh, while the
+/// other variants are rare.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Event {
     /// A job is active and minable. Anything held from an earlier generation
@@ -220,6 +343,8 @@ struct Session {
     reader: ConnectionReader,
     writer: Arc<Mutex<ConnectionWriter>>,
     channel_id: u32,
+    extranonce_prefix: Vec<u8>,
+    extranonce_size: usize,
 }
 
 pub struct MiningClient {
@@ -233,6 +358,8 @@ pub struct MiningClient {
     nbits: u32,
     jobs: HashMap<u32, MiningJob>,
     active: Option<u32>,
+    extranonce_prefix: Vec<u8>,
+    extranonce_size: usize,
     trace: VecDeque<Trace>,
     /// One message can produce two events, when a tip change invalidates the
     /// old jobs and activates a new one. The second waits here.
@@ -253,6 +380,8 @@ impl MiningClient {
             nbits: 0,
             jobs: HashMap::new(),
             active: None,
+            extranonce_prefix: Vec::new(),
+            extranonce_size: 0,
             trace: VecDeque::new(),
             pending: None,
         };
@@ -355,6 +484,22 @@ impl MiningClient {
     /// bits 16-23 are the algorithm, so changing them moves the share to the
     /// other algorithm's proof-of-work limit.
     pub fn submit(&mut self, job: &MiningJob, nonce: u32, ntime: u32) -> Result<u32> {
+        self.submit_with(job, nonce, ntime, &[])
+    }
+
+    /// Submits a share for an extended job, naming the extranonce that was
+    /// hashed.
+    ///
+    /// On an extended channel the merkle root depends on the extranonce, so
+    /// the pool has to be told which one: it reassembles the same coinbase and
+    /// folds the same path. Pass an empty slice on a standard channel.
+    pub fn submit_with(
+        &mut self,
+        job: &MiningJob,
+        nonce: u32,
+        ntime: u32,
+        extranonce: &[u8],
+    ) -> Result<u32> {
         if job.generation != self.generation {
             return Err(Error::Protocol(format!(
                 "job {} is from connection {} and this is connection {}; work does not survive \
@@ -380,8 +525,23 @@ impl MiningClient {
                 job.ntime_min, job.ntime_max
             )));
         }
+        if let Some(extended) = &job.extended {
+            if extranonce.len() != extended.extranonce_size {
+                return Err(Error::Protocol(format!(
+                    "this channel's extranonce is {} bytes and {} were given",
+                    extended.extranonce_size,
+                    extranonce.len()
+                )));
+            }
+        } else if !extranonce.is_empty() {
+            return Err(Error::Protocol(
+                "a standard channel's coinbase is the pool's, so there is no extranonce to \
+                 submit"
+                    .into(),
+            ));
+        }
         let version = job.version;
-        self.submit_exact(job.job_id, nonce, ntime, version)
+        self.submit_exact_with(job.job_id, nonce, ntime, version, extranonce)
     }
 
     /// Submits exactly these fields, checking none of them.
@@ -395,30 +555,59 @@ impl MiningClient {
         ntime: u32,
         version: u32,
     ) -> Result<u32> {
+        let extranonce = vec![0u8; self.extranonce_size];
+        self.submit_exact_with(job_id, nonce, ntime, version, &extranonce)
+    }
+
+    /// [`Self::submit_exact`] with an explicit extranonce.
+    pub fn submit_exact_with(
+        &mut self,
+        job_id: u32,
+        nonce: u32,
+        ntime: u32,
+        version: u32,
+        extranonce: &[u8],
+    ) -> Result<u32> {
         let session = self
             .session
             .as_ref()
             .ok_or_else(|| Error::Protocol("not connected".into()))?;
         self.sequence += 1;
         let sequence_number = self.sequence;
-        let message = SubmitSharesStandard {
-            channel_id: session.channel_id,
-            sequence_number,
-            job_id,
-            nonce,
-            ntime,
-            version,
-        };
-        session
+        let mut writer = session
             .writer
             .lock()
-            .map_err(|_| Error::Protocol("the client's writer is poisoned".into()))?
-            .send(
+            .map_err(|_| Error::Protocol("the client's writer is poisoned".into()))?;
+        if session.extranonce_size > 0 {
+            writer.send(
+                EXT_CORE,
+                MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+                CHANNEL_BIT_SUBMIT_SHARES_EXTENDED,
+                SubmitSharesExtended {
+                    channel_id: session.channel_id,
+                    sequence_number,
+                    job_id,
+                    nonce,
+                    ntime,
+                    version,
+                    extranonce: extranonce.try_into()?,
+                },
+            )?;
+        } else {
+            writer.send(
                 EXT_CORE,
                 MESSAGE_TYPE_SUBMIT_SHARES_STANDARD,
                 CHANNEL_BIT_SUBMIT_SHARES_STANDARD,
-                message,
+                SubmitSharesStandard {
+                    channel_id: session.channel_id,
+                    sequence_number,
+                    job_id,
+                    nonce,
+                    ntime,
+                    version,
+                },
             )?;
+        }
         Ok(sequence_number)
     }
 
@@ -477,6 +666,8 @@ impl MiningClient {
         }
         self.sequence = 0;
         self.invalidate();
+        self.extranonce_prefix = session.extranonce_prefix.clone();
+        self.extranonce_size = session.extranonce_size;
         self.session = Some(session);
         let generation = self.generation;
         self.record(Trace::Connected { generation });
@@ -490,6 +681,8 @@ impl MiningClient {
             reader,
             writer,
             channel_id: 0,
+            extranonce_prefix: Vec::new(),
+            extranonce_size: 0,
         };
         Self::setup_connection(&mut session, trace)?;
         Self::request_extensions(&mut session, trace)?;
@@ -666,18 +859,35 @@ impl MiningClient {
     ) -> Result<()> {
         let identity = config.user_identity.clone();
         let max_target = config.max_target;
-        Self::send(
-            session,
-            EXT_CORE,
-            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
-            CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL,
-            OpenStandardMiningChannel {
-                request_id: 1,
-                user_identity: identity.as_bytes().try_into()?,
-                nominal_hash_rate: config.nominal_hash_rate,
-                max_target: U256::try_from(max_target.as_slice())?,
-            },
-        )?;
+        if config.extended {
+            Self::send(
+                session,
+                EXT_CORE,
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+                CHANNEL_BIT_OPEN_EXTENDED_MINING_CHANNEL,
+                OpenExtendedMiningChannel {
+                    request_id: 1,
+                    user_identity: identity.as_bytes().try_into()?,
+                    nominal_hash_rate: config.nominal_hash_rate,
+                    max_target: U256::try_from(max_target.as_slice())?,
+                    min_extranonce_size: config.min_extranonce_size,
+                },
+            )?;
+        } else {
+            Self::send(
+                session,
+                EXT_CORE,
+                MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
+                CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL,
+                OpenStandardMiningChannel {
+                    request_id: 1,
+                    user_identity: identity.as_bytes().try_into()?,
+                    nominal_hash_rate: config.nominal_hash_rate,
+                    max_target: U256::try_from(max_target.as_slice())?,
+                },
+            )?;
+        }
+
         let mut frame = session.reader.recv()?;
         match (frame.extension_type, frame.msg_type) {
             (EXT_CORE, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS) => {
@@ -689,14 +899,32 @@ impl MiningClient {
                 });
                 Ok(())
             }
+            (EXT_CORE, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS) => {
+                let success: mining_sv2::OpenExtendedMiningChannelSuccess =
+                    from_bytes(&mut frame.payload)?;
+                session.channel_id = success.channel_id;
+                session.extranonce_prefix = success.extranonce_prefix.as_ref().to_vec();
+                session.extranonce_size = success.extranonce_size as usize;
+                if session.extranonce_size == 0 {
+                    return Err(Error::Protocol(
+                        "an extended channel with no extranonce for the miner gives it no \
+                         search space"
+                            .into(),
+                    ));
+                }
+                trace.push(Trace::OpenSuccess {
+                    channel_id: success.channel_id,
+                });
+                Ok(())
+            }
             (EXT_CORE, MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR) => {
                 let error: mining_sv2::OpenMiningChannelError = from_bytes(&mut frame.payload)?;
                 let code = String::from_utf8_lossy(error.error_code.as_ref()).into_owned();
                 trace.push(Trace::OpenError(code.clone()));
-                Err(Error::Refused(format!("OpenStandardMiningChannel: {code}")))
+                Err(Error::Refused(format!("OpenMiningChannel: {code}")))
             }
             _ => Err(Error::Protocol(format!(
-                "unexpected reply to OpenStandardMiningChannel: {}",
+                "unexpected reply to a channel open: {}",
                 frame.describe()
             ))),
         }
@@ -712,6 +940,71 @@ impl MiningClient {
                     job.share_target = self.share_target;
                 }
                 self.record(Trace::SetTarget);
+                Ok(Event::Idle)
+            }
+            (EXT_CORE, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB) => {
+                let job: mining_sv2::NewExtendedMiningJob = from_bytes(&mut frame.payload)?;
+                if job.version_rolling_allowed {
+                    // Avian keeps the algorithm in nVersion bits 16-23, so a
+                    // pool offering to let them be rolled has offered
+                    // something that cannot be honoured safely.
+                    return Err(Error::Protocol(
+                        "the pool set version_rolling_allowed, and Avian's nVersion carries the \
+                         algorithm in bits 16-23"
+                            .into(),
+                    ));
+                }
+                let min_ntime: Sv2Option<u32> = job.min_ntime;
+                let start = min_ntime.into_inner();
+                let future = start.is_none();
+                let pow_type = avian::pow_type_from_version(job.version)?;
+                if pow_type != self.config.pow {
+                    return Err(Error::Protocol(format!(
+                        "a {pow_type} job arrived on a {} channel",
+                        self.config.pow
+                    )));
+                }
+                let merkle_path: Vec<[u8; 32]> = job
+                    .merkle_path
+                    .into_inner()
+                    .into_iter()
+                    .map(|hash| {
+                        let mut out = [0u8; 32];
+                        out.copy_from_slice(hash.as_ref());
+                        out
+                    })
+                    .collect();
+                let extended = ExtendedWork {
+                    coinbase_prefix: job.coinbase_tx_prefix.as_ref().to_vec(),
+                    coinbase_suffix: job.coinbase_tx_suffix.as_ref().to_vec(),
+                    merkle_path,
+                    extranonce_prefix: self.extranonce_prefix.clone(),
+                    extranonce_size: self.extranonce_size,
+                };
+                self.jobs.insert(
+                    job.job_id,
+                    MiningJob {
+                        job_id: job.job_id,
+                        generation: self.generation,
+                        pow_type,
+                        version: job.version,
+                        prev_hash: self.prev_hash.unwrap_or([0u8; 32]),
+                        // An extended job has no single merkle root: it
+                        // depends on the extranonce the miner picks. Computed
+                        // by MiningJob::merkle_root when it does.
+                        merkle_root: [0u8; 32],
+                        ntime: start.unwrap_or(0),
+                        ntime_min: start.unwrap_or(0),
+                        ntime_max: 0,
+                        nbits: self.nbits,
+                        share_target: self.share_target,
+                        extended: Some(extended),
+                    },
+                );
+                self.record(Trace::NewMiningJob {
+                    job_id: job.job_id,
+                    future,
+                });
                 Ok(Event::Idle)
             }
             (EXT_CORE, MESSAGE_TYPE_NEW_MINING_JOB) => {
@@ -748,6 +1041,7 @@ impl MiningClient {
                         ntime_max: 0,
                         nbits: self.nbits,
                         share_target: self.share_target,
+                        extended: None,
                     },
                 );
                 self.record(Trace::NewMiningJob {

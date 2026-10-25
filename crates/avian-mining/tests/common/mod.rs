@@ -127,6 +127,11 @@ impl Rig {
         config.pool_authority = Some(self.pool_authority);
         config.user_identity = format!("{}.test-rig", worker_address());
         config.timeout = Duration::from_secs(30);
+        // Standard, because the tests that predate extended channels are
+        // about standard ones and should keep testing those. The library
+        // default is extended, which is what a solo miner should want; the
+        // tests in extended.rs opt back in.
+        config.extended = false;
         config.reconnect = Backoff {
             initial: Duration::from_millis(50),
             max: Duration::from_millis(500),

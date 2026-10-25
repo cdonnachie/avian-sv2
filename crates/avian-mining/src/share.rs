@@ -85,6 +85,9 @@ pub enum Refusal {
     TooManyShares,
     /// Too many invalid submissions; the channel is being dropped.
     TooManyInvalidShares,
+    /// An extranonce of the wrong length for the channel, or one sent on a
+    /// standard channel where the pool chose the whole coinbase.
+    InvalidExtranonce,
 }
 
 impl Refusal {
@@ -100,6 +103,7 @@ impl Refusal {
             Refusal::PowUnavailable => "pow-unavailable",
             Refusal::TooManyShares => "too-many-shares",
             Refusal::TooManyInvalidShares => "too-many-invalid-shares",
+            Refusal::InvalidExtranonce => "invalid-extranonce",
         }
     }
 }
@@ -118,13 +122,17 @@ pub enum Outcome {
     Refused(Refusal),
 }
 
-/// A submission, in the fields `SubmitSharesStandard` carries.
-#[derive(Debug, Clone, Copy)]
+/// A submission, in the fields `SubmitSharesStandard` and
+/// `SubmitSharesExtended` carry.
+#[derive(Debug, Clone)]
 pub struct Submission {
     pub job_id: u32,
     pub nonce: u32,
     pub ntime: u32,
     pub version: u32,
+    /// The miner's half of the extranonce, on an extended channel. Empty on a
+    /// standard one, where the pool chose the whole coinbase.
+    pub extranonce: Vec<u8>,
 }
 
 /// Validates a share against the job it names.
@@ -151,10 +159,18 @@ pub fn validate(
         return Outcome::Refused(Refusal::InvalidNtime);
     }
 
+    // On an extended channel this is where the miner's extranonce enters: the
+    // pool reassembles the coinbase the miner hashed and folds the same path,
+    // so a submission that named a different extranonce produces a different
+    // root and will simply fail the target.
+    let merkle_root = match job.merkle_root(&submission.extranonce) {
+        Ok(root) => root,
+        Err(_) => return Outcome::Refused(Refusal::InvalidExtranonce),
+    };
     let header = block::header(
         job.version,
         &job.prev_hash,
-        &job.merkle_root,
+        &merkle_root,
         submission.ntime,
         job.nbits,
         submission.nonce,
@@ -184,13 +200,15 @@ mod tests {
             version: 0x3200_0000,
             prev_hash: [0x11; 32],
             nbits: 0x207f_ffff,
-            merkle_root: [0x22; 32],
             window: Window {
                 ntime_min: 1000,
                 ntime_max: 1000,
             },
             network_target: [0xff; 32],
-            coinbase: vec![],
+            work: crate::job::JobWork::Standard {
+                merkle_root: [0x22; 32],
+                coinbase: vec![],
+            },
             future: false,
         }
     }
@@ -201,6 +219,7 @@ mod tests {
             nonce: 7,
             ntime: 1000,
             version: 0x3200_0000,
+            extranonce: Vec::new(),
         }
     }
 

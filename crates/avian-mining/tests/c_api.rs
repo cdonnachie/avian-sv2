@@ -117,13 +117,16 @@ fn a_c_program_mines_a_share_through_the_static_library() {
     // In the form a miner's configuration takes, which is what the C program
     // would be given by an operator.
     let authority = avian_sv2::address::encode_authority_key(&rig.pool_authority);
-    for algorithm in ["x16rt", "minotaurx"] {
+    // Both kinds of channel, because serving both is the point and a C miner
+    // is the only thing that proves the extended path is usable from C.
+    for (algorithm, extended) in [("x16rt", true), ("minotaurx", true), ("x16rt", false)] {
         let before = rig.node.height();
         let output = Command::new(&program)
             .arg(rig.pool.mining_addr().to_string())
             .arg(&authority)
             .arg(algorithm)
             .arg(common::WORKER_ADDRESS)
+            .env("AVIAN_SV2_EXTENDED", if extended { "1" } else { "0" })
             .output()
             .expect("running the C program");
 
@@ -137,9 +140,26 @@ fn a_c_program_mines_a_share_through_the_static_library() {
         );
 
         assert!(
-            stdout.contains("connected and opened a channel"),
+            stdout.contains("connected and opened"),
             "the C program did not get a channel:\n{stdout}"
         );
+        if extended {
+            assert!(
+                stdout.contains("an extended channel"),
+                "the C program should have opened an extended channel:\n{stdout}"
+            );
+            // What extended channels are for, from C: it read the coinbase it
+            // was committing to rather than trusting a merkle root.
+            assert!(
+                stdout.contains("coinbase I assembled"),
+                "the C program should have read its own coinbase:\n{stdout}"
+            );
+        } else {
+            assert!(
+                stdout.contains("a standard channel"),
+                "the C program should have opened a standard channel:\n{stdout}"
+            );
+        }
         assert!(
             stdout.contains("share") && stdout.contains("accepted"),
             "the C program did not have a share accepted:\n{stdout}"
@@ -178,9 +198,14 @@ fn a_c_program_mines_a_share_through_the_static_library() {
             common::WORKER_ADDRESS
         );
         eprintln!(
-            "[test] a C program mined {algorithm} block {} at height {}",
+            "[test] a C program mined {algorithm} block {} at height {} over {} channel",
             rig.node.tip(),
-            rig.node.height()
+            rig.node.height(),
+            if extended {
+                "an extended"
+            } else {
+                "a standard"
+            }
         );
     }
 

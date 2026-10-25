@@ -14,6 +14,10 @@ template_distribution_sv2.workspace = true
 secp256k1.workspace = true
 
 [dev-dependencies]
+avian-regtest = { path = "../avian-regtest" }
+# avian-pow stands in for a miner's own hashing in the extended-coinbase
+# test. It is not a dependency of the library or of this crate's own code.
+avian-pow = { path = "../avian-pow" }
 # The spike's whole point is to exercise SRI's own codec and handshake
 # directly, so it needs them even though the library wraps them.
 codec_sv2.workspace = true

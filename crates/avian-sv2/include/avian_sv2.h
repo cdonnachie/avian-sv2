@@ -74,6 +74,9 @@ typedef struct {
     int32_t pow_type;
     uint32_t version;
     uint8_t prev_hash[32];
+    /* The merkle root, on a STANDARD channel. On an extended channel it
+     * depends on the extranonce you pick, so this is zero and you call
+     * avian_sv2_client_job_header instead. */
     uint8_t merkle_root[32];
     /* Where to start, which equals ntime_min. */
     uint32_t ntime;
@@ -86,6 +89,18 @@ typedef struct {
     uint32_t ntime_max;
     uint32_t nbits;
     uint8_t share_target[32];
+    /* 1 on an extended channel, 0 on a standard one.
+     *
+     * On a standard channel the pool built the whole coinbase and handed you a
+     * finished merkle root: you can only take its word for what is in the
+     * block. On an extended channel you assemble the coinbase yourself from
+     * the two halves the pool sent, so you can read every output it commits
+     * to, including your own payout. For solo mining that verification is the
+     * point. */
+    int32_t extended;
+    /* How many extranonce bytes you may roll, on an extended channel. 0 on a
+     * standard one. */
+    uint32_t extranonce_size;
 } AvianMiningJob;
 
 typedef struct {
@@ -119,6 +134,15 @@ typedef struct {
     uint32_t backoff_max_ms;
     /* 0 retries forever, which is what a miner wants. */
     uint32_t max_reconnects;
+    /* Non-zero for an extended channel, which is what a solo miner should
+     * want: you assemble the coinbase and can see what you are committing to.
+     * Zero for a standard channel. */
+    int32_t extended;
+    /* The least extranonce to ask for on an extended channel. 0 for the
+     * default of 8. The pool refuses the channel if it cannot spare that
+     * much, because the scriptSig is only 100 bytes and the height push and
+     * the operator tag are in there too. */
+    uint32_t min_extranonce_size;
 } AvianSv2ClientConfig;
 
 typedef struct AvianSv2Client AvianSv2Client;
@@ -157,6 +181,38 @@ int32_t avian_sv2_client_submit(AvianSv2Client *client,
                                 const AvianMiningJob *job, uint32_t nonce,
                                 uint32_t ntime);
 
+/* Submits a share for an extended job, naming the extranonce you hashed.
+ *
+ * The pool reassembles the same coinbase and folds the same path, so it has to
+ * be told which extranonce produced the root. Pass extranonce_len 0 on a
+ * standard channel, or use avian_sv2_client_submit. */
+int32_t avian_sv2_client_submit_extended(AvianSv2Client *client,
+                                         const AvianMiningJob *job,
+                                         uint32_t nonce, uint32_t ntime,
+                                         const uint8_t *extranonce,
+                                         size_t extranonce_len);
+
+/* The 80 header bytes for a job at an extranonce, ntime and nonce.
+ *
+ * Works for both kinds of channel: on a standard one the extranonce is ignored
+ * and the pool's merkle root used, on an extended one the coinbase is
+ * assembled and the path folded. Does not hash. out needs 80 bytes. */
+int32_t avian_sv2_client_job_header(AvianSv2Client *client, uint32_t job_id,
+                                    const uint8_t *extranonce,
+                                    size_t extranonce_len, uint32_t ntime,
+                                    uint32_t nonce, uint8_t *out);
+
+/* The coinbase an extended job commits to, without witness.
+ *
+ * This is what extended channels are for: read the outputs instead of taking
+ * the pool's word for a merkle root. Writes at most capacity bytes and sets
+ * *written to the full length, so calling once with capacity 0 sizes a
+ * buffer. */
+int32_t avian_sv2_client_job_coinbase(AvianSv2Client *client, uint32_t job_id,
+                                      const uint8_t *extranonce,
+                                      size_t extranonce_len, uint8_t *out,
+                                      size_t capacity, size_t *written);
+
 /* Closes the connection so the next poll reconnects. For failover. */
 int32_t avian_sv2_client_disconnect(AvianSv2Client *client);
 
@@ -178,6 +234,23 @@ int32_t avian_sv2_meets_target(const uint8_t *hash, const uint8_t *target);
 
 /* The library version, NUL-terminated and statically allocated. */
 const char *avian_sv2_version(void);
+
+/* Checks that this header agrees with the library about struct layout.
+ *
+ * The header is written by hand, so a field added to the Rust side in the
+ * wrong place would make every struct member after it read the wrong bytes,
+ * and a job whose ntime or target silently shifted would mine garbage rather
+ * than fail. Call it once at startup with sizeof and offsetof and it answers
+ * before that can happen:
+ *
+ *     avian_sv2_abi_check(sizeof(AvianMiningJob),
+ *                         offsetof(AvianMiningJob, extranonce_size),
+ *                         sizeof(AvianSv2Event),
+ *                         offsetof(AvianSv2Event, message))
+ *
+ * Returns AVIAN_SV2_OK or AVIAN_SV2_ERROR. */
+int32_t avian_sv2_abi_check(size_t job_size, size_t job_extranonce_size_offset,
+                            size_t event_size, size_t event_message_offset);
 
 #ifdef __cplusplus
 }

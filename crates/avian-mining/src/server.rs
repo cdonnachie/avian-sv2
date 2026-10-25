@@ -14,7 +14,10 @@ use avian_sv2::block;
 use avian_sv2::error::{Error, Result};
 use avian_sv2::transport::{Connection, ConnectionReader, ConnectionWriter};
 use avian_sv2::wire::{Reader, Writer};
-use avian_tdp::coinbase::{PayoutPlan, MAX_COINBASE_TAG};
+use avian_tdp::coinbase::{
+    PayoutPlan, EXTENDED_EXTRANONCE_PREFIX, EXTENDED_EXTRANONCE_SIZE, MAX_COINBASE_TAG,
+    MAX_HEIGHT_PUSH, MAX_SCRIPT_SIG,
+};
 use avian_tdp::tdp::PrevHash;
 use avian_tdp::{SolutionSubmitter, Work};
 use common_messages_sv2::{
@@ -23,12 +26,18 @@ use common_messages_sv2::{
     SV2_MINING_PROTOCOL_DISCRIMINANT,
 };
 use mining_sv2::{
-    OpenMiningChannelError, MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
-    MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL, MESSAGE_TYPE_SUBMIT_SHARES_STANDARD,
+    OpenMiningChannelError, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+    MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
+    MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED, MESSAGE_TYPE_SUBMIT_SHARES_STANDARD,
 };
+
+/// The bits of a submission that are the same in both forms.
+struct SubmitMeta {
+    sequence_number: u32,
+}
 use secp256k1::Keypair;
 
-use crate::channel::Channel;
+use crate::channel::{Channel, ChannelKind};
 use crate::ratelimit::RateLimitConfig;
 use crate::share::{PowHasher, Submission};
 use avian_sv2::flags;
@@ -318,40 +327,92 @@ impl Server {
         let mut frame = reader.recv()?;
         if frame.extension_type != EXT_CORE_MINING {
             return Err(Error::Protocol(format!(
-                "expected OpenStandardMiningChannel, got {}",
-                frame.describe()
-            )));
-        }
-        if frame.msg_type != MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL {
-            // Extended channels are out of scope, and doc/sv2.md says
-            // REQUIRES_EXTENDED_CHANNELS is never set, so this is the only
-            // kind served.
-            send(
-                writer,
-                EXT_CORE_MINING,
-                MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
-                false,
-                OpenMiningChannelError {
-                    request_id: 0,
-                    error_code: b"unsupported-channel-type".as_slice().try_into()?,
-                },
-            )?;
-            return Err(Error::Protocol(format!(
-                "only standard channels are served, got {}",
+                "expected a channel open, got {}",
                 frame.describe()
             )));
         }
 
-        let open: mining_sv2::OpenStandardMiningChannel =
-            binary_sv2::from_bytes(&mut frame.payload)?;
-        let request_id = open.request_id;
-        let worker_max_target = {
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(open.max_target.as_ref());
-            bytes
+        // Both kinds are served, and REQUIRES_EXTENDED_CHANNELS is never set,
+        // because serving both is the point: a miner that can only do
+        // standard channels still works, and one that can do extended
+        // channels gets to assemble its own coinbase and see what it is
+        // committing to. For solo mining that verification is the product.
+        let (request_id, identity, nominal_hash_rate, worker_max_target, kind) = match frame
+            .msg_type
+        {
+            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL => {
+                let open: mining_sv2::OpenStandardMiningChannel =
+                    binary_sv2::from_bytes(&mut frame.payload)?;
+                let mut max_target = [0u8; 32];
+                max_target.copy_from_slice(open.max_target.as_ref());
+                (
+                    open.request_id,
+                    String::from_utf8_lossy(open.user_identity.as_ref()).into_owned(),
+                    open.nominal_hash_rate,
+                    max_target,
+                    ChannelKind::Standard,
+                )
+            }
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => {
+                let open: mining_sv2::OpenExtendedMiningChannel =
+                    binary_sv2::from_bytes(&mut frame.payload)?;
+                let mut max_target = [0u8; 32];
+                max_target.copy_from_slice(open.max_target.as_ref());
+                let wanted = open.min_extranonce_size as usize;
+                // The scriptSig is the constraint: the BIP34 height push, the
+                // operator tag and the extranonce all share 100 bytes. A miner
+                // asking for more than is left is refused rather than given a
+                // channel whose every coinbase the node would reject.
+                let available = MAX_SCRIPT_SIG
+                    .saturating_sub(MAX_HEIGHT_PUSH)
+                    .saturating_sub(self.config.coinbase_tag.len())
+                    .saturating_sub(EXTENDED_EXTRANONCE_PREFIX);
+                let size = EXTENDED_EXTRANONCE_SIZE.max(wanted);
+                if size > available {
+                    send(
+                        writer,
+                        EXT_CORE_MINING,
+                        MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
+                        false,
+                        OpenMiningChannelError {
+                            request_id: open.request_id,
+                            error_code: b"min-extranonce-size-too-large".as_slice().try_into()?,
+                        },
+                    )?;
+                    return Err(Error::Refused(format!(
+                        "a {wanted}-byte extranonce was asked for and only {available} bytes of \
+                         scriptSig are left after a {}-byte height push, a {}-byte operator tag \
+                         and {EXTENDED_EXTRANONCE_PREFIX} bytes of pool prefix",
+                        MAX_HEIGHT_PUSH,
+                        self.config.coinbase_tag.len()
+                    )));
+                }
+                (
+                    open.request_id,
+                    String::from_utf8_lossy(open.user_identity.as_ref()).into_owned(),
+                    open.nominal_hash_rate,
+                    max_target,
+                    ChannelKind::Extended {
+                        extranonce_size: size,
+                    },
+                )
+            }
+            other => {
+                send(
+                    writer,
+                    EXT_CORE_MINING,
+                    MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
+                    false,
+                    OpenMiningChannelError {
+                        request_id: 0,
+                        error_code: b"unsupported-channel-type".as_slice().try_into()?,
+                    },
+                )?;
+                return Err(Error::Protocol(format!(
+                    "expected a channel open, got message 0x{other:02x}"
+                )));
+            }
         };
-        let nominal_hash_rate = open.nominal_hash_rate;
-        let identity = String::from_utf8_lossy(open.user_identity.as_ref()).into_owned();
 
         // The money. On a solo pool the worker's own address goes in the
         // coinbase and consensus pays them directly, so this is the one place
@@ -403,6 +464,7 @@ impl Server {
         let id = self.next_channel_id.fetch_add(1, Ordering::SeqCst);
         let channel = Arc::new(Channel::new(
             id,
+            kind,
             algo.pow,
             share_target,
             payout,
@@ -413,7 +475,12 @@ impl Server {
             writer.clone(),
         ));
         eprintln!(
-            "[pool] channel {id} pays {} ({:?}){}, worker {:?}, up to {:.2} submissions/s",
+            "[pool] {} channel {id} pays {} ({:?}){}, worker {:?}, up to {:.2} submissions/s",
+            if kind.is_extended() {
+                "extended"
+            } else {
+                "standard"
+            },
             parsed.address_text,
             parsed.address.kind,
             if self.config.fee_basis_points > 0 {
@@ -447,22 +514,52 @@ impl Server {
         loop {
             let mut frame = reader.recv()?;
             match (frame.extension_type, frame.msg_type) {
-                (EXT_CORE_MINING, MESSAGE_TYPE_SUBMIT_SHARES_STANDARD) => {
-                    let submit: mining_sv2::SubmitSharesStandard =
-                        binary_sv2::from_bytes(&mut frame.payload)?;
-                    if submit.channel_id != channel.id {
-                        channel.send_error(
+                (EXT_CORE_MINING, MESSAGE_TYPE_SUBMIT_SHARES_STANDARD)
+                | (EXT_CORE_MINING, MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED) => {
+                    let extended = frame.msg_type == MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED;
+                    let (channel_id, sequence_number, submission) = if extended {
+                        let submit: mining_sv2::SubmitSharesExtended =
+                            binary_sv2::from_bytes(&mut frame.payload)?;
+                        (
+                            submit.channel_id,
                             submit.sequence_number,
-                            crate::share::Refusal::InvalidChannelId,
+                            Submission {
+                                job_id: submit.job_id,
+                                nonce: submit.nonce,
+                                ntime: submit.ntime,
+                                version: submit.version,
+                                extranonce: submit.extranonce.as_ref().to_vec(),
+                            },
+                        )
+                    } else {
+                        let submit: mining_sv2::SubmitSharesStandard =
+                            binary_sv2::from_bytes(&mut frame.payload)?;
+                        (
+                            submit.channel_id,
+                            submit.sequence_number,
+                            Submission {
+                                job_id: submit.job_id,
+                                nonce: submit.nonce,
+                                ntime: submit.ntime,
+                                version: submit.version,
+                                extranonce: Vec::new(),
+                            },
+                        )
+                    };
+                    if channel_id != channel.id {
+                        channel
+                            .send_error(sequence_number, crate::share::Refusal::InvalidChannelId)?;
+                        continue;
+                    }
+                    // A miner must submit the form its channel was opened as.
+                    if extended != channel.kind.is_extended() {
+                        channel.send_error(
+                            sequence_number,
+                            crate::share::Refusal::InvalidExtranonce,
                         )?;
                         continue;
                     }
-                    let submission = Submission {
-                        job_id: submit.job_id,
-                        nonce: submit.nonce,
-                        ntime: submit.ntime,
-                        version: submit.version,
-                    };
+                    let submit = SubmitMeta { sequence_number };
                     if let Some(candidate) = channel.handle_submit(
                         submission,
                         submit.sequence_number,

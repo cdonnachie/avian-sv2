@@ -16,7 +16,7 @@ as an ordinary Rust crate and adds the two halves a miner never needs: the
 Template Distribution client it is to the node, and the Mining Protocol server
 it is to workers.
 
-Stages 2 through 5 of `Avian-Native-Stratum-V2-Mining-Plan.md` section 25.
+Stages 2 through 6 of `Avian-Native-Stratum-V2-Mining-Plan.md` section 25.
 
 ```
 crates/avian-sv2        libavian-sv2: Noise, framing, extension codecs,
@@ -28,7 +28,16 @@ crates/avian-sv2-pool   the pool binary
 crates/avian-regtest    starts a regtest node for tests; test support only
 ```
 
-**The milestone is reached, and it is the money one.** `aviand` to pool to
+**Both milestones are reached.** Blocks mined over an **extended** channel,
+with the miner assembling the coinbase from prefix and suffix rather than being
+handed a merkle root, for both algorithms, from Rust and from C:
+
+```
+[test] x16rt block 5f01b53b8f59f0de343f6ffbe386e75642a4884f639d1f95b6eace12ef4db4ed mined over an extended channel, extranonce 0000000000000000, paying mnPBEVKjU1zz9214C7M7Zp4FuurUAsU6ZS
+[test] a C program mined minotaurx block 196221cec74fba690eff112f611fd0ae7565494bfb5472f0e25ca6e87cb8fded at height 103 over an extended channel
+```
+
+And the money one, which still holds on both kinds of channel. `aviand` to pool to
 miner to pool to `aviand`, with a regtest block found by hashing, relayed by
 the pool, accepted by the node, reported by `getblock` under the algorithm
 that was negotiated, **and paying the address the miner supplied at channel
@@ -48,6 +57,7 @@ the node's own view of the block it accepted.
 ## Contents
 
 - [Solo mining](#solo-mining)
+- [Extended channels](#extended-channels)
 - [The four questions that shaped this](#the-four-questions-that-shaped-this)
 - [The C API](#the-c-api)
 - [Reconnection, and what does not survive it](#reconnection-and-what-does-not-survive-it)
@@ -243,6 +253,126 @@ published.
 This is a usability detail with a sharp edge: an operator who publishes the key
 in a form their miners cannot parse has a pool nobody can connect to, and the
 failure arrives as a handshake that never completes.
+
+## Extended channels
+
+The reason is not completeness. On a **standard** channel the pool hands down a
+finished merkle root, and the miner can only take its word for what is in the
+block: whether the coinbase pays the miner, whether the transactions are what
+the pool says. On an **extended** channel the pool hands down the coinbase in
+two halves and the miner assembles it, so it can read every output it is
+committing to.
+
+For solo mining that verification is the product. "We wrote the miner, so it
+will show you" moves the trust rather than removing it, and stops being true
+the moment somebody mines Avian with software this project did not write. The
+library therefore **defaults to extended**, and the pool serves both: it never
+sets `REQUIRES_EXTENDED_CHANNELS`, so a miner that can only do standard
+channels still works.
+
+### The deferral that turned out not to apply
+
+doc/sv2.md deferred extended-channel coinbase handling on the grounds that
+Stratum v2 defines `coinbase_tx_prefix` and `coinbase_tx_suffix` **without** the
+BIP141 marker, flag and witness data, while Avian's node requires a specific
+witness stack and a canonical byte-for-byte reconstruction.
+
+Those two requirements never meet, and the reason is that **a merkle root is
+built from txids, and a txid excludes witness data**:
+
+```
+pool    splits its coinbase around the extranonce, without witness,
+        which is what the spec asks for
+miner   inserts its extranonce, hashes prefix+extranonce+suffix to a
+        txid, folds the merkle path. Never needs the witness.
+pool    on a share, reconstructs the whole coinbase including the
+        BIP141 witness and submits that
+```
+
+`src/sv2/solution_check.cpp` bears that out in source — it takes
+`result.coinbase->GetHash()`, which is the txid, and calls
+`FoldMerklePath(coinbase_txid, ctx.merkle_path)` — so the canonical check only
+ever applies to what the **pool** submits, which the pool controls entirely.
+The witness commitment is unaffected by the extranonce because it commits to
+the witness root of the other transactions plus the coinbase's own fixed
+all-zero witness, and the extranonce lives in the scriptSig.
+
+**Proved against a live node rather than argued.**
+`crates/avian-tdp/tests/extended_coinbase.rs` mines a block the extended way
+and has the node accept it, for both algorithms, with a **non-empty merkle
+path** — a block with only a coinbase would make the fold a no-op and prove
+far less:
+
+```
+[test] x16rt: mempool transaction eb384600858273205eba8723c9148ab054c8b9e6370613c9003f715052127505
+[test] x16rt template 1 with a 1-hash merkle path
+[test] x16rt block 40bc7b9457b74ba9156d20d42d8954b961844219282e11cbedcf4f7c646fb4aa accepted, mined from a prefix/suffix split with a 1-hash merkle path
+[test] minotaurx block 2e5fda8a308976443ec3794522ec0fc0dc54f27efb266f4e8d65677a05635cb9 accepted, mined from a prefix/suffix split with a 1-hash merkle path
+```
+
+So the deferral can be lifted. There was no conflict to reconcile, only two
+requirements that look adjacent and never touch.
+
+### What a miner can check
+
+`ExtendedWork`, in the library, carries the two halves, the merkle path and the
+extranonce shape. Two questions it can answer that a standard channel cannot:
+
+- `commits_to_script` — is my payout script really in this coinbase? The claim
+  a solo miner most needs, because it is the one a dishonest pool would break.
+- `path_contains` — is this transaction in my block? In a two-transaction block
+  the single merkle sibling *is* the other transaction's txid. In a larger
+  block the siblings are interior nodes, so this answers only for those that
+  happen to be leaves, which is why it is phrased as a question about the path
+  rather than about the block.
+
+Both have a test that asserts the yes **and** the no, because a check that
+cannot say no is not a check.
+
+### The scriptSig, recounted
+
+Three claimants and a hard 100-byte ceiling the node enforces: the BIP34 height
+push, the operator tag, and the extranonce.
+
+| | bytes |
+| --- | --- |
+| BIP34 height push, worst case | 5 |
+| extranonce, standard channel | 8 |
+| extranonce, extended channel | 4 pool prefix + 8 miner |
+| operator tag cap | **83** |
+
+The tag cap was 87 while only standard channels existed and the extranonce was
+a fixed 8. Extended channels take four more bytes for the pool's prefix, so the
+cap **tightens to 83**, derived from the constants rather than asserted:
+
+```rust
+pub const MAX_COINBASE_TAG: usize =
+    MAX_SCRIPT_SIG - MAX_HEIGHT_PUSH - (EXTENDED_EXTRANONCE_PREFIX + EXTENDED_EXTRANONCE_SIZE);
+```
+
+A miner asking for more extranonce than is left after the height push, the
+configured tag and the pool's prefix is refused with
+`min-extranonce-size-too-large`, rather than given a channel whose every
+coinbase the node would reject — which, with no `SubmitSolution.Error`, would
+be silent.
+
+### `version_rolling_allowed` is false
+
+On every extended job, to match `REQUIRES_FIXED_VERSION`. Avian keeps the
+algorithm in `nVersion` bits 16-23, so rolling them moves the share to the
+other algorithm's proof-of-work limit. The client **refuses a job that says
+otherwise**, rather than ignoring the permission: a pool offering something
+that cannot be honoured safely is a pool to walk away from.
+
+### One implementation of the bytes
+
+The standard-channel coinbase and the extended-channel split are assembled from
+the same `Parts`, and the BIP144 witness splice has one implementation used by
+both. They cannot disagree about the bytes because there is only one piece of
+code that writes them, and a unit test asserts the split and the whole coinbase
+produce the **same txid** for several extranonce lengths. If they ever diverged,
+a miner would fold a root the node will not reproduce and every share would be
+refused for a reason that looks like bad proof of work.
 
 ## The four questions that shaped this
 
@@ -672,7 +802,7 @@ problem.
 cargo test
 ```
 
-93 tests, of which 27 start a real node and one also invokes a C compiler.
+108 tests, of which 36 start a real node and one also invokes a C compiler.
 Everything that needs a node skips with a message when `aviand` is not found;
 `AVIAND` and `AVIAN_CLI` override the default of `~/avian-build/bin`, and `CC`
 overrides `cc`. The nodes the tests start pass `-listen=0`, without which they
@@ -704,6 +834,31 @@ The wrong-network test re-encodes a known-good regtest key hash under
 mainnet's version byte, so the address is checksum-valid and the only thing
 wrong with it is the network. Otherwise it would pass for the wrong reason.
 
+### Extended channels
+
+`crates/avian-tdp/tests/extended_coinbase.rs` is the proof the stage opened
+with, above. `crates/avian-mining/tests/extended.rs` is the protocol:
+
+```
+test a_miner_mines_a_block_over_an_extended_channel ... ok
+test the_miner_can_see_what_it_is_committing_to ... ok
+test standard_and_extended_channels_are_served_side_by_side ... ok
+test version_rolling_is_not_allowed_on_an_extended_job ... ok
+test an_extranonce_of_the_wrong_length_is_refused ... ok
+test an_oversized_extranonce_request_refuses_the_channel ... ok
+```
+
+The visibility test is the one that encodes the product claim: a known
+transaction goes into the mempool, and the miner, from nothing but what it was
+sent, determines that transaction is in its block and that its own payout
+script is in the coinbase, then mines a share the pool accepts, which it could
+not do if its reading of prefix and suffix were wrong. **If extended channels
+stop giving a miner that, this test fails.**
+
+`standard_and_extended_channels_are_served_side_by_side` keeps the other half
+honest: both channel kinds open on one pool, get their own ids and coinbases,
+and both mine accepted shares.
+
 ### The C program
 
 `crates/avian-mining/tests/c_api.rs` builds both static libraries, compiles
@@ -716,12 +871,30 @@ with the right `powtype`.
 test a_c_program_mines_a_share_through_the_static_library ... ok
 ```
 
+It runs three times: extended for each algorithm, and standard once, so both
+channel kinds are proved usable from C. On an extended channel it reads back
+the coinbase it assembled before mining it:
+
+```
+connected and opened an extended channel, paying mnPBEVKjU1zz9214C7M7Zp4FuurUAsU6ZS
+  extended: 8 extranonce bytes, a 194-byte coinbase I assembled
+```
+
 It is the only test that can catch three things: the header drifting from
 `capi.rs` (the compile fails), the documented link line drifting from what
 actually links (the link fails), and an API that is awkward or impossible to
 use from C (the program cannot be written). The first of those also has a
 cheap unit test, `the_c_header_matches_this_module`, which compares the
 constants without needing a compiler.
+
+**And a fourth, which compiling cannot catch.** The header is hand written, so a
+field added to the Rust side in the wrong place would make every member after
+it read the wrong bytes while still compiling. A job whose `ntime` or
+`share_target` silently shifted would mine garbage rather than fail, which is
+this project's recurring failure shape. `avian_sv2_abi_check` takes `sizeof`
+and `offsetof` from the caller and answers before that can happen; the C
+program calls it at startup. One offset and one size per struct is enough: the
+offset catches a field inserted before it, the size one appended after.
 
 ### Reconnection, tested as reconnection
 
@@ -829,7 +1002,8 @@ specifies but nothing in Avian Core implements, so this is the first time
 anything has been built against that half. Finding 12 is from writing the
 miner's side, which is the first thing to have worn that shoe. Findings 13 and
 14 are from building a solo pool, where `user_identity` stops being a label and
-becomes an instruction about money.
+becomes an instruction about money. Findings 15 and 16 are from building
+extended channels, which the document had deferred.
 
 **All eleven are now resolved**, nine by a change to `doc/sv2.md` or the node,
 one withdrawn as wrong, and one, the Noise handshake, by a fix to Avian Core
@@ -1073,6 +1247,49 @@ pool that did not know that would try to parse the whole string as an address
 and refuse every real miner. Worth stating wherever Avian describes what a pool
 should do with the field, because it is load-bearing and entirely undocumented.
 
+### From building extended channels
+
+**15. The extended-channel deferral was based on a conflict that does not
+exist.** doc/sv2.md deferred the whole thing on the grounds that Stratum v2
+defines `coinbase_tx_prefix` and `coinbase_tx_suffix` without the BIP141
+marker, flag and witness, while Avian's node requires a specific witness stack
+and a canonical byte-for-byte reconstruction, and that the two "have to be
+reconciled deliberately rather than assumed compatible".
+
+They never meet. A merkle root is built from txids, a txid excludes witness
+data, and `solution_check.cpp` folds the path onto `GetHash()`, the txid. The
+canonical check applies only to what the pool submits, which the pool builds
+in full. Confirmed against a live node, both algorithms, non-empty merkle path.
+The passage can say so, and the registry submission's "deferred" can go.
+
+What *is* worth documenting in its place, and is not anywhere now:
+
+- **A pool must reserve the whole extranonce in the scriptSig length that goes
+  inside `coinbase_tx_prefix`.** The length byte is in the prefix, before the
+  bytes it counts exist. Getting it wrong produces a coinbase that is malformed
+  for every extranonce, and with no `SubmitSolution.Error` the pool would see
+  nothing but shares that never become blocks.
+- **The scriptSig's 2-to-100-byte bound is shared three ways** on an extended
+  channel: the BIP34 height push, the operator tag and the extranonce. A pool
+  has to refuse a `min_extranonce_size` it cannot fit rather than grant it, and
+  the Stratum v2 specification has no error code for that either, so this one
+  sends `min-extranonce-size-too-large`. That is the fourth instance of the
+  gap findings 7, 8 and 13 describe.
+- **`version_rolling_allowed` must be false**, which the Avian extension
+  already implies through `REQUIRES_FIXED_VERSION` but does not say for the
+  extended-job message that carries its own flag. A miner should refuse a job
+  that sets it, and this client does; saying so would make that a rule rather
+  than a choice.
+
+**16. Nothing says what a miner may conclude from `merkle_path`.** The
+visibility that justifies extended channels rests on it, and its contents
+depend on the block: in a two-transaction block the single sibling is the other
+transaction's txid, so inclusion is checkable; in a larger block the siblings
+are interior nodes and most are not txids at all. A miner that assumed every
+entry was a txid would quietly check nothing. Worth a sentence, because the
+whole argument for preferring extended channels is about what a miner can
+verify, and this is the limit of it.
+
 ## Design
 
 ```
@@ -1080,7 +1297,7 @@ libavian-sv2, the lift-out unit:
   avian_sv2::address     Avian addresses, identities, authority keys
   avian_sv2::transport   SRI's Noise and framing, both roles, over a socket
   avian_sv2::avian       extension 0x4001 and negotiation extension 0x0001
-  avian_sv2::block       header, SHA256d, target arithmetic
+  avian_sv2::block       header, SHA256d, merkle fold, target arithmetic
   avian_sv2::wire        the field codecs SRI does not provide
   avian_sv2::authority   the key a certificate is checked against
   avian_sv2::reconnect   backoff, and what does not survive a reconnect
@@ -1089,7 +1306,7 @@ libavian-sv2, the lift-out unit:
 
 the pool, consuming it as an ordinary Rust crate:
   avian_tdp::tdp         the stock Template Distribution messages, owned
-  avian_tdp::coinbase    the coinbase, payout split and merkle root
+  avian_tdp::coinbase    the coinbase, its prefix/suffix split, payout split
   avian_mining::ratelimit  per-channel submission limits
   avian_tdp::session     one upstream connection, with reconnection
   avian_mining::share    the validation ladder, behind a PowHasher trait
@@ -1159,6 +1376,14 @@ contiguous on the wire: a `SubmitShares.Success` cannot land between a
   there is no partial check that can stand in for the hash, which doc/sv2.md
   gives as the reason the node needs a rate limit; the same applies to a pool.
   Two tests prove the ordering by using a hasher that fails.
+- **An extended job carries no merkle root, and that is deliberate.** The
+  field is zero and the root is computed from whichever extranonce the miner
+  picks. Sending a root the miner would have to ignore would be an invitation
+  to use it.
+- **The merkle fold lives in the library, not the pool.** It moved there when
+  extended channels arrived, because a miner folds the same path onto a
+  coinbase it assembled itself. The pool re-exports it, so there is still one
+  implementation.
 - **`poll` uses a peek, not a read timeout.** SRI's decoder counts the bytes of
   `writable()` as present before they are read, so a `read_exact` that times
   out part way leaves it decrypting whatever the buffer held, with no way back.
@@ -1176,7 +1401,7 @@ contiguous on the wire: a `SubmitShares.Success` cannot land between a
 - **No hashing in the library.** Deliberately, and at length above.
 - **No Stratum v1**, and not as an oversight: an SV1 downstream adapter would
   have shaped the pool around a protocol the project is trying to move past.
-- No extended channels, no job declaration.
+- No job declaration.
 - Anything non-loopback. Both the connection to the node and the Mining
   Protocol listener refuse it.
 

@@ -22,6 +22,7 @@
  */
 
 #include <inttypes.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,7 +37,41 @@
 
 /* Avian has no cheap pre-filter: the only way to know whether a nonce is good
  * is to compute the whole hash. This is the loop a real miner replaces with
- * something fast, and the reason it is here and not in the library. */
+ * something fast, and the reason it is here and not in the library.
+ *
+ * On an extended channel the extranonce is search space too, and the header
+ * has to be rebuilt through the library each time because the coinbase, and so
+ * the merkle root, changes with it. */
+static int search_extended(AvianSv2Client *client, const AvianMiningJob *job,
+                           uint8_t *extranonce, uint32_t *found_nonce) {
+    uint8_t header[80];
+    uint8_t hash[32];
+
+    for (uint32_t counter = 0; counter < 64; counter++) {
+        memset(extranonce, 0, job->extranonce_size);
+        size_t take = sizeof(counter) < job->extranonce_size ? sizeof(counter)
+                                                             : job->extranonce_size;
+        memcpy(extranonce, &counter, take);
+        for (uint32_t nonce = 0; nonce < 256; nonce++) {
+            if (avian_sv2_client_job_header(client, job->job_id, extranonce,
+                                            job->extranonce_size, job->ntime, nonce,
+                                            header) != AVIAN_SV2_OK) {
+                fprintf(stderr, "job_header failed: %s\n", avian_sv2_last_error(client));
+                return 0;
+            }
+            if (avian_pow_hash(job->pow_type, header, sizeof(header), hash) != AVIAN_POW_OK) {
+                fprintf(stderr, "avian_pow_hash failed\n");
+                return 0;
+            }
+            if (avian_sv2_meets_target(hash, job->share_target) == 1) {
+                *found_nonce = nonce;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 static int search(const AvianMiningJob *job, uint32_t *found_nonce) {
     uint8_t header[80];
     uint8_t hash[32];
@@ -101,6 +136,17 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    /* The header is hand written, so check it agrees with the library about
+     * struct layout before trusting a single field. */
+    if (avian_sv2_abi_check(sizeof(AvianMiningJob),
+                            offsetof(AvianMiningJob, extranonce_size),
+                            sizeof(AvianSv2Event),
+                            offsetof(AvianSv2Event, message))
+        != AVIAN_SV2_OK) {
+        fprintf(stderr, "avian_sv2.h disagrees with the library about struct layout\n");
+        return 1;
+    }
+
     AvianSv2ClientConfig config;
     memset(&config, 0, sizeof(config));
     config.pool = argv[1];
@@ -112,6 +158,13 @@ int main(int argc, char **argv) {
     config.backoff_initial_ms = 50;
     config.backoff_max_ms = 500;
     config.max_reconnects = 20;
+    /* Extended, which is what a solo miner should want: the coinbase is
+     * assembled here and can be inspected, rather than arriving as a merkle
+     * root to be trusted. AVIAN_SV2_EXTENDED=0 asks for a standard channel
+     * instead, so both paths get exercised. */
+    const char *want_standard = getenv("AVIAN_SV2_EXTENDED");
+    config.extended = (want_standard != NULL && strcmp(want_standard, "0") == 0) ? 0 : 1;
+    config.min_extranonce_size = 8;
 
     int32_t status = AVIAN_SV2_OK;
     AvianSv2Client *client = avian_sv2_client_connect(&config, &status);
@@ -119,7 +172,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "connect failed (%d): %s\n", status, avian_sv2_last_connect_error());
         return 1;
     }
-    printf("connected and opened a channel\n");
+    printf("connected and opened %s channel, paying %s\n",
+           config.extended ? "an extended" : "a standard", argv[4]);
 
     AvianMiningJob job;
     int have_job = 0;
@@ -151,6 +205,37 @@ int main(int argc, char **argv) {
             print_hex("  prev_hash     ", job.prev_hash, 32);
             print_hex("  merkle_root   ", job.merkle_root, 32);
             print_hex("  share_target  ", job.share_target, 32);
+            if (job.extended) {
+                /* What a standard channel cannot do: read the coinbase this
+                 * block commits to, rather than taking the pool's word for a
+                 * merkle root. A real miner would check its own payout script
+                 * is in here. */
+                uint8_t extranonce[32];
+                size_t needed = 0;
+                memset(extranonce, 0, sizeof(extranonce));
+                if (job.extranonce_size > sizeof(extranonce)) {
+                    fprintf(stderr, "extranonce is larger than this program expects\n");
+                    avian_sv2_client_free(client);
+                    return 1;
+                }
+                avian_sv2_client_job_coinbase(client, job.job_id, extranonce,
+                                              job.extranonce_size, NULL, 0, &needed);
+                uint8_t *coinbase = malloc(needed);
+                if (coinbase == NULL
+                    || avian_sv2_client_job_coinbase(client, job.job_id, extranonce,
+                                                     job.extranonce_size, coinbase, needed,
+                                                     &needed)
+                           != AVIAN_SV2_OK) {
+                    fprintf(stderr, "could not read the coinbase: %s\n",
+                            avian_sv2_last_error(client));
+                    free(coinbase);
+                    avian_sv2_client_free(client);
+                    return 1;
+                }
+                printf("  extended: %u extranonce bytes, a %zu-byte coinbase I assembled\n",
+                       job.extranonce_size, needed);
+                free(coinbase);
+            }
             break;
 
         case AVIAN_SV2_EVENT_JOBS_INVALIDATED:
@@ -188,11 +273,19 @@ int main(int argc, char **argv) {
 
         if (have_job && !submitted) {
             uint32_t nonce = 0;
-            if (!search(&job, &nonce)) {
-                printf("no nonce in %d tries for job %" PRIu32 "\n", MAX_NONCES, job.job_id);
+            uint8_t extranonce[32];
+            memset(extranonce, 0, sizeof(extranonce));
+            int found = job.extended
+                            ? search_extended(client, &job, extranonce, &nonce)
+                            : search(&job, &nonce);
+            if (!found) {
+                printf("no nonce found for job %" PRIu32 "\n", job.job_id);
                 continue;
             }
-            status = avian_sv2_client_submit(client, &job, nonce, job.ntime);
+            status = job.extended
+                         ? avian_sv2_client_submit_extended(client, &job, nonce, job.ntime,
+                                                            extranonce, job.extranonce_size)
+                         : avian_sv2_client_submit(client, &job, nonce, job.ntime);
             if (status == AVIAN_SV2_OK) {
                 printf("submitted nonce %" PRIu32 " ntime %" PRIu32 " for job %" PRIu32 "\n",
                        nonce, job.ntime, job.job_id);

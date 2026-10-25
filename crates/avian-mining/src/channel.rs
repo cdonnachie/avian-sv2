@@ -16,18 +16,21 @@ use avian_sv2::transport::ConnectionWriter;
 use avian_tdp::coinbase::PayoutPlan;
 use avian_tdp::tdp::PrevHash;
 use avian_tdp::Work;
-use binary_sv2::{Sv2Option, U256};
+use binary_sv2::{Seq0255, Sv2Option, U256};
 use mining_sv2::{
-    NewMiningJob, OpenStandardMiningChannelSuccess, SetNewPrevHash, SetTarget, SubmitSharesError,
-    SubmitSharesSuccess, CHANNEL_BIT_MINING_SET_NEW_PREV_HASH, CHANNEL_BIT_NEW_MINING_JOB,
+    NewExtendedMiningJob, NewMiningJob, OpenExtendedMiningChannelSuccess,
+    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetTarget, SubmitSharesError,
+    SubmitSharesSuccess, CHANNEL_BIT_MINING_SET_NEW_PREV_HASH, CHANNEL_BIT_NEW_EXTENDED_MINING_JOB,
+    CHANNEL_BIT_NEW_MINING_JOB, CHANNEL_BIT_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
     CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, CHANNEL_BIT_SET_TARGET,
     CHANNEL_BIT_SUBMIT_SHARES_ERROR, CHANNEL_BIT_SUBMIT_SHARES_SUCCESS,
-    MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, MESSAGE_TYPE_NEW_MINING_JOB,
+    MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+    MESSAGE_TYPE_NEW_MINING_JOB, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
     MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MESSAGE_TYPE_SET_TARGET,
     MESSAGE_TYPE_SUBMIT_SHARES_ERROR, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
 };
 
-use crate::job::{self, Job};
+use crate::job::{self, Job, JobWork};
 use crate::ratelimit::{Decision, Limiter, RateLimitConfig};
 use crate::share::{self, Outcome, PowHasher, Refusal, Submission};
 use crate::EXT_CORE_MINING;
@@ -49,8 +52,30 @@ pub struct BlockCandidate {
     pub hash: [u8; 32],
 }
 
+/// Which kind of channel this is.
+///
+/// Both are served, and `REQUIRES_EXTENDED_CHANNELS` is never set, because
+/// serving both is the point: a miner that can only do standard channels still
+/// works, and one that can do extended channels gets to see what it is
+/// committing to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelKind {
+    /// The pool builds the whole coinbase and hands down a merkle root.
+    Standard,
+    /// The pool hands down the coinbase in two halves and the miner assembles
+    /// it, with `extranonce_size` bytes of its own to roll.
+    Extended { extranonce_size: usize },
+}
+
+impl ChannelKind {
+    pub fn is_extended(self) -> bool {
+        matches!(self, ChannelKind::Extended { .. })
+    }
+}
+
 pub struct Channel {
     pub id: u32,
+    pub kind: ChannelKind,
     pub pow: PowType,
     pub share_target: [u8; 32],
     pub extranonce_prefix: Vec<u8>,
@@ -81,6 +106,7 @@ impl Channel {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u32,
+        kind: ChannelKind,
         pow: PowType,
         share_target: [u8; 32],
         payout: PayoutPlan,
@@ -92,9 +118,16 @@ impl Channel {
     ) -> Self {
         Self {
             id,
+            kind,
             pow,
             share_target,
-            extranonce_prefix: job::extranonce(id, 0).to_vec(),
+            // On an extended channel this is the pool's half of the
+            // extranonce, which the miner prepends to its own. On a standard
+            // one it is informational: the pool chose the whole coinbase.
+            extranonce_prefix: match kind {
+                ChannelKind::Standard => job::extranonce(id, 0).to_vec(),
+                ChannelKind::Extended { .. } => job::extranonce_prefix(id),
+            },
             payout,
             worker,
             coinbase_tag,
@@ -112,6 +145,18 @@ impl Channel {
         }
     }
 
+    fn shape(&self, job_id: u32) -> job::Shape {
+        match self.kind {
+            ChannelKind::Standard => job::Shape::Standard {
+                extranonce: job::extranonce(self.id, job_id).to_vec(),
+            },
+            ChannelKind::Extended { extranonce_size } => job::Shape::Extended {
+                extranonce_prefix: self.extranonce_prefix.clone(),
+                extranonce_size,
+            },
+        }
+    }
+
     /// Submissions per second this channel may sustain, for logging.
     pub fn submission_rate(&self) -> f64 {
         self.state.lock().map(|s| s.limiter.rate()).unwrap_or(0.0)
@@ -126,20 +171,35 @@ impl Channel {
     pub fn send_open_success(&self, request_id: u32) -> Result<()> {
         let mut writer = self.lock_writer()?;
         let target = self.share_target;
-        writer.send(
-            EXT_CORE_MINING,
-            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
-            CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
-            OpenStandardMiningChannelSuccess {
-                request_id,
-                channel_id: self.id,
-                target: U256::try_from(target.as_slice())?,
-                extranonce_prefix: self.extranonce_prefix.as_slice().try_into()?,
-                // Standard channels are not grouped here, and 0 is the
-                // "no group" value.
-                group_channel_id: 0,
-            },
-        )?;
+        match self.kind {
+            ChannelKind::Standard => writer.send(
+                EXT_CORE_MINING,
+                MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+                CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+                OpenStandardMiningChannelSuccess {
+                    request_id,
+                    channel_id: self.id,
+                    target: U256::try_from(target.as_slice())?,
+                    extranonce_prefix: self.extranonce_prefix.as_slice().try_into()?,
+                    // Standard channels are not grouped here, and 0 is the
+                    // "no group" value.
+                    group_channel_id: 0,
+                },
+            )?,
+            ChannelKind::Extended { extranonce_size } => writer.send(
+                EXT_CORE_MINING,
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+                CHANNEL_BIT_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+                OpenExtendedMiningChannelSuccess {
+                    request_id,
+                    channel_id: self.id,
+                    target: U256::try_from(target.as_slice())?,
+                    extranonce_size: extranonce_size as u16,
+                    extranonce_prefix: self.extranonce_prefix.as_slice().try_into()?,
+                    group_channel_id: 0,
+                },
+            )?,
+        }
         writer.send(
             EXT_CORE_MINING,
             MESSAGE_TYPE_SET_TARGET,
@@ -183,7 +243,7 @@ impl Channel {
             &work.constraints,
             &self.payout,
             &self.coinbase_tag,
-            &job::extranonce(self.id, job_id),
+            self.shape(job_id),
             activate,
         )?;
 
@@ -201,25 +261,57 @@ impl Channel {
         }
 
         let mut writer = self.lock_writer()?;
-        let merkle_root = job.merkle_root;
-        writer.send(
-            EXT_CORE_MINING,
-            MESSAGE_TYPE_NEW_MINING_JOB,
-            CHANNEL_BIT_NEW_MINING_JOB,
-            NewMiningJob {
-                channel_id: self.id,
-                job_id,
-                // A future job leaves this unset; the specification requires
-                // the first job on a channel to be one.
-                min_ntime: Sv2Option::new(if activate {
-                    None
-                } else {
-                    Some(job.window.ntime_min)
-                }),
-                version: job.version,
-                merkle_root: U256::try_from(merkle_root.as_slice())?,
-            },
-        )?;
+        // A future job leaves min_ntime unset; the specification requires the
+        // first job on a channel to be one.
+        let min_ntime = Sv2Option::new(if activate {
+            None
+        } else {
+            Some(job.window.ntime_min)
+        });
+        match &job.work {
+            JobWork::Standard { merkle_root, .. } => {
+                let merkle_root = *merkle_root;
+                writer.send(
+                    EXT_CORE_MINING,
+                    MESSAGE_TYPE_NEW_MINING_JOB,
+                    CHANNEL_BIT_NEW_MINING_JOB,
+                    NewMiningJob {
+                        channel_id: self.id,
+                        job_id,
+                        min_ntime,
+                        version: job.version,
+                        merkle_root: U256::try_from(merkle_root.as_slice())?,
+                    },
+                )?;
+            }
+            JobWork::Extended {
+                split, merkle_path, ..
+            } => {
+                let path: Vec<U256> = merkle_path
+                    .iter()
+                    .map(|hash| U256::try_from(hash.as_slice()))
+                    .collect::<std::result::Result<_, _>>()?;
+                writer.send(
+                    EXT_CORE_MINING,
+                    MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+                    CHANNEL_BIT_NEW_EXTENDED_MINING_JOB,
+                    NewExtendedMiningJob {
+                        channel_id: self.id,
+                        job_id,
+                        min_ntime,
+                        version: job.version,
+                        // False, to match REQUIRES_FIXED_VERSION. nVersion
+                        // bits 16-23 are the algorithm, so rolling them moves
+                        // the share to the other algorithm's proof-of-work
+                        // limit, and there is no safe subset to open.
+                        version_rolling_allowed: false,
+                        merkle_path: Seq0255::new(path)?,
+                        coinbase_tx_prefix: split.prefix.as_slice().try_into()?,
+                        coinbase_tx_suffix: split.suffix.as_slice().try_into()?,
+                    },
+                )?;
+            }
+        }
 
         writer.send_raw(
             EXT_AVIAN,
@@ -312,6 +404,13 @@ impl Channel {
             return Ok(None);
         };
 
+        if !self.kind.is_extended() && !submission.extranonce.is_empty() {
+            state.limiter.record_invalid();
+            drop(state);
+            self.send_error(sequence_number, Refusal::InvalidExtranonce)?;
+            return Ok(None);
+        }
+
         let fingerprint = (submission.job_id, submission.nonce, submission.ntime);
         if !state.seen.insert(fingerprint) {
             state.limiter.record_invalid();
@@ -346,12 +445,17 @@ impl Channel {
                     },
                 )?;
 
-                Ok(is_block.then(|| BlockCandidate {
+                if !is_block {
+                    return Ok(None);
+                }
+                // The pool's side of an extended channel: reassemble what the
+                // miner hashed and add the witness it never saw.
+                Ok(Some(BlockCandidate {
                     template_id: job.template_id,
                     version: job.version,
                     ntime: submission.ntime,
                     nonce: submission.nonce,
-                    coinbase: job.coinbase.clone(),
+                    coinbase: job.coinbase(&submission.extranonce)?,
                     hash,
                 }))
             }
