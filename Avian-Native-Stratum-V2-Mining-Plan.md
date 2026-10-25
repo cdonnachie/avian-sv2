@@ -1682,11 +1682,26 @@ mine first MinotaurX block
 
 ### Stage 8 — X16RT
 
+Two halves, and the first is nearly free.
+
 ```text
-fork selected ccminer/suprminer
-link the same libavian-sv2
-mine first X16RT block
+8a  X16RT in the miner we already have
+      cpuminer-opt carries X16RT already, which is part of
+      why it was chosen as the base
+      prove hash agreement as for MinotaurX, across epoch
+      boundaries rather than within one
+      reuse the Stratum v2 backend unchanged
+      -> both Avian algorithms have a working miner
+
+8b  GPU X16RT, a ccminer or suprminer fork
+      link the same libavian-sv2
+      about performance, not about X16RT existing
+      can happen any time after 8a
 ```
+
+Splitting it this way means a two-algorithm launch does not wait on a CUDA
+port. It also means 8b is optional rather than blocking, which is a better
+shape for the larger piece of work.
 
 ### Stage 9 — Dual mining
 
