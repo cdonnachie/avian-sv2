@@ -38,9 +38,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "avian-mining"
+version = "0.1.0"
+dependencies = [
+ "avian-pow",
+ "avian-regtest",
+ "avian-tdp",
+ "binary_sv2",
+ "common_messages_sv2",
+ "mining_sv2",
+ "secp256k1",
+]
+
+[[package]]
+name = "avian-pow"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "avian-regtest"
+version = "0.1.0"
+dependencies = [
+ "avian-tdp",
+ "secp256k1",
+]
+
+[[package]]
 name = "avian-sv2-pool"
 version = "0.1.0"
 dependencies = [
+ "avian-mining",
+ "avian-pow",
+ "avian-regtest",
  "avian-tdp",
  "secp256k1",
 ]
@@ -258,6 +289,15 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "mining_sv2"
+version = "12.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab45eca584d0e0478ea87919f7c7f93d579bb453ecb1e772e46ffe9b20a89bdb"
+dependencies = [
+ "binary_sv2",
+]
 
 [[package]]
 name = "noise_sv2"

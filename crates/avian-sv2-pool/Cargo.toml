@@ -1,6 +1,6 @@
 [package]
 name = "avian-sv2-pool"
-description = "Template Distribution client for the Avian Stratum v2 pool"
+description = "An Avian Stratum v2 pool: Template Distribution client and Mining Protocol server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,4 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 avian-tdp = { path = "../avian-tdp" }
+avian-mining = { path = "../avian-mining" }
+avian-pow = { path = "../avian-pow" }
 secp256k1.workspace = true
+
+[dev-dependencies]
+avian-regtest = { path = "../avian-regtest" }

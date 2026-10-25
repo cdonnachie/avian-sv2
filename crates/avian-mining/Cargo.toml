@@ -1,0 +1,18 @@
+[package]
+name = "avian-mining"
+description = "The Stratum v2 Mining Protocol server half of the Avian pool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+avian-tdp = { path = "../avian-tdp" }
+avian-pow = { path = "../avian-pow" }
+binary_sv2.workspace = true
+common_messages_sv2.workspace = true
+mining_sv2.workspace = true
+secp256k1.workspace = true
+
+[dev-dependencies]
+avian-regtest = { path = "../avian-regtest" }

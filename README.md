@@ -1,19 +1,83 @@
 # avian-sv2
 
-Stage 2 of the Avian Stratum v2 pool: a Rust Template Distribution Protocol
-client that connects to a live `aviand`, negotiates Avian's `0x4001`
-extension, and receives block templates for both of Avian's proof-of-work
-algorithms.
+An Avian Stratum v2 pool. Upstream it is a Template Distribution client to
+`aviand`, one connection per algorithm. Downstream it is a Mining Protocol
+server to workers, one standard channel each. Both halves speak Avian's
+`0x4001` extension.
 
-No Mining Protocol, no mining channels, no share accounting, no payouts. Those
-are Stage 3 and later. See `Avian-Native-Stratum-V2-Mining-Plan.md` section 25.
+Stages 2 and 3 of `Avian-Native-Stratum-V2-Mining-Plan.md` section 25.
 
 ```
-crates/avian-tdp        the library: Noise, framing, codecs, session
-crates/avian-sv2-pool   the binary: one session per algorithm
+crates/avian-pow        Avian's X16RT and MinotaurX, linked from src/algo
+crates/avian-tdp        Noise, framing, codecs, the TDP session, coinbase
+crates/avian-mining     the Mining Protocol server and the pool wiring
+crates/avian-sv2-pool   the binary
+crates/avian-regtest    starts a regtest node for tests; test support only
 ```
 
-## The two findings that shaped this
+**The milestone is reached.** `aviand` to pool to worker to pool to `aviand`,
+with a regtest block found by a test worker, relayed by the pool, accepted by
+the node, and reported by `getblock` under the algorithm that was negotiated —
+for both algorithms. Section 12 of the plan, with the test worker standing in
+for a real miner. See [Tests](#tests) for the output.
+
+## Contents
+
+- [The three questions that shaped this](#the-three-questions-that-shaped-this)
+- [Building](#building)
+- [Running it](#running-it)
+- [Tests](#tests)
+- [Where doc/sv2.md falls short](#where-docsv2md-falls-short)
+- [Design](#design)
+- [What is not here](#what-is-not-here)
+
+## The three questions that shaped this
+
+Each stage opened with one question whose wrong answer would have wasted
+everything after it. The third is Stage 3's.
+
+### Can the pool compute Avian's proof-of-work hash from Rust? Yes, by FFI
+
+A pool has to compare a share against a target, and for Avian that target is
+compared against the X16RT or MinotaurX hash, not SHA256d. Without this,
+share validation is a stub and nothing downstream can be verified.
+
+`crates/avian-pow` links Avian's own implementation. It was cheaper than
+feared, because the two entry points are header-only templates: `HashX16R` in
+`src/algo/x16r/x16r.h` and `Minotaurx` in `src/algo/minotaurx/minotaurx.h`.
+Neither needs any of the node's own machinery — only `uint256.h` and the
+algorithm sources `src/CMakeLists.txt` already lists, 24 C and C++ files plus
+`uint256.cpp`. Nothing is copied into this repository and nothing in the Avian
+tree is written to; `build.rs` compiles them in place with the `cc` crate,
+which was already in the tree as `secp256k1-sys`'s build dependency.
+
+`ComputePoWHash` itself is not used, because it is a `CBlockHeader` method and
+that pulls in `hash.h`, `streams.h` and the rest. The shim instantiates the two
+templates directly and derives X16RT's seed, `SHA256d(nTime & 0xffffff80)`,
+on the C side so the Rust caller cannot get the mask or the double hash wrong.
+
+It is verified against ground truth rather than against itself: four real
+regtest blocks, two per algorithm, taken from `getblock <hash> 0` and
+`getblockhash` with `getblock`'s `powtype` saying which algorithm each was
+mined under. The hasher reproduces all four block hashes. There is also a test
+that the same header hashes differently under each algorithm, so a `pow_type`
+argument that was being ignored could not pass.
+
+```
+running 3 tests
+test tests::the_seed_follows_the_128_second_epoch ... ok
+test tests::the_two_algorithms_disagree ... ok
+test tests::matches_real_regtest_blocks ... ok
+```
+
+`PowHasher` is still a trait, with a `MetadataOnlyHasher` beside the real one.
+Not as a fallback — the pool refuses to start without the real hashers — but
+because it makes the ordering of the validation ladder testable: a check that
+runs *before* the hash can be proved to run before it by using a hasher that
+fails. Two of the share tests do exactly that. The stub refuses every share
+rather than accepting one, so it cannot be mistaken for a working pool.
+
+### The two from Stage 2
 
 The second one has since been fixed in Avian Core, and this client now runs
 entirely on SRI's Noise. Both are recorded because the second is the reason
@@ -148,14 +212,24 @@ matters — SRI against the node — rather than this client against itself.
 cargo build --release
 ```
 
-Needs Rust 1.75 or later. Dependencies are SRI's `codec_sv2`, `noise_sv2`,
-`framing_sv2`, `binary_sv2`, `common_messages_sv2` and
-`template_distribution_sv2`, plus `secp256k1` at the version `noise_sv2`
-already pins — needed only to turn the node's authority private key file into
-the x-only public key `noise_sv2` checks the certificate against. Nothing
-else.
+Needs Rust 1.75 or later, a C and C++ toolchain, and the Avian Core source
+tree. Dependencies are SRI's `codec_sv2`, `noise_sv2`, `framing_sv2`,
+`binary_sv2`, `common_messages_sv2`, `mining_sv2` and
+`template_distribution_sv2`, plus two that were already in the tree as
+transitive dependencies at the versions SRI pins: `secp256k1`, for the
+authority keys and for SHA256, and `cc` as a build dependency, to compile
+Avian's algorithm sources. Nothing else.
 
-## Running it against a node
+`build.rs` looks for the Avian `src` directory beside this repository, or at
+`AVIAN_SRC`. Without it the crate still compiles, but the hashers report
+themselves unavailable and the pool refuses to start rather than accepting
+every share:
+
+```
+AVIAN_SRC=/path/to/Avian-v5.0/src cargo build --release
+```
+
+## Running it
 
 Start a regtest node. **Generate a block first:** the node refuses to build
 templates while it considers itself in initial block download, and refuses
@@ -175,17 +249,40 @@ With `-sv2` and no `-sv2bind` it listens on `127.0.0.1:18447`.
 cargo run -p avian-sv2-pool -- --datadir /tmp/sv2
 ```
 
-That opens one connection per algorithm and prints every round of work until
-killed. `--duration <seconds>` stops on its own.
+That opens one Template Distribution connection per algorithm and then serves
+the Mining Protocol on `127.0.0.1:34254`:
 
-The certificate is verified against the authority key by default, derived from
-the 32 raw bytes the node writes to `<datadir>/regtest/sv2_authority_key` on
-first run. `--authority <hex>` takes the x-only public key directly, for an
-operator who does not have the node's datadir. `--insecure-tofu` skips the
-check; the session is still encrypted, but nothing says the peer is the node
-you meant.
+```
+[pool] generated a new authority key in /tmp/pool-key
+[pool] proof of work: Avian's own X16RT and MinotaurX, linked from src/algo
+[pool] x16rt: session open, extension 0x4001 accepted, version_rolling_mask 0x00000000, node certificate verified
+[pool] minotaurx: session open, extension 0x4001 accepted, version_rolling_mask 0x00000000, node certificate verified
+[x16rt] template 1 — the tip moved
+[x16rt]   tip 07966e15ab8bf8c1ff4e7b98abbdc3f5fa91f82c6b7fbe4c3ad2bea068f169b4 ntime 1792947890..1792947890
+[minotaurx] template 2 — the tip moved
+[minotaurx]   tip 07966e15ab8bf8c1ff4e7b98abbdc3f5fa91f82c6b7fbe4c3ad2bea068f169b4 ntime 1792947890..1792947890
+[pool] serving the Mining Protocol on 127.0.0.1:34254 for 2 algorithm(s)
+[pool] pool authority public key fd19c02f26ae6e3ba3e241e47633238acf0230feeed247d817f4d4b9b2bf8fb0
+```
 
-The client connects to loopback only, and refuses anything else.
+The listener does not open until a template has arrived for every algorithm,
+because a worker that connected before one had no target to be given and no
+job to mine.
+
+That last line is what a worker pins to know it is talking to this pool. The
+pool's authority private key is generated mode 0600 on first run, the same way
+the node generates its own.
+
+**Two certificates, two directions.** The pool verifies the node's by default,
+from the 32 raw bytes at `<datadir>/regtest/sv2_authority_key`; `--authority
+<hex>` takes the key directly for an operator without the node's datadir, and
+`--insecure-tofu` skips the check. A worker verifies the pool's, from the
+public key above. Noise NX authenticates the server to the client in both
+directions and neither client to its server, so it is transport security and
+not access control.
+
+Both the connection to the node and the listener are loopback only, and both
+refuse anything else.
 
 ### The spike
 
@@ -205,24 +302,91 @@ problem.
 cargo test
 ```
 
-`crates/avian-sv2-pool/tests/live_node.rs` starts a regtest `aviand`, mines
-101 blocks, opens a session per algorithm and asserts that a template arrived
-for each with the right algorithm in `version` bits 16-23, that
-`AvianTimeConstraints` keys to the same template and agrees with
-`SetNewPrevHash`, that `RequestTransactionData` answers, and that an unknown
-template id is refused rather than disconnected. A second test asserts a tip
-change pushes fresh work.
+43 tests, of which 15 start a real node. Everything that needs one skips with
+a message when `aviand` is not found; `AVIAND` and `AVIAN_CLI` override the
+default of `~/avian-build/bin`. The nodes the tests start pass `-listen=0`,
+without which they bind the regtest P2P port and refuse to start if a node is
+already running by hand.
 
-Both skip with a message when `aviand` is not found. `AVIAND` and `AVIAN_CLI`
-override the default of `~/avian-build/bin`.
+### The milestone
 
-The nodes the tests start pass `-listen=0`. Without it they bind the regtest
-P2P port and refuse to start if a node is already running by hand.
+`crates/avian-mining/tests/end_to_end.rs` is section 12 of the plan with a test
+worker in place of a real miner:
+
+```
+[pool] 127.0.0.1:32970 completed the Noise handshake
+[pool] 127.0.0.1:32970 opened channel 1 on x16rt
+[pool] channel 1 found a block for template 1, submitting
+[test] x16rt mined block 0e5fd7d85ec63ab0b4498c820c17219ef5e5ddd048ad49e9234a1b56217fcf10 at height 102
+[pool] 127.0.0.1:32978 completed the Noise handshake
+[pool] 127.0.0.1:32978 opened channel 2 on minotaurx
+[pool] channel 2 found a block for template 4, submitting
+[test] minotaurx mined block 74f14ca9fd22b9fdeaf494abe2bef078cafd07cd0a9a14bee4fd2948031bc624 at height 103
+```
+
+The node accepted both and `getblock` reports the algorithm each channel had
+negotiated, which the test asserts. Nothing about that is mocked: a real
+`aviand` issued the templates, the pool built the coinbases, the worker found
+the nonces by hashing, and the node validated the blocks.
+
+### The test worker
+
+`crates/avian-mining/tests/common/worker.rs`, a subdirectory so cargo does not
+build it as a product. It opens a channel, receives jobs, searches nonces and
+submits shares, and it is a second reader of the pool's wire format, which is
+the only way to find out whether the pool's ordering and flags are what it
+believes they are.
+
+It records every message **in the order it arrived**, because the properties
+worth asserting here are orderings. Asserting that `ntime_min` equals the
+activating `ntime_start` passes whatever order the two messages arrived in; the
+rule doc/sv2.md states is about order:
+
+```
+test constraints_precede_the_set_new_prev_hash_that_activates_a_job ... ok
+test the_first_job_on_a_channel_is_a_future_job ... ok
+test the_activation_ntime_equals_the_jobs_ntime_min ... ok
+```
+
+And the flags, which are silent when wrong:
+
+```
+test a_version_rolling_request_is_refused_rather_than_answered ... ok
+test setup_success_always_sets_fixed_version_and_never_extended_channels ... ok
+test a_worker_that_cannot_take_standard_jobs_is_refused ... ok
+test the_extension_is_required_of_a_worker_too ... ok
+test the_algorithm_reply_reports_a_zero_version_rolling_mask ... ok
+```
+
+And the refusals, each of which a worker could otherwise mistake for silence:
+
+```
+test a_rolled_version_or_an_out_of_window_ntime_is_refused ... ok
+test a_duplicate_share_is_refused ... ok
+test a_share_below_the_network_target_is_accepted_but_not_submitted ... ok
+test each_algorithm_gets_its_own_channel_and_job_stream ... ok
+```
+
+### The upstream half on its own
+
+`crates/avian-sv2-pool/tests/live_node.rs` opens a Template Distribution
+session per algorithm with no Mining Protocol involved, and asserts the
+algorithm in `version` bits 16-23, that `AvianTimeConstraints` keys to the
+same template and agrees with `SetNewPrevHash`, that
+`RequestTransactionData` answers, that an unknown template id is refused
+rather than disconnected, and that a tip change pushes fresh work.
 
 ## Where doc/sv2.md falls short
 
 This matters because that document is about to be used for a registry
 allocation and third-party implementers will build against it.
+
+Findings 1 through 6 are from implementing the **downstream** side, the pool as
+a client of the node. Findings 7 through 11 are from implementing the
+**upstream** side, the pool as a server to workers, which the document
+specifies but nothing in Avian Core implements, so this is the first time
+anything has been built against that half. Four of the six downstream findings
+have since been fixed in the node or the document.
 
 **1. The Noise handshake, above. Fixed in the node; the claim is now true.**
 It was the costliest thing in the document, because it was the one claim an
@@ -263,17 +427,19 @@ interval refresh. `Work::tip_changed` here compares the hash instead.
 Either the document should say the node always sends all three, or the node
 should do what the document says.
 
-**3. `SetNewPrevHash`'s third field is named twice.** The document, and
-`mining_sv2.py`, call it `ntime_start`:
+**3. `SetNewPrevHash`'s third field is named twice. Withdrawn: SRI is the one
+that diverges.** I reported this as a documentation defect and it was not one.
+Both `05-Mining-Protocol.md` and `07-Template-Distribution-Protocol.md` name
+the field `ntime_start`, so the document matches the specification and SRI's
+`template_distribution_sv2::SetNewPrevHash::header_timestamp` is SRI's own
+name for it. Likewise `stale-template`: `07` defines no values for
+`RequestTransactionData.Error.error_code` at all, so the field is free-form and
+SRI's `"stale-template-id"` constant is SRI's invention, not a correction.
 
-> the `AvianTimeConstraints` `ntime_min` equals the `ntime_start` in the
-> `SetNewPrevHash` for that template
-
-The Stratum v2 spec and SRI's `template_distribution_sv2::SetNewPrevHash` call
-that field `header_timestamp`; `ntime_start` and `min_ntime` are Mining
-Protocol names. An implementer using SRI's structs has to work out that the two
-are the same field. Worth one parenthesis in the document, since it never
-tabulates the stock messages.
+The thing that is still worth a parenthesis is only that SRI's name differs, so
+an implementer wiring SRI's structs to this document has to work out that the
+two are one field. That is SRI's problem to fix, not Avian's. The code here
+carries the note at the declaration of `PrevHash::ntime_start`.
 
 **4. Three error codes the node sends are not in the document, and one that is
 disagrees with SRI.** The codes the document names are
@@ -324,36 +490,137 @@ canonical re-serialization check and the submission is refused with nothing on
 the wire. One sentence saying the declared size must cover every output the
 pool adds, not just its payout, would save an implementer a silent failure.
 
-## Design, and the seam for Stage 3
+### From implementing the upstream side
+
+**7. `SubmitShares.Error` has no code for the two things the extension exists
+to enforce.** The specification's codes are `invalid-channel-id`,
+`stale-share`, `difficulty-too-low` and `invalid-job-id`. An Avian pool must
+refuse a share whose `version` differs from the job's, because
+`REQUIRES_FIXED_VERSION` is set and rolling bits 16-23 moves the share to the
+other algorithm's proof-of-work limit, and one whose `ntime` falls outside
+`AvianJobTimeConstraints`. Those are precisely the two failures the extension
+was created to make explicit rather than silent, and there is no code for
+either.
+
+`error_code` is a `STR0_255`, so inventing one is legal; this pool sends
+`invalid-version` and `invalid-ntime`. But a miner cannot know them in advance,
+which puts them in the same position the algorithm and the ntime bound were in
+before the extension existed. They belong in the extension's own
+specification, beside the `AvianSelectAlgorithm.Error` table that was just
+added, because they are what a third-party *miner* has to recognise. This is
+the mirror image of finding 4 and the same class of defect.
+
+**8. Nothing says what a pool does when a worker clears
+`REQUIRES_STANDARD_JOBS`.** The flag table says Avian v1 wants it — "**1**,
+the worker needs `NewMiningJob`" — and explains why, but not what happens if a
+worker does not set it. There is no "missing required flag" code:
+`unsupported-feature-flags` names flags that *are* unsupported, and the
+specification describes the accompanying `flags` field as indicating "which
+flag is causing an error", so using it for a flag whose *absence* is the
+problem is a stretch a miner cannot disambiguate. The specification has
+precedent for a dedicated code in `missing-declare-tx-data-flag`, so an Avian
+equivalent would be clearer. This pool refuses with
+`unsupported-feature-flags` and the bit named, and a test pins that behaviour
+so it is at least consistent.
+
+**9. The `AvianJobTimeConstraints` ordering rules do not cover a tip change.**
+The document gives two cases, "active job, `ntime_start` present" and "future
+job, `ntime_start` absent". Neither is what a pool faces most of the time: a
+channel that already has an active job, on a tip that has just moved. Two
+readings are defensible. Issue a new *future* job, then its constraints, then
+the `SetNewPrevHash` that activates it — which preserves the stated invariant
+that constraints precede activation. Or issue an *active* job and a
+`SetNewPrevHash`, which arguably breaks it. This pool does the first. One
+sentence would settle it, and it is the steady-state case, so it is the one an
+implementer will hit most.
+
+**10. "Narrow, never widen" has no floor.** A pool must narrow the node's
+window. But on regtest and testnet the node pins it shut, `ntime_min ==
+ntime_max`, because `nBits` there is a function of `nTime`. A pool that
+narrowed a pinned window would produce an empty one and its workers would have
+no legal `ntime` at all. The document should say that a pool must not produce
+an empty window, or that a pinned one is passed through unchanged. This pool
+treats an empty window as a protocol error and refuses to build the job.
+
+**11. Nothing says where the pool's own coinbase outputs may go.** "What a
+client must reproduce" requires every output in `coinbase_tx_outputs` present
+verbatim, "with the witness commitment the highest-indexed output bearing the
+`aa21a9ed` magic". The pool adds its own payout output and the document does
+not say whether that goes before or after the required ones. The natural
+implementation — append yours at the end — is the one that looks unsafe, since
+it moves the commitment away from the highest index overall. This pool puts the
+payout first and the required outputs after it, which works. **I did not test
+the other order**, so I cannot say whether it is refused or merely
+ill-advised; either way an implementer has to guess, and one sentence would
+remove the guess.
+
+## Design
 
 ```
-avian-tdp::transport   SRI's Noise and framing, over a blocking socket
+avian-pow              Avian's X16RT and MinotaurX, by FFI
+avian-tdp::transport   SRI's Noise and framing, both roles, over a socket
 avian-tdp::avian       extension 0x4001 and negotiation extension 0x0001
 avian-tdp::tdp         the stock Template Distribution messages, owned
-avian-tdp::session     one connection, one algorithm
-avian-sv2-pool         one AlgoContext per algorithm
+avian-tdp::block       coinbase, merkle folding, header, target comparison
+avian-tdp::session     one upstream connection, one algorithm
+avian-mining::share    the validation ladder, behind a PowHasher trait
+avian-mining::job      a job and its ntime window
+avian-mining::channel  one standard channel: push work, answer submissions
+avian-mining::server   the listener and each worker's session
+avian-mining::pool     the wiring, so the binary and the tests share one
 ```
 
-Three things are kept separable because Stage 3 needs them apart:
+### The seam between the two halves
 
-- **The TDP session knows nothing about mining.** `TdpSession` produces rounds
-  of work for one algorithm. A Mining Protocol server owns one per algorithm
-  and never has to reach inside it.
-- **The Avian extension codecs are not Template Distribution specific.**
-  `avian::encode_job_time_constraints` and `decode_job_time_constraints` are
-  there now, unused, because `AvianJobTimeConstraints` is the Mining Protocol
-  half of the same extension and travels under `0xc001`. The transport already
-  sets and reads the `channel_msg` bit.
-- **Per-algorithm state lives in `AlgoContext`.** Avian's two algorithms have
-  independent difficulty, independent targets and independent job streams, so
-  nothing is shared between them. One connection carries one algorithm, which
-  is why a pool mining both opens two.
+A `Connection` splits into a reader and a writer that share no state: each
+direction has its own cipher, nonce counter and buffer. That is what makes the
+whole thing work with plain threads and no async runtime.
+
+- **Downstream**, the thread that received a template pushes a job onto every
+  channel mining that algorithm, while each worker's own thread is blocked
+  reading from its socket. Both go through that channel's writer mutex.
+- **Upstream**, a worker's thread sends a winning share to the node as a
+  `SubmitSolution` through a `SolutionSubmitter`, while the Template
+  Distribution session's own thread is blocked in `next_work`.
+
+Holding the writer mutex across a whole round of work is also what keeps it
+contiguous on the wire: a `SubmitShares.Success` cannot land between a
+`NewMiningJob` and the `SetNewPrevHash` that activates it.
+
+### Decisions worth knowing about
+
+- **Job invalidation compares the prev hash; it does not watch for a message.**
+  `aviand` sends `SetNewPrevHash` every round whether the tip moved or not,
+  while doc/sv2.md says an in-place refresh omits it, and that is still
+  unresolved upstream. `Work::tip_changed` compares the hash, and a channel
+  clears its retained jobs only when that is true. A pool keyed on the
+  message's arrival would throw away every job in flight on every interval
+  refresh; one keyed on its absence would never invalidate against `aviand` at
+  all. The comparison is right against both.
+- **An `AlgoContext` remembers the prev hash separately from the work**, so a
+  round that genuinely omits `SetNewPrevHash` still has a header to build.
+  Unreachable against `aviand` today, which is exactly why it is there.
+- **Channel ids are pool-wide, not per algorithm.** A channel id goes into its
+  coinbase's extranonce, so two channels sharing one would hash identical
+  headers whenever their templates matched. A test caught this: two workers on
+  different algorithms were handed the same merkle root.
+- **The share target is fixed**, the network target made `--share-target-shift`
+  halvings harder and then clamped to the worker's `max_target`. No vardiff. On
+  regtest the network target is the algorithm's own floor, so the default of 0
+  makes nearly every accepted share a block, which is what makes the end-to-end
+  test fast.
+- **The validation ladder runs every cheap check before the hash.** For Avian
+  there is no partial check that can stand in for the hash, which doc/sv2.md
+  gives as the reason the node needs a rate limit; the same applies to a pool.
+  Two tests prove the ordering by using a hasher that fails.
 
 ## What is not here
 
-- The Mining Protocol, mining channels, `SetTarget`, jobs, shares, payouts.
-- `SubmitSolution`. The client never builds a coinbase, so there is nothing to
-  submit. The coinbase contract in doc/sv2.md is the pool's to satisfy, and it
-  belongs with the code that builds one.
-- Reconnection. A session that fails reports and stops.
+- No miner. The test worker is test support and says so.
+- No payouts, no share accounting beyond what validation needs, no vardiff
+  beyond a fixed `SetTarget`, no extended channels, no job declaration, no
+  Stratum v1.
+- No reconnection. A session that fails reports and stops.
+- No rate limiting on submissions. The node has one and the pool relies on
+  being loopback; a pool facing untrusted workers would need its own.
 - Anything non-loopback.

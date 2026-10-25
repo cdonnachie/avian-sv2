@@ -1,0 +1,11 @@
+[package]
+name = "avian-regtest"
+description = "Starts a regtest aviand for integration tests. Test support only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+avian-tdp = { path = "../avian-tdp" }
+secp256k1.workspace = true

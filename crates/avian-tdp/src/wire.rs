@@ -107,6 +107,32 @@ impl Writer {
         self
     }
 
+    pub fn raw(&mut self, bytes: &[u8]) -> &mut Self {
+        self.0.extend_from_slice(bytes);
+        self
+    }
+
+    /// A B0_255: a one-byte length then the bytes.
+    pub fn bytes_u8(&mut self, bytes: &[u8]) -> &mut Self {
+        self.u8(bytes.len() as u8).raw(bytes)
+    }
+
+    /// A B0_64K: a two-byte length then the bytes.
+    pub fn bytes_u16(&mut self, bytes: &[u8]) -> &mut Self {
+        self.u16(bytes.len() as u16).raw(bytes)
+    }
+
+    /// Bitcoin's compact size. Used for transaction serialization, not for
+    /// Stratum v2, which has no variable-length integer.
+    pub fn varint(&mut self, value: u64) -> &mut Self {
+        match value {
+            0..=0xfc => self.u8(value as u8),
+            0xfd..=0xffff => self.u8(0xfd).u16(value as u16),
+            0x1_0000..=0xffff_ffff => self.u8(0xfe).u32(value as u32),
+            _ => self.u8(0xff).u64(value),
+        }
+    }
+
     pub fn seq_u16(&mut self, items: &[u16]) -> &mut Self {
         self.u16(items.len() as u16);
         for item in items {

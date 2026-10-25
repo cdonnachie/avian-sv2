@@ -4,7 +4,10 @@
 //! anything here:
 //!
 //! - [`transport`] is the Noise NX handshake and frame encryption, all of it
-//!   SRI's, with a blocking socket loop on top.
+//!   SRI's, with a blocking socket loop on top. Both roles: the initiator a
+//!   pool is to a node, and the responder it is to a worker.
+//! - [`block`] is coinbase construction, merkle folding and target
+//!   comparison, which are the pool's obligations to the node.
 //! - [`avian`] is extension `0x4001` and the Extensions Negotiation extension
 //!   `0x0001`, which SRI does not define. It includes
 //!   `AvianJobTimeConstraints`, the Mining Protocol half, which this client
@@ -15,6 +18,7 @@
 
 pub mod authority;
 pub mod avian;
+pub mod block;
 pub mod error;
 pub mod session;
 pub mod tdp;
@@ -23,8 +27,8 @@ pub mod wire;
 
 pub use avian::{PowType, EXT_AVIAN, EXT_CORE, EXT_NEGOTIATION};
 pub use error::{Error, Result};
-pub use session::{SessionConfig, TdpSession, Work, PROTOCOL_VERSION};
-pub use transport::{Connection, Frame};
+pub use session::{SessionConfig, SolutionSubmitter, TdpSession, Work, PROTOCOL_VERSION};
+pub use transport::{Connection, ConnectionReader, ConnectionWriter, Frame};
 
 /// The port `aviand` listens on with `-sv2` and no `-sv2bind`.
 pub fn default_port(chain: &str) -> u16 {

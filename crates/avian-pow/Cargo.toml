@@ -1,0 +1,11 @@
+[package]
+name = "avian-pow"
+description = "Avian's X16RT and MinotaurX proof-of-work hashes, linked from Avian Core's own sources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+links = "avian_algo"
+
+[build-dependencies]
+cc.workspace = true

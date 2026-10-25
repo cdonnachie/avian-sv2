@@ -98,19 +98,25 @@ Native SV2 should be an additional option, not a mandatory migration.
 
 # 3. Target Components
 
-The project consists of four major pieces.
+The project consists of five major pieces, built in this order.
 
 ```text
 1. aviand SV2 Template Provider
 
 2. Avian SV2 pool
 
-3. MinotaurX native SV2 miner
+3. libavian-sv2 shared client library
 
-4. X16RT native SV2 miner
+4. MinotaurX native SV2 miner
+
+5. X16RT native SV2 miner
 ```
 
-A fifth optional project can combine both miners into one executable after the individual implementations are stable.
+The library is third rather than last. Both miners link it rather than each
+carrying its own protocol code, which is what keeps the Noise implementation
+count at one. Section 15 has the reasoning.
+
+A sixth optional project can combine both miners into one executable after the individual implementations are stable.
 
 ---
 
@@ -662,8 +668,13 @@ existing cpuminer-opt
               |
               +--- Stratum V1
               |
-              +--- Avian SV2
+              +--- libavian-sv2 over its C API
 ```
+
+The SV2 side is linked, not written. By the time this phase starts,
+`libavian-sv2` exists and has been exercised by the pool's own test worker, so
+the work here is the adapter between its `AvianMiningJob` and cpuminer-opt's
+existing job structures, and nothing protocol-level.
 
 ---
 
@@ -905,13 +916,43 @@ nTime + sv2ntimeforward
 
 # 15. Phase 5: Reusable Avian SV2 Client Library
 
-Once both miners work, extract their common protocol code.
+**Build this before the miners, not after them.**
 
-Possible project:
+The original ordering was to let both miners reveal which abstractions are
+genuinely common and extract afterwards. That is usually the right instinct and
+it is wrong here, for one reason: the pool is Rust and the miners are C and
+CUDA. Extracting later does not mean refactoring two Rust codebases into one.
+It means writing the SV2 client **twice in C** first, Noise included, and then
+discovering what they share.
+
+Writing Noise twice is specifically what this project cannot afford. Avian
+Core's own Noise implementation was self-consistent, passed every test written
+for it, and could not complete a handshake with any conforming Stratum v2
+implementation. It took an independent reader to find that, and the symptom was
+a MAC failure with no diagnostic. A second and third hand-written Noise, inside
+mining software where the feedback loop is a miner that silently earns nothing,
+is a worse bet than doing the library first.
 
 ```text
 libavian-sv2
 ```
+
+## It is mostly already written
+
+This is not a new project. The pool's `avian-tdp` crate already contains the
+framing, the Noise transport, extension negotiation and the Avian extension
+codecs, and Stage 3 adds the Mining Protocol message handling. What the library
+needs is the downstream half of the mining messages, which the pool's own test
+worker will have exercised, plus the part that does not exist yet:
+
+**A C API.** `extern "C"` bindings and a static library, so `cpuminer-opt` and a
+ccminer fork can link it without a Rust rewrite. Section 10's neutral
+`AvianMiningJob` struct is the right shape for that boundary: the C side sees
+jobs and submits shares, and never sees Noise, framing or SV2 types.
+
+The cost of this ordering is a Rust toolchain in the miner build, and
+cross-compiling for Windows and macOS miner releases is harder than for Linux.
+That is a real cost and it is smaller than the alternative.
 
 Responsibilities:
 
@@ -1382,7 +1423,8 @@ AvianNetwork/ccminer-avian
     X16RT reference miner
 
 AvianNetwork/libavian-sv2
-    optional shared miner client library
+    shared client library, extracted from the pool
+    and linked by both miners over a C API
 ```
 
 This prevents the consensus repository from accumulating pool or miner-specific code.
@@ -1440,23 +1482,37 @@ SubmitSharesStandard
 The annotation on those last two is not a detail. Section 8 has the full rule,
 and a checklist read on its own would suggest the order is always exactly this.
 
-### Stage 4 — MinotaurX
+### Stage 4 — Shared library
+
+```text
+libavian-sv2
+    extract framing, Noise, negotiation and the Avian
+    extension from the pool's avian-tdp crate
+    add the downstream mining-protocol half
+    add a C API over AvianMiningJob
+```
+
+Before the miners, not after. Section 15 says why: the pool is Rust and the
+miners are C and CUDA, so extracting later means writing the SV2 client twice
+in C first, Noise included.
+
+### Stage 5 — MinotaurX
 
 ```text
 fork cpuminer-opt
-add Avian SV2 client
+link libavian-sv2
 mine first MinotaurX block
 ```
 
-### Stage 5 — X16RT
+### Stage 6 — X16RT
 
 ```text
 fork selected ccminer/suprminer
-reuse SV2 client
+link the same libavian-sv2
 mine first X16RT block
 ```
 
-### Stage 6 — Dual mining
+### Stage 7 — Dual mining
 
 ```text
 run CPU MinotaurX
@@ -1464,16 +1520,6 @@ run CPU MinotaurX
 GPU X16RT
 simultaneously
 ```
-
-### Stage 7 — Shared library
-
-Extract:
-
-```text
-libavian-sv2
-```
-
-once both implementations reveal which abstractions are genuinely common.
 
 ### Stage 8 — Compatibility
 
