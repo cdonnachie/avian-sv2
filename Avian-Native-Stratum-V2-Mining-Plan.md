@@ -263,6 +263,28 @@ And it is how the stack gets battle-tested: real hardware, real uptime, real
 network conditions, with nothing at stake when something breaks. Every bug
 better found in solo mode than in pooled mode will be found in solo mode.
 
+### Solo wants extended channels
+
+A standard channel hands the miner a finished merkle root. The miner hashes
+what it is given and has no way to know what is in the block. An extended
+channel hands it the coinbase prefix and suffix instead, so it assembles the
+coinbase itself and can see the transactions it is committing to.
+
+That difference is the whole of Stratum v2's case for itself, and solo mining
+is where it matters most: the miner who finds the block is the one being asked
+to trust the pool about what is in it.
+
+"We wrote the miner, so it will show you" is not an answer. It moves the trust
+rather than removing it, and it stops being true the moment somebody mines
+Avian with something we did not write. Bitaxe, the reference hobbyist Stratum
+v2 miner, defaults to extended channels for external pools and tells the user
+why in its own interface: the pool sends the coinbase template, enabling
+transaction verification.
+
+So blockminerz serves extended channels, and the first native Avian miners are
+written against them. Standard channels stay supported, because they are
+simpler and some miners will want them.
+
 ### Where the payout address comes from
 
 The natural carrier is `user_identity` in `OpenStandardMiningChannel`, and it
@@ -471,7 +493,7 @@ the channel opens. Section 8 also fixes the `SetupConnection` flags on both
 sides, which is how "standard jobs only, fixed version" becomes enforceable
 rather than conventional.
 
-Extended channels and Job Declaration can come later.
+Job Declaration can come later. Extended channels cannot: see section 5.
 
 The initial goal is simply:
 
@@ -635,13 +657,33 @@ bounds.
 `AvianJobTimeConstraints` applies to extended channels too, unchanged: a job's
 `ntime` window does not depend on who assembles the coinbase.
 
-Extended-channel coinbase reconstruction, and how Avian's coinbase contract is
-enforced across it, are **deferred** until extended channels are implemented.
-Do not assume it falls out of the standard-channel case. SV2 defines
-`coinbase_tx_prefix` and `coinbase_tx_suffix` **without** the BIP141 marker,
-flag and witness data, while Avian's node-side contract requires a specific
-witness stack and a canonical byte-for-byte reconstruction. Those two have to
-be reconciled deliberately.
+Extended-channel coinbase reconstruction was deferred here on the grounds that
+SV2 defines `coinbase_tx_prefix` and `coinbase_tx_suffix` **without** the
+BIP141 marker, flag and witness data, while Avian's node-side contract requires
+a specific witness stack and a canonical byte-for-byte reconstruction.
+
+**That reconciles more easily than it first appears, because a merkle root is
+built from txids and a txid excludes witness data.** So:
+
+```text
+pool    splits its coinbase around the extranonce, without witness,
+        which is exactly what the spec asks for
+
+miner   inserts its extranonce, hashes prefix+extranonce+suffix to a
+        txid, folds the merkle path. It never needs the witness.
+
+pool    on a share, reconstructs the whole coinbase including the
+        BIP141 witness and submits that
+```
+
+Avian's canonical byte-for-byte check applies to what the pool submits to the
+node, and the pool controls that end entirely. The witness commitment is also
+unaffected by the extranonce, because it commits to the witness root of the
+other transactions plus the coinbase's own fixed zero witness.
+
+What still needs care is the prefix and suffix split itself: the extranonce
+goes inside the scriptSig, which must stay within its 2 to 100 byte bound
+including the BIP34 height push and any operator tag.
 
 ## Flags on an Avian mining connection
 
@@ -706,25 +748,27 @@ at all, so `aviand` rejects any non-zero `SetupConnection.flags` with
 
 ```text
 one connection            = one algorithm, immutable
-one channel type          = standard
-one job type              = standard job
+one job type              = standard job on a standard channel,
+                            extended job on an extended channel
 nVersion                  = fixed, enforced by flags on both sides
 ntime                     = explicit inclusive min and max
-merkle root               = fixed, the miner does not recompute it
-the miner varies          = nonce, and ntime within its window
-the pool constructs       = the coinbase
+the miner varies          = nonce, ntime within its window, and on an
+                            extended channel its own extranonce
+the pool constructs       = the coinbase, or its prefix and suffix
 the pool owns             = Avian coinbase compliance, section 6
 targets                   = separate per algorithm, never normalized
 
 no job declaration
-no extranonce rolling
 no version rolling
-no extended channels
 ```
 
-Deliberately restrictive. Every one of those is something that can be relaxed
-later from a working base, and several of them are things that would be very
-hard to debug if they were all variable at once.
+Still deliberately restrictive, with one line moved out of it. Extended
+channels were on that list and are now in v1, for the reason in section 5:
+on a standard channel the pool hands down a finished merkle root and the
+miner can only take its word for what is in the block.
+
+Everything else can still be relaxed later from a working base, and several
+of them would be very hard to debug if they were all variable at once.
 
 ---
 
@@ -1614,7 +1658,21 @@ miner works there is something real to point it at rather than another stage
 to wait through. The library's C test program already stands in for a miner
 well enough to develop against.
 
-### Stage 6 — MinotaurX, and blockminerz live
+### Stage 6 — Extended channels
+
+```text
+NewExtendedMiningJob, coinbase split around the extranonce
+SubmitSharesExtended, coinbase reconstructed with its witness
+version_rolling_allowed = false, matching REQUIRES_FIXED_VERSION
+standard channels keep working alongside
+```
+
+Before the miners, so they are written against it rather than retrofitted.
+Section 5 has why, and the coinbase note in section 8 has the mechanism: the
+split works because a merkle root is built from txids and a txid excludes
+witness data.
+
+### Stage 7 — MinotaurX, and blockminerz live
 
 ```text
 fork cpuminer-opt
@@ -1622,7 +1680,7 @@ link libavian-sv2
 mine first MinotaurX block
 ```
 
-### Stage 7 — X16RT
+### Stage 8 — X16RT
 
 ```text
 fork selected ccminer/suprminer
@@ -1630,7 +1688,7 @@ link the same libavian-sv2
 mine first X16RT block
 ```
 
-### Stage 8 — Dual mining
+### Stage 9 — Dual mining
 
 ```text
 run CPU MinotaurX
@@ -1639,7 +1697,7 @@ GPU X16RT
 simultaneously
 ```
 
-### Stage 9 — Compatibility
+### Stage 10 — Compatibility
 
 Add optional:
 
@@ -1649,7 +1707,7 @@ SV1 downstream support
 
 for legacy miners.
 
-### Stage 10 — Pooled mining
+### Stage 11 — Pooled mining
 
 ```text
 share accounting
@@ -1663,7 +1721,7 @@ operator dashboard, as separate services
 The first stage that holds other people's money, and therefore the first that
 can lose it. Everything before this has been load-bearing practice for it.
 
-### Stage 11 — Production
+### Stage 12 — Production
 
 Freeze the Avian extension wire format, **both halves**: the Template
 Distribution messages `0x00` to `0x03` and the Mining Protocol message `0x04`.
@@ -1704,7 +1762,7 @@ There are two of these now, and the first one matters more.
 
 ## First: blockminerz solo mining is live
 
-Reached at the end of Stage 6, not Stage 5, because solo is Stratum v2 only and
+Reached at the end of Stage 7, not Stage 5, because solo is Stratum v2 only and
 the first native miner lands there.
 
 ```text
