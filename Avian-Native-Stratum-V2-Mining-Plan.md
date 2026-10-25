@@ -27,6 +27,20 @@ Avian's two proof-of-work algorithms remain independent. A miner or mining syste
 
 The first implementation should prioritize correctness, protocol interoperability and clean separation of responsibilities over adding every optional Stratum V2 feature.
 
+## This ships
+
+The pool is not a reference implementation with production as a someday. It is
+production software with a named operator: **blockminerz.com**, previously run
+and shut down, to be brought back as the first Stratum v2 mining pool for
+Avian.
+
+That changes two things about how it is built. Accounting, payouts,
+persistence, vardiff, rate limiting and an operator view are requirements that
+are **deferred**, not features that are out of scope. And the first thing
+deployed is **solo mining**, not pooled mining, for the reason in section 5:
+pooled mining means holding other people's money between a block and a payout,
+and solo mining means never touching it.
+
 ---
 
 # 2. Design Principles
@@ -214,20 +228,7 @@ Both algorithms should successfully produce and submit blocks through the Templa
 
 ---
 
-# 5. Phase 2: Build a Minimal Avian SV2 Pool
-
-The next component should be a deliberately small reference pool.
-
-It does not initially need:
-
-```text
-database accounting
-web dashboard
-PPLNS
-PPS
-user management
-large-scale clustering
-```
+# 5. Phase 2: Build the Avian SV2 Pool
 
 Its purpose is to connect:
 
@@ -240,6 +241,92 @@ to:
 ```text
 SV2 Mining Protocol
 ```
+
+Built in layers, deployable at the end of the first one.
+
+## Solo mining first
+
+**Solo mining is the first thing blockminerz offers, and pooled mining comes
+after it.** This is a risk ordering, not a convenience one.
+
+Pooled mining means holding miners' earnings between finding a block and paying
+them out. That is custody. A share accounting bug, a payout bug, or a restart
+that loses a day of shares costs real money and the reputation the operator is
+rebuilding on. Solo mining has none of that: the miner's address goes in the
+coinbase, consensus pays them directly, and the pool never holds anything.
+
+It is also close to what already exists. The pool builds coinbases that satisfy
+the node's contract today. Solo mode mostly needs the payout script to come
+from the worker rather than be fixed. No ledger, no payout scheme, no database.
+
+And it is how the stack gets battle-tested: real hardware, real uptime, real
+network conditions, with nothing at stake when something breaks. Every bug
+better found in solo mode than in pooled mode will be found in solo mode.
+
+### Where the payout address comes from
+
+The natural carrier is `user_identity` in `OpenStandardMiningChannel`. Treat
+that as unsettled: it is actively churning upstream, with a TLV truncation to
+32 bytes landed as an acknowledged temporary patch and the maintainers saying
+it is mutated through the channel bootstrap flow and needs a deeper look. An
+Avian address is 34 characters and would not survive a 32-byte cap.
+
+Confirm it before building on it. The fallback is an account mapping held by
+the pool, which is more work and insulates the operator from an upstream
+redesign.
+
+### The catch worth naming
+
+Solo mining over Stratum v2 needs a Stratum v2 miner, and for Avian none
+exists until sections 9 and 13 are done. Two ways round it:
+
+```text
+a) solo over SV1 downstream
+      every existing Avian miner works unchanged
+      blockminerz is live before any native miner exists
+      moves section 21 much earlier than planned
+
+b) solo over SV2 only
+      waits for the native miners
+      keeps the staging in section 25 as originally written
+```
+
+(a) is the faster path to real hashrate on the stack, and it does not violate
+the principle in section 21 that SV1 must not dictate the architecture: the
+internal job representation stays SV2-shaped and SV1 is a thin adapter onto it.
+It does mean building the adapter years before it was planned.
+
+## What is deferred, and what is never
+
+Deferred until pooled mining, and required then:
+
+```text
+share accounting
+payout scheme, PPLNS or PPS
+persistence across restart
+worker authentication
+vardiff
+submission rate limiting
+operator dashboard and monitoring
+abuse handling and banning
+restart without dropping every miner
+```
+
+Submission rate limiting is the one that cannot wait for pooled mining. It is a
+hard prerequisite before the pool faces anything untrusted, including a public
+solo offering, for the reason `doc/sv2.md` gives for the node: Avian has no
+cheap proof-of-work pre-filter, so every submission costs a full hash.
+
+Never in the pool role itself:
+
+```text
+the web dashboard and stats services
+```
+
+Those are separate services consuming snapshots from the pool, the arrangement
+hashpool uses. It keeps the protocol core clean enough to stay a reference
+implementation while blockminerz runs it in production, which is the
+arrangement that benefits Avian most.
 
 ## Pool architecture
 
@@ -1414,7 +1501,12 @@ AvianNetwork/Avian
     aviand Template Provider
 
 AvianNetwork/avian-sv2-pool
-    reference pool
+    the pool, run in production by blockminerz.com
+    and serving as Avian's reference implementation
+
+AvianNetwork/avian-pool-services
+    stats and web, consuming snapshots from the pool
+    so operator concerns stay out of the protocol core
 
 AvianNetwork/cpuminer-avian
     MinotaurX reference miner
@@ -1496,7 +1588,26 @@ Before the miners, not after. Section 15 says why: the pool is Rust and the
 miners are C and CUDA, so extracting later means writing the SV2 client twice
 in C first, Noise included.
 
-### Stage 5 — MinotaurX
+### Stage 5 — Solo mining, and blockminerz live
+
+```text
+payout address per worker, from user_identity or an
+    account mapping if user_identity cannot carry it
+coinbase pays the worker, not the operator
+submission rate limiting, which cannot be deferred
+    past a public offering
+reconnection, from Stage 4
+```
+
+Plus a decision, per section 5: solo over SV1 downstream, which is live with
+existing Avian miners and pulls Stage 8 forward, or solo over SV2 only, which
+waits for Stages 6 and 7. The first gets real hashrate on the stack sooner and
+is how the rest of this plan gets tested against something other than our own
+code.
+
+No custody at this stage. That is the point of it.
+
+### Stage 6 — MinotaurX
 
 ```text
 fork cpuminer-opt
@@ -1504,7 +1615,7 @@ link libavian-sv2
 mine first MinotaurX block
 ```
 
-### Stage 6 — X16RT
+### Stage 7 — X16RT
 
 ```text
 fork selected ccminer/suprminer
@@ -1512,7 +1623,7 @@ link the same libavian-sv2
 mine first X16RT block
 ```
 
-### Stage 7 — Dual mining
+### Stage 8 — Dual mining
 
 ```text
 run CPU MinotaurX
@@ -1521,7 +1632,7 @@ GPU X16RT
 simultaneously
 ```
 
-### Stage 8 — Compatibility
+### Stage 9 — Compatibility
 
 Add optional:
 
@@ -1531,7 +1642,21 @@ SV1 downstream support
 
 for legacy miners.
 
-### Stage 9 — Production
+### Stage 10 — Pooled mining
+
+```text
+share accounting
+payout scheme
+persistence across restart
+worker authentication
+vardiff
+operator dashboard, as separate services
+```
+
+The first stage that holds other people's money, and therefore the first that
+can lose it. Everything before this has been load-bearing practice for it.
+
+### Stage 11 — Production
 
 Freeze the Avian extension wire format, **both halves**: the Template
 Distribution messages `0x00` to `0x03` and the Mining Protocol message `0x04`.
@@ -1567,6 +1692,29 @@ template-side special case.
 ---
 
 # 26. Definition of Success
+
+There are two of these now, and the first one matters more.
+
+## First: blockminerz solo mining is live
+
+```text
+aviand
+   |
+blockminerz SV2 pool
+   |
+real Avian miners, solo, paid by consensus
+```
+
+Running unattended, surviving restarts and network drops, rate limited against
+untrusted workers, and holding none of anyone's money. This is the milestone
+that turns the stack from something that passes its own tests into something
+that has met the world.
+
+Every defect found so far came from building something independent against the
+specification rather than from reviewing what was already written. Real miners
+are the next genuinely independent thing, and they will find what we have not.
+
+## Then: the full topology
 
 The project is complete when the following topology works reliably:
 
