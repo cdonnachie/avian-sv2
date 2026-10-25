@@ -385,8 +385,14 @@ Findings 1 through 6 are from implementing the **downstream** side, the pool as
 a client of the node. Findings 7 through 11 are from implementing the
 **upstream** side, the pool as a server to workers, which the document
 specifies but nothing in Avian Core implements, so this is the first time
-anything has been built against that half. Four of the six downstream findings
-have since been fixed in the node or the document.
+anything has been built against that half.
+
+**All eleven are now resolved**, nine by a change to `doc/sv2.md` or the node,
+one withdrawn as wrong, and one, the Noise handshake, by a fix to Avian Core
+itself. They are kept here rather than deleted, because the point of the list
+is not the defects but the method: both of Avian's own readers of the wire
+format agreed with each other and with nothing else, and the node's own test
+suite could not tell.
 
 **1. The Noise handshake, above. Fixed in the node; the claim is now true.**
 It was the costliest thing in the document, because it was the one claim an
@@ -394,7 +400,8 @@ implementer would not think to test: reach for SRI, get a MAC failure with no
 diagnostic, and have no reason to suspect the handshake rather than your own
 code. Kept here as the record of why this client was worth writing.
 
-**2. `SetNewPrevHash` is documented as conditional and is not.** The document
+**2. `SetNewPrevHash` is documented as conditional and is not. Fixed in the
+node: it now follows the tip rather than the refresh.** The document
 says:
 
 > `SetNewPrevHash` accompanies a template built on a tip the client has not
@@ -442,7 +449,8 @@ two are one field. That is SRI's problem to fix, not Avian's. The code here
 carries the note at the declaration of `PrevHash::ntime_start`.
 
 **4. Three error codes the node sends are not in the document, and one that is
-disagrees with SRI.** The codes the document names are
+disagrees with SRI. Fixed in the document: the extension's error values are
+now tabulated and normative.** The codes the document names are
 `unsupported-feature-flags`, `stale-template`, `template-id-not-found`,
 `unknown-template`, `bad-algo-id` and `bad-diff`. The node also sends:
 
@@ -464,7 +472,8 @@ The document matches the node, so SRI is the odd one out, but a client built on
 SRI's constants will not match the string it receives. This client accepts
 either.
 
-**5. A malformed extension message is a disconnect, not an error reply.** The
+**5. A malformed extension message is a disconnect, not an error reply. Fixed
+in the document, along with the error-then-disconnect case beside it.** The
 document covers the case where a client never negotiates the extension
 ("A client that never negotiates at all can only be disconnected, with a log
 line and no on-wire explanation"), but not the case where a negotiated
@@ -482,7 +491,8 @@ by a disconnect is worth stating, because a client that reads the error and
 tries to carry on will get an unexplained EOF.
 
 **6. Nothing says how `CoinbaseOutputConstraints` relates to the coinbase a
-pool will actually build.** The document says the node will not issue a
+pool will actually build. Fixed in the document: under-declaring surfaces only
+as a refused submission.** The document says the node will not issue a
 template before it arrives and that "the coinbase size and sigop budget it
 declares are what the block assembler reserves". What it does not say is what
 happens if a pool under-declares: the coinbase it then builds fails the
@@ -507,11 +517,16 @@ either.
 which puts them in the same position the algorithm and the ntime bound were in
 before the extension existed. They belong in the extension's own
 specification, beside the `AvianSelectAlgorithm.Error` table that was just
-added, because they are what a third-party *miner* has to recognise. This is
-the mirror image of finding 4 and the same class of defect.
+added, because they are what a third-party *miner* has to recognise.
+
+**Fixed in the document**, and in the registry submission draft: both
+`invalid-version` and `invalid-ntime` are now normative, which is what makes
+the names this pool chose recognisable to a miner that did not write them.
+This is the mirror image of finding 4 and the same class of defect.
 
 **8. Nothing says what a pool does when a worker clears
-`REQUIRES_STANDARD_JOBS`.** The flag table says Avian v1 wants it — "**1**,
+`REQUIRES_STANDARD_JOBS`. Fixed in the document: refuse the connection with
+`missing-standard-jobs-flag`.** The flag table says Avian v1 wants it — "**1**,
 the worker needs `NewMiningJob`" — and explains why, but not what happens if a
 worker does not set it. There is no "missing required flag" code:
 `unsupported-feature-flags` names flags that *are* unsupported, and the
@@ -523,7 +538,8 @@ equivalent would be clearer. This pool refuses with
 `unsupported-feature-flags` and the bit named, and a test pins that behaviour
 so it is at least consistent.
 
-**9. The `AvianJobTimeConstraints` ordering rules do not cover a tip change.**
+**9. The `AvianJobTimeConstraints` ordering rules do not cover a tip change.
+Fixed in the document: it resolves as the future-job case.**
 The document gives two cases, "active job, `ntime_start` present" and "future
 job, `ntime_start` absent". Neither is what a pool faces most of the time: a
 channel that already has an active job, on a tip that has just moved. Two
@@ -534,7 +550,8 @@ that constraints precede activation. Or issue an *active* job and a
 sentence would settle it, and it is the steady-state case, so it is the one an
 implementer will hit most.
 
-**10. "Narrow, never widen" has no floor.** A pool must narrow the node's
+**10. "Narrow, never widen" has no floor. Fixed in the document: narrowing to
+an empty window is now a protocol error.** A pool must narrow the node's
 window. But on regtest and testnet the node pins it shut, `ntime_min ==
 ntime_max`, because `nBits` there is a function of `nTime`. A pool that
 narrowed a pinned window would produce an empty one and its workers would have
@@ -542,7 +559,8 @@ no legal `ntime` at all. The document should say that a pool must not produce
 an empty window, or that a pinned one is passed through unchanged. This pool
 treats an empty window as a protocol error and refuses to build the job.
 
-**11. Nothing says where the pool's own coinbase outputs may go.** "What a
+**11. Nothing says where the pool's own coinbase outputs may go. Answered in
+the document: either order works, and this one needed no experiment.** "What a
 client must reproduce" requires every output in `coinbase_tx_outputs` present
 verbatim, "with the witness commitment the highest-indexed output bearing the
 `aa21a9ed` magic". The pool adds its own payout output and the document does
