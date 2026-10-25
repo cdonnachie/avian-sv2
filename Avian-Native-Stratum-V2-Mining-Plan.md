@@ -275,26 +275,25 @@ Confirm it before building on it. The fallback is an account mapping held by
 the pool, which is more work and insulates the operator from an upstream
 redesign.
 
-### The catch worth naming
+### Decided: solo over Stratum v2 only
 
-Solo mining over Stratum v2 needs a Stratum v2 miner, and for Avian none
-exists until sections 9 and 13 are done. Two ways round it:
+Solo mining over Stratum v2 needs a Stratum v2 miner, and for Avian none exists
+until section 9 is done. The alternative considered was an SV1 downstream
+adapter, which would have put existing Avian miners on the stack immediately
+and pulled section 21 years forward.
 
-```text
-a) solo over SV1 downstream
-      every existing Avian miner works unchanged
-      blockminerz is live before any native miner exists
-      moves section 21 much earlier than planned
+**That is not the route.** SV1 stays where it was, at Stage 9, optional and
+late.
 
-b) solo over SV2 only
-      waits for the native miners
-      keeps the staging in section 25 as originally written
-```
+What it costs: blockminerz cannot go live at Stage 5. The pool-side work lands
+there, and the first real miners arrive with the MinotaurX reference miner in
+Stage 6. Real-world exposure is therefore further out, and real-world exposure
+is what has found every defect that mattered so far.
 
-(a) is the faster path to real hashrate on the stack, and it does not violate
-the principle in section 21 that SV1 must not dictate the architecture: the
-internal job representation stays SV2-shaped and SV1 is a thin adapter onto it.
-It does mean building the adapter years before it was planned.
+What it buys: no adapter to build or maintain, nothing shaped by a protocol
+the project is trying to move past, and a launch that is native Stratum v2 from
+the miner's side rather than only from the pool's. "The first Stratum v2 mining
+pool for Avian" is then a description rather than a claim about internals.
 
 ## What is deferred, and what is never
 
@@ -1588,7 +1587,7 @@ Before the miners, not after. Section 15 says why: the pool is Rust and the
 miners are C and CUDA, so extracting later means writing the SV2 client twice
 in C first, Noise included.
 
-### Stage 5 — Solo mining, and blockminerz live
+### Stage 5 — Solo mining, pool side
 
 ```text
 payout address per worker, from user_identity or an
@@ -1599,15 +1598,16 @@ submission rate limiting, which cannot be deferred
 reconnection, from Stage 4
 ```
 
-Plus a decision, per section 5: solo over SV1 downstream, which is live with
-existing Avian miners and pulls Stage 8 forward, or solo over SV2 only, which
-waits for Stages 6 and 7. The first gets real hashrate on the stack sooner and
-is how the rest of this plan gets tested against something other than our own
-code.
-
 No custody at this stage. That is the point of it.
 
-### Stage 6 — MinotaurX
+This has no clients when it is finished: solo is Stratum v2 only, per section
+5, so the first real miner arrives in Stage 6. Build it here anyway. It is
+small, it is independent of the miner, and it means the day the MinotaurX
+miner works there is something real to point it at rather than another stage
+to wait through. The library's C test program already stands in for a miner
+well enough to develop against.
+
+### Stage 6 — MinotaurX, and blockminerz live
 
 ```text
 fork cpuminer-opt
@@ -1697,12 +1697,15 @@ There are two of these now, and the first one matters more.
 
 ## First: blockminerz solo mining is live
 
+Reached at the end of Stage 6, not Stage 5, because solo is Stratum v2 only and
+the first native miner lands there.
+
 ```text
 aviand
    |
 blockminerz SV2 pool
    |
-real Avian miners, solo, paid by consensus
+native SV2 MinotaurX miners, solo, paid by consensus
 ```
 
 Running unattended, surviving restarts and network drops, rate limited against
