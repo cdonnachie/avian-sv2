@@ -30,9 +30,15 @@ The first implementation should prioritize correctness, protocol interoperabilit
 ## This ships
 
 The pool is not a reference implementation with production as a someday. It is
-production software with a named operator: **blockminerz.com**, previously run
-and shut down, to be brought back as the first Stratum v2 mining pool for
-Avian.
+production software with a named deployment: **solo.avn.network**, run as an
+Avian project pool rather than anyone's private one, and the first Stratum v2
+mining pool for Avian.
+
+That it belongs to the project rather than to an individual is not only
+branding. It settles a question this plan raised earlier, whether the
+reference implementation and the production deployment should be the same
+codebase: for an Avian pool they plainly should. And it raises the stake on
+the non-custodial design, because the reputation at risk is the chain's.
 
 That changes two things about how it is built. Accounting, payouts,
 persistence, vardiff, rate limiting and an operator view are requirements that
@@ -246,7 +252,7 @@ Built in layers, deployable at the end of the first one.
 
 ## Solo mining first
 
-**Solo mining is the first thing blockminerz offers, and pooled mining comes
+**Solo mining is the first thing the pool offers, and pooled mining comes
 after it.** This is a risk ordering, not a convenience one.
 
 Pooled mining means holding miners' earnings between finding a block and paying
@@ -281,7 +287,7 @@ v2 miner, defaults to extended channels for external pools and tells the user
 why in its own interface: the pool sends the coinbase template, enabling
 transaction verification.
 
-So blockminerz serves extended channels, and the first native Avian miners are
+So the pool serves extended channels, and the first native Avian miners are
 written against them. Standard channels stay supported, because they are
 simpler and some miners will want them.
 
@@ -314,7 +320,7 @@ and pulled section 21 years forward.
 **That is not the route.** SV1 stays where it was, at Stage 9, optional and
 late.
 
-What it costs: blockminerz cannot go live at Stage 5. The pool-side work lands
+What it costs: the pool cannot go live at Stage 5. The pool-side work lands
 there, and the first real miners arrive with the MinotaurX reference miner in
 Stage 6. Real-world exposure is therefore further out, and real-world exposure
 is what has found every defect that mattered so far.
@@ -353,7 +359,7 @@ the web dashboard and stats services
 
 Those are separate services consuming snapshots from the pool, the arrangement
 hashpool uses. It keeps the protocol core clean enough to stay a reference
-implementation while blockminerz runs it in production, which is the
+implementation while solo.avn.network runs it in production, which is the
 arrangement that benefits Avian most.
 
 ## Pool architecture
@@ -1551,7 +1557,7 @@ AvianNetwork/Avian
     aviand Template Provider
 
 AvianNetwork/avian-sv2-pool
-    the pool, run in production by blockminerz.com
+    the pool, run in production at solo.avn.network
     and serving as Avian's reference implementation
 
 AvianNetwork/avian-pool-services
@@ -1672,7 +1678,7 @@ Section 5 has why, and the coinbase note in section 8 has the mechanism: the
 split works because a merkle root is built from txids and a txid excludes
 witness data.
 
-### Stage 7 — MinotaurX, and blockminerz live
+### Stage 7 — MinotaurX, and solo.avn.network live
 
 ```text
 fork cpuminer-opt
@@ -1775,7 +1781,7 @@ template-side special case.
 
 There are two of these now, and the first one matters more.
 
-## First: blockminerz solo mining is live
+## First: solo.avn.network is live
 
 Reached at the end of Stage 7, not Stage 5, because solo is Stratum v2 only and
 the first native miner lands there.
@@ -1783,7 +1789,7 @@ the first native miner lands there.
 ```text
 aviand
    |
-blockminerz SV2 pool
+solo.avn.network SV2 pool
    |
 native SV2 MinotaurX miners, solo, paid by consensus
 ```
