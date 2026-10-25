@@ -1,0 +1,31 @@
+[workspace]
+members = ["crates/avian-tdp", "crates/avian-sv2-pool"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+[workspace.dependencies]
+# Framing and message codecs from the Stratum v2 Reference Implementation.
+# framing_sv2 supplies the 6-byte header, which carries any extension_type.
+framing_sv2 = "8.0.0"
+binary_sv2 = "7.0.0"
+common_messages_sv2 = "9.0.0"
+template_distribution_sv2 = "7.0.0"
+
+# codec_sv2 and noise_sv2 are dev-dependencies only. Their framing is fine and
+# their Noise is spec-correct, but aviand's Noise is not, so a handshake
+# between them cannot complete. See crates/avian-tdp/src/noise.rs and the
+# extension_spike example, which demonstrates both halves of that.
+codec_sv2 = { version = "7.0.0", features = ["noise_sv2"] }
+noise_sv2 = "2.0.0"
+
+# The two primitives the hand-written Noise layer needs, both already in the
+# tree as transitive dependencies of noise_sv2, at the versions it pins.
+# secp256k1 also turns the node's authority private key file into the x-only
+# public key the certificate is checked against.
+secp256k1 = { version = "0.28.2", features = ["std", "hashes", "rand-std"] }
+chacha20poly1305 = { version = "0.10.1", features = ["alloc"] }
