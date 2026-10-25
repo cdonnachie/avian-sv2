@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use avian_sv2::avian::{self, PowType, EXT_AVIAN, MSG_JOB_TIME_CONSTRAINTS};
 use avian_sv2::error::{Error, Result};
 use avian_sv2::transport::ConnectionWriter;
+use avian_tdp::coinbase::PayoutPlan;
 use avian_tdp::tdp::PrevHash;
 use avian_tdp::Work;
 use binary_sv2::{Sv2Option, U256};
@@ -27,6 +28,7 @@ use mining_sv2::{
 };
 
 use crate::job::{self, Job};
+use crate::ratelimit::{Decision, Limiter, RateLimitConfig};
 use crate::share::{self, Outcome, PowHasher, Refusal, Submission};
 use crate::EXT_CORE_MINING;
 
@@ -52,7 +54,12 @@ pub struct Channel {
     pub pow: PowType,
     pub share_target: [u8; 32],
     pub extranonce_prefix: Vec<u8>,
-    payout_script: Vec<u8>,
+    /// Who the coinbase pays. From the worker's `user_identity`, not from
+    /// configuration.
+    pub payout: PayoutPlan,
+    /// The worker label after the address, for logging only.
+    pub worker: String,
+    coinbase_tag: Vec<u8>,
     writer: Arc<Mutex<ConnectionWriter>>,
     state: Mutex<ChannelState>,
 }
@@ -67,14 +74,20 @@ struct ChannelState {
     shares: u64,
     last_sequence: u32,
     seen: HashSet<(u32, u32, u32)>,
+    limiter: Limiter,
 }
 
 impl Channel {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u32,
         pow: PowType,
         share_target: [u8; 32],
-        payout_script: Vec<u8>,
+        payout: PayoutPlan,
+        worker: String,
+        coinbase_tag: Vec<u8>,
+        nominal_hash_rate: f32,
+        rate_limit: RateLimitConfig,
         writer: Arc<Mutex<ConnectionWriter>>,
     ) -> Self {
         Self {
@@ -82,7 +95,9 @@ impl Channel {
             pow,
             share_target,
             extranonce_prefix: job::extranonce(id, 0).to_vec(),
-            payout_script,
+            payout,
+            worker,
+            coinbase_tag,
             writer,
             state: Mutex::new(ChannelState {
                 next_job_id: 1,
@@ -92,8 +107,14 @@ impl Channel {
                 shares: 0,
                 last_sequence: 0,
                 seen: HashSet::new(),
+                limiter: Limiter::new(&share_target, nominal_hash_rate, rate_limit),
             }),
         }
+    }
+
+    /// Submissions per second this channel may sustain, for logging.
+    pub fn submission_rate(&self) -> f64 {
+        self.state.lock().map(|s| s.limiter.rate()).unwrap_or(0.0)
     }
 
     /// Answers `OpenStandardMiningChannel` and states the target.
@@ -160,7 +181,8 @@ impl Channel {
             &work.template,
             prev,
             &work.constraints,
-            &self.payout_script,
+            &self.payout,
+            &self.coinbase_tag,
             &job::extranonce(self.id, job_id),
             activate,
         )?;
@@ -254,12 +276,37 @@ impl Channel {
         let mut state = self.lock_state()?;
         state.last_sequence = sequence_number;
 
+        // Before anything else, including the job lookup. Avian has no cheap
+        // proof-of-work pre-filter, so a submission that reaches the hash
+        // costs a whole X16RT or MinotaurX, and a flood has to be refused
+        // without getting that far.
+        match state.limiter.admit() {
+            Decision::Allow => {}
+            Decision::TooFast => {
+                drop(state);
+                self.send_error(sequence_number, Refusal::TooManyShares)?;
+                return Ok(None);
+            }
+            Decision::TooManyInvalid => {
+                drop(state);
+                self.send_error(sequence_number, Refusal::TooManyInvalidShares)?;
+                // Dropped, in the spirit of the node's -sv2maxrejects: a
+                // worker that keeps failing has been told something it is not
+                // acting on and will never find a block.
+                return Err(Error::Refused(format!(
+                    "channel {} sent too many invalid submissions",
+                    self.id
+                )));
+            }
+        }
+
         let Some(job) = state
             .jobs
             .iter()
             .find(|job| job.job_id == submission.job_id)
             .cloned()
         else {
+            state.limiter.record_invalid();
             drop(state);
             self.send_error(sequence_number, Refusal::InvalidJobId)?;
             return Ok(None);
@@ -267,6 +314,7 @@ impl Channel {
 
         let fingerprint = (submission.job_id, submission.nonce, submission.ntime);
         if !state.seen.insert(fingerprint) {
+            state.limiter.record_invalid();
             drop(state);
             self.send_error(sequence_number, Refusal::DuplicateShare)?;
             return Ok(None);
@@ -274,6 +322,7 @@ impl Channel {
 
         match share::validate(&job, self.pow, &submission, &self.share_target, hasher) {
             Outcome::Refused(refusal) => {
+                state.limiter.record_invalid();
                 drop(state);
                 self.send_error(sequence_number, refusal)?;
                 Ok(None)
@@ -339,6 +388,14 @@ impl Channel {
 
     pub fn accepted(&self) -> u32 {
         self.state.lock().map(|s| s.accepted).unwrap_or(0)
+    }
+
+    /// Invalid submissions so far, and submissions refused for rate.
+    pub fn refusals(&self) -> (u32, u64) {
+        self.state
+            .lock()
+            .map(|s| (s.limiter.invalid(), s.limiter.refused_for_rate()))
+            .unwrap_or((0, 0))
     }
 
     fn lock_writer(&self) -> Result<std::sync::MutexGuard<'_, ConnectionWriter>> {

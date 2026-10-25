@@ -114,13 +114,16 @@ fn a_c_program_mines_a_share_through_the_static_library() {
         }
     };
 
-    let authority = avian_sv2::wire::hex(&rig.pool_authority.serialize());
+    // In the form a miner's configuration takes, which is what the C program
+    // would be given by an operator.
+    let authority = avian_sv2::address::encode_authority_key(&rig.pool_authority);
     for algorithm in ["x16rt", "minotaurx"] {
         let before = rig.node.height();
         let output = Command::new(&program)
             .arg(rig.pool.mining_addr().to_string())
             .arg(&authority)
             .arg(algorithm)
+            .arg(common::WORKER_ADDRESS)
             .output()
             .expect("running the C program");
 
@@ -162,6 +165,17 @@ fn a_c_program_mines_a_share_through_the_static_library() {
             rig.node.pow_type_of(&rig.node.tip()).as_deref(),
             Some(algorithm),
             "getblock should report the algorithm the C program negotiated"
+        );
+        // And the money went where the C program asked, which is the only
+        // part of solo mining the protocol working does not prove.
+        let block = rig
+            .node
+            .rpc(&["getblock", &rig.node.tip(), "2"])
+            .expect("getblock");
+        assert!(
+            block.contains(common::WORKER_SCRIPT),
+            "the coinbase of the block the C program mined must pay {}",
+            common::WORKER_ADDRESS
         );
         eprintln!(
             "[test] a C program mined {algorithm} block {} at height {}",

@@ -130,6 +130,23 @@ pub fn with_retry<T>(
     }
 }
 
+/// A read that found nothing inside the caller's own deadline.
+///
+/// Not a dead connection, and so not something to reconnect over: the caller
+/// asked to be given up on after a while and it was. Telling these apart
+/// matters because a session that reconnected every time a caller's timeout
+/// expired would log a reconnection storm on an idle chain, and an operator
+/// reading that would reasonably think something was wrong.
+pub fn is_read_timeout(error: &Error) -> bool {
+    match error {
+        Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        _ => false,
+    }
+}
+
 /// A failure that should be retried, as opposed to one that will fail the same
 /// way every time.
 ///
@@ -176,6 +193,22 @@ mod tests {
         let backoff = Backoff::default();
         assert!(!backoff.exhausted(1_000_000));
         assert!(Backoff::none().exhausted(1));
+    }
+
+    #[test]
+    fn a_read_timeout_is_told_apart_from_a_dropped_socket() {
+        assert!(is_read_timeout(&Error::Io(std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        ))));
+        assert!(is_read_timeout(&Error::Io(std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        ))));
+        assert!(!is_read_timeout(&Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        ))));
+        assert!(!is_read_timeout(&Error::Protocol(
+            "the peer closed the Stratum v2 connection".into()
+        )));
     }
 
     #[test]

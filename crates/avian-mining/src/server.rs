@@ -4,6 +4,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use avian_sv2::address::{self, Network};
 use avian_sv2::avian::{
     PowType, EXT_AVIAN, EXT_NEGOTIATION, MSG_REQUEST_EXTENSIONS, MSG_REQUEST_EXTENSIONS_ERROR,
     MSG_REQUEST_EXTENSIONS_SUCCESS, MSG_SELECT_ALGORITHM, MSG_SELECT_ALGORITHM_ERROR,
@@ -13,6 +14,7 @@ use avian_sv2::block;
 use avian_sv2::error::{Error, Result};
 use avian_sv2::transport::{Connection, ConnectionReader, ConnectionWriter};
 use avian_sv2::wire::{Reader, Writer};
+use avian_tdp::coinbase::{PayoutPlan, MAX_COINBASE_TAG};
 use avian_tdp::tdp::PrevHash;
 use avian_tdp::{SolutionSubmitter, Work};
 use common_messages_sv2::{
@@ -27,6 +29,7 @@ use mining_sv2::{
 use secp256k1::Keypair;
 
 use crate::channel::Channel;
+use crate::ratelimit::RateLimitConfig;
 use crate::share::{PowHasher, Submission};
 use avian_sv2::flags;
 
@@ -36,17 +39,63 @@ use crate::{EXT_CORE_MINING, PROTOCOL_VERSION};
 pub struct ServerConfig {
     pub bind: SocketAddr,
     /// The authority keypair the certificate is signed with. A worker pins the
-    /// matching x-only public key.
+    /// matching x-only public key, which
+    /// [`avian_sv2::address::encode_authority_key`] prints in the form a
+    /// miner's configuration takes.
     pub authority: Keypair,
     pub cert_validity: u32,
-    /// The script the pool pays itself. This is the only place pool revenue
-    /// appears: there is no share accounting and no payout, so a worker's
-    /// shares earn it nothing here.
-    pub payout_script: Vec<u8>,
+    /// Which chain's addresses to accept. Getting this wrong means accepting
+    /// an address for another network and mining to it.
+    pub network: Network,
+    /// The operator's cut. Zero basis points, or an empty script, means the
+    /// worker takes the whole coinbase, which is what solo mining is.
+    pub fee_script: Vec<u8>,
+    pub fee_basis_points: u32,
+    /// Goes in the coinbase scriptSig after `coinbase_prefix`. At most
+    /// [`avian_tdp::coinbase::MAX_COINBASE_TAG`] bytes; longer is refused when
+    /// the server is built, not when the node rejects the block.
+    pub coinbase_tag: Vec<u8>,
     /// How many halvings below the network target a share must be. Zero makes
     /// the share target the network target, which on regtest is the
     /// algorithm's own floor, so nearly every share is also a block.
     pub share_target_shift: u32,
+    pub rate_limit: RateLimitConfig,
+}
+
+impl ServerConfig {
+    /// Checks the parts that would otherwise fail later and less clearly.
+    ///
+    /// An over-long coinbase tag is the sharp one: it would build a coinbase
+    /// the node refuses with nothing on the wire to say why, because the
+    /// Template Distribution Protocol has no `SubmitSolution.Error`. So it is
+    /// refused here, where an operator is reading the message.
+    pub fn validate(&self) -> Result<()> {
+        if self.coinbase_tag.len() > MAX_COINBASE_TAG {
+            return Err(Error::Protocol(format!(
+                "the coinbase tag is {} bytes and the most that always fits is \
+                 {MAX_COINBASE_TAG}; the scriptSig must be 2 to 100 bytes and also carries the \
+                 BIP34 height push and 8 bytes of extranonce",
+                self.coinbase_tag.len()
+            )));
+        }
+        if self.fee_basis_points > 10_000 {
+            return Err(Error::Protocol(format!(
+                "an operator fee of {} basis points is more than the whole coinbase",
+                self.fee_basis_points
+            )));
+        }
+        if self.fee_basis_points > 0 && self.fee_script.is_empty() {
+            return Err(Error::Protocol(
+                "an operator fee was configured with no address to pay it to".into(),
+            ));
+        }
+        if !self.fee_script.is_empty() && self.fee_basis_points == 0 {
+            return Err(Error::Protocol(
+                "an operator fee address was configured with a fee of zero".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One algorithm's worth of pool: its Template Distribution session's output
@@ -180,7 +229,17 @@ pub struct Server {
 }
 
 impl Server {
+    /// Builds a server, checking the configuration first.
     pub fn new(
+        config: ServerConfig,
+        algos: Vec<Arc<AlgoContext>>,
+        hasher: Arc<dyn PowHasher>,
+    ) -> Result<Self> {
+        config.validate()?;
+        Ok(Self::new_unchecked(config, algos, hasher))
+    }
+
+    fn new_unchecked(
         config: ServerConfig,
         algos: Vec<Arc<AlgoContext>>,
         hasher: Arc<dyn PowHasher>,
@@ -291,6 +350,37 @@ impl Server {
             bytes.copy_from_slice(open.max_target.as_ref());
             bytes
         };
+        let nominal_hash_rate = open.nominal_hash_rate;
+        let identity = String::from_utf8_lossy(open.user_identity.as_ref()).into_owned();
+
+        // The money. On a solo pool the worker's own address goes in the
+        // coinbase and consensus pays them directly, so this is the one place
+        // where getting it wrong hands someone else's block reward away.
+        //
+        // There is deliberately no fallback. Not a default address, not a
+        // burn address, not the operator's: a worker that mistypes its address
+        // and is quietly mined to somebody else's is the worst thing this can
+        // do, and it is silent in exactly the way everything else found in
+        // this project has been silent.
+        let parsed = match address::parse_identity(&identity, self.config.network) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                let code = e.code();
+                send(
+                    writer,
+                    EXT_CORE_MINING,
+                    MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
+                    false,
+                    OpenMiningChannelError {
+                        request_id,
+                        error_code: code.as_bytes().try_into()?,
+                    },
+                )?;
+                return Err(Error::Refused(format!(
+                    "OpenStandardMiningChannel with user_identity {identity:?}: {e} ({code})"
+                )));
+            }
+        };
 
         let (_, prev) = algo.current().ok_or_else(|| {
             Error::Protocol("no template has arrived yet, so there is no target to set".into())
@@ -304,14 +394,40 @@ impl Server {
             share_target = worker_max_target;
         }
 
+        let payout = PayoutPlan {
+            worker_script: parsed.address.script_pubkey(),
+            fee_script: self.config.fee_script.clone(),
+            fee_basis_points: self.config.fee_basis_points,
+        };
+
         let id = self.next_channel_id.fetch_add(1, Ordering::SeqCst);
         let channel = Arc::new(Channel::new(
             id,
             algo.pow,
             share_target,
-            self.config.payout_script.clone(),
+            payout,
+            parsed.worker.clone(),
+            self.config.coinbase_tag.clone(),
+            nominal_hash_rate,
+            self.config.rate_limit,
             writer.clone(),
         ));
+        eprintln!(
+            "[pool] channel {id} pays {} ({:?}){}, worker {:?}, up to {:.2} submissions/s",
+            parsed.address_text,
+            parsed.address.kind,
+            if self.config.fee_basis_points > 0 {
+                format!(
+                    " less an operator fee of {}.{:02}%",
+                    self.config.fee_basis_points / 100,
+                    self.config.fee_basis_points % 100
+                )
+            } else {
+                String::new()
+            },
+            parsed.worker,
+            channel.submission_rate(),
+        );
         channel.send_open_success(request_id)?;
         algo.register(channel.clone())?;
 

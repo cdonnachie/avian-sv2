@@ -13,9 +13,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use avian_mining::pool::{self, PoolConfig, PoolHandle};
+use avian_mining::ratelimit::RateLimitConfig;
 use avian_mining::server::ServerConfig;
 use avian_mining::share::{AvianHasher, PowHasher};
 use avian_regtest::Node;
+use avian_sv2::address::Network;
 use avian_sv2::avian::{PowType, EXT_AVIAN, EXT_CORE, EXT_NEGOTIATION, MSG_REQUEST_EXTENSIONS};
 use avian_sv2::block;
 use avian_sv2::client::{ClientConfig, Event, MiningClient, MiningJob, Trace};
@@ -50,6 +52,23 @@ impl Rig {
     }
 
     pub fn attach(node: Node, algorithms: &[PowType], share_target_shift: u32) -> Option<Rig> {
+        Self::attach_with(
+            node,
+            algorithms,
+            share_target_shift,
+            (Vec::new(), 0),
+            RateLimitConfig::default(),
+        )
+    }
+
+    /// With an operator fee and submission limits, for the tests about those.
+    pub fn attach_with(
+        node: Node,
+        algorithms: &[PowType],
+        share_target_shift: u32,
+        fee: (Vec<u8>, u32),
+        rate_limit: RateLimitConfig,
+    ) -> Option<Rig> {
         let secp = Secp256k1::new();
         let authority = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
         let (pool_authority, _) = authority.x_only_public_key();
@@ -74,8 +93,12 @@ impl Rig {
                     bind: "127.0.0.1:0".parse().unwrap(),
                     authority,
                     cert_validity: 3600,
-                    payout_script: vec![0x51], // OP_TRUE
+                    network: Network::Regtest,
+                    fee_script: fee.0,
+                    fee_basis_points: fee.1,
+                    coinbase_tag: b"/avian-sv2-test/".to_vec(),
                     share_target_shift,
+                    rate_limit,
                 },
                 coinbase_size: 1000,
                 coinbase_sigops: 10,
@@ -102,7 +125,7 @@ impl Rig {
     pub fn client_config(&self, pow: PowType) -> ClientConfig {
         let mut config = ClientConfig::new(self.pool.mining_addr(), pow);
         config.pool_authority = Some(self.pool_authority);
-        config.user_identity = "test".into();
+        config.user_identity = format!("{}.test-rig", worker_address());
         config.timeout = Duration::from_secs(30);
         config.reconnect = Backoff {
             initial: Duration::from_millis(50),
@@ -272,3 +295,24 @@ pub fn raw_request_extensions(rig: &Rig, wanted: &[u16]) -> (Vec<u16>, Vec<u16>,
 }
 
 pub const AVIAN_EXTENSION: u16 = EXT_AVIAN;
+
+/// A regtest address for the test miner to be paid at, with its scriptPubKey.
+///
+/// From a real node, so the script the pool derives can be compared against
+/// what the node itself says the address means.
+pub const WORKER_ADDRESS: &str = "mnPBEVKjU1zz9214C7M7Zp4FuurUAsU6ZS";
+pub const WORKER_SCRIPT: &str = "76a9144b505a74657fb2b28c4741f5983b6ea88ea1fe0688ac";
+
+/// A second one, for the operator fee.
+pub const FEE_ADDRESS: &str = "2N7bauzAGSJTusSf3TUDQzpSDs6hH5qFGjs";
+pub const FEE_SCRIPT: &str = "a9149d6b8c5b9c3743e6016c0baf56f4f90432977b4687";
+
+pub fn worker_address() -> &'static str {
+    WORKER_ADDRESS
+}
+
+pub fn script_for(address: &str) -> Vec<u8> {
+    avian_sv2::address::Address::decode(address, Network::Regtest)
+        .expect("a test address should decode")
+        .script_pubkey()
+}

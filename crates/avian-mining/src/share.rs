@@ -81,6 +81,10 @@ pub enum Refusal {
     /// The hasher could not run, so the share was neither accepted nor
     /// genuinely refused.
     PowUnavailable,
+    /// Over the channel's submission rate. Refused without hashing.
+    TooManyShares,
+    /// Too many invalid submissions; the channel is being dropped.
+    TooManyInvalidShares,
 }
 
 impl Refusal {
@@ -94,6 +98,8 @@ impl Refusal {
             Refusal::InvalidNtime => "invalid-ntime",
             Refusal::DuplicateShare => "duplicate-share",
             Refusal::PowUnavailable => "pow-unavailable",
+            Refusal::TooManyShares => "too-many-shares",
+            Refusal::TooManyInvalidShares => "too-many-invalid-shares",
         }
     }
 }

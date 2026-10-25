@@ -21,3 +21,10 @@ binary_sv2.workspace = true
 common_messages_sv2.workspace = true
 mining_sv2.workspace = true
 secp256k1.workspace = true
+
+[dev-dependencies]
+# Only to pin the authority-key string format against SRI's own
+# implementation. An operator who publishes the key in a form their miners
+# cannot parse has a pool nobody can connect to, and the symptom is a
+# handshake that never completes.
+key-utils = "1.2.0"

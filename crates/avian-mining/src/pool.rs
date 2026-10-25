@@ -87,7 +87,7 @@ pub fn spawn(
         sessions.push((session, algo));
     }
 
-    let server = Arc::new(Server::new(config.server, algos.clone(), hasher));
+    let server = Arc::new(Server::new(config.server, algos.clone(), hasher)?);
 
     for (session, algo) in &mut sessions {
         let work = match session.next_work()? {

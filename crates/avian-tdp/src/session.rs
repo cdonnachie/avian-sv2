@@ -561,6 +561,10 @@ impl ReconnectingSession {
                         work,
                     })
                 }
+                // A read timeout is the caller's own deadline firing, not a
+                // dead connection, so it goes back to the caller rather than
+                // provoking a reconnect.
+                Err(e) if reconnect::is_read_timeout(&e) => return Err(e),
                 Err(e) if reconnect::is_transient(&e) => {
                     self.session = None;
                     self.slot.clear();

@@ -10,7 +10,12 @@
  * libavian_pow standing in for a miner's own optimised code. libavian-sv2
  * contains no X16RT and no MinotaurX, on purpose.
  *
- *     ./session <pool host:port> <pool authority hex> <x16rt|minotaurx>
+ *     ./session <host:port> <pool authority> <x16rt|minotaurx> <payout address>
+ *
+ * The payout address is where a solo pool sends the block reward, so it goes
+ * in user_identity as `address.workername`. A pool refuses the channel if it
+ * does not parse, which is the only safe thing it can do: there is no sane
+ * fallback for "I could not read where to send the money".
  *
  * Prints what happened, one line per step, and exits 0 only if a share was
  * accepted.
@@ -62,8 +67,10 @@ static void print_hex(const char *label, const uint8_t *bytes, size_t len) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s <host:port> <authority hex> <x16rt|minotaurx>\n", argv[0]);
+    if (argc != 5) {
+        fprintf(stderr,
+                "usage: %s <host:port> <authority> <x16rt|minotaurx> <payout address>\n",
+                argv[0]);
         return 2;
     }
 
@@ -84,12 +91,22 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* user_identity is `address.workername`, the Stratum v1 convention carried
+     * into v2 and what a miner's UI labels "User". The label is the operator's
+     * to read; only the address affects the payout. */
+    char identity[320];
+    int written = snprintf(identity, sizeof(identity), "%s.c-miner", argv[4]);
+    if (written < 0 || (size_t)written >= sizeof(identity)) {
+        fprintf(stderr, "payout address is too long\n");
+        return 2;
+    }
+
     AvianSv2ClientConfig config;
     memset(&config, 0, sizeof(config));
     config.pool = argv[1];
     config.authority_hex = argv[2];
     config.pow_type = pow_type;
-    config.user_identity = "c-miner";
+    config.user_identity = identity;
     config.nominal_hash_rate = 1.0f;
     config.timeout_ms = 30000;
     config.backoff_initial_ms = 50;

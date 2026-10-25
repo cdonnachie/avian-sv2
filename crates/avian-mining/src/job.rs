@@ -2,7 +2,7 @@
 
 use avian_sv2::avian::{PowType, TimeConstraints, TIME_MASK};
 use avian_sv2::error::{Error, Result};
-use avian_tdp::coinbase::{self, Coinbase};
+use avian_tdp::coinbase::{self, Coinbase, PayoutPlan};
 use avian_tdp::tdp::{PrevHash, Template};
 
 /// Everything needed to rebuild the header a worker hashed, and to turn a
@@ -78,16 +78,22 @@ impl Window {
 ///
 /// The coinbase is the pool's to build and the pool's to get right: the node
 /// re-serializes it and compares bytes before computing any proof of work.
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     job_id: u32,
     template: &Template,
     prev: &PrevHash,
     constraints: &TimeConstraints,
-    payout_script: &[u8],
+    payout: &PayoutPlan,
+    tag: &[u8],
     extranonce: &[u8],
     future: bool,
 ) -> Result<Job> {
-    let coinbase = Coinbase::build(template, payout_script, extranonce)?;
+    // The worker's own address takes the spendable value. On a solo pool this
+    // is the money, and it comes from the channel rather than from
+    // configuration.
+    let outputs = payout.outputs(template.coinbase_tx_value_remaining);
+    let coinbase = Coinbase::build(template, &outputs, tag, extranonce)?;
     let window = Window::from_template(constraints);
     if window.is_empty() {
         return Err(Error::Protocol(format!(

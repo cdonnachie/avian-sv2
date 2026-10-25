@@ -341,8 +341,12 @@ fn a_share_below_the_network_target_is_accepted_but_not_submitted() {
     let mut miner = rig.miner(PowType::X16rt);
     let job = miner.active_job().expect("an active job").clone();
 
+    // Twelve, which is inside the default burst of sixteen: any more and the
+    // submission rate limiter would refuse them as too-many-shares before the
+    // target was ever compared, which is exactly what it is for and not what
+    // this test is about.
     let mut refused = 0;
-    for nonce in 0..40u32 {
+    for nonce in 0..12u32 {
         miner
             .submit_exact(job.job_id, nonce, job.ntime_min, job.version)
             .unwrap();

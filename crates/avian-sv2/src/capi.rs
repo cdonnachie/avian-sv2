@@ -151,9 +151,11 @@ impl AvianSv2Event {
 pub struct AvianSv2ClientConfig {
     /// `"host:port"`, NUL-terminated. Loopback only.
     pub pool: *const c_char,
-    /// The pool's authority x-only public key as 64 hex characters, or null
-    /// for trust on first use. Null means the session is encrypted but
-    /// nothing says the peer is the pool you meant.
+    /// The pool's authority public key as the operator published it: either
+    /// the base58 form a Stratum v2 miner configuration takes, or 64 hex
+    /// characters. Null is trust on first use, which leaves the session
+    /// encrypted but says nothing about whether the peer is the pool you
+    /// meant.
     pub authority_hex: *const c_char,
     pub pow_type: c_int,
     /// May be null.
@@ -203,8 +205,14 @@ fn build_config(raw: &AvianSv2ClientConfig) -> Result<ClientConfig, &'static str
 
     let mut config = ClientConfig::new(addr, pow);
     if let Some(hex) = unsafe { text(raw.authority_hex) } {
-        config.pool_authority =
-            Some(crate::authority::from_hex(&hex).map_err(|_| "authority_hex is not a key")?);
+        // Either form, because an operator may publish either and a miner
+        // should not have to care which: base58 is what SRI-derived miner
+        // configurations take, hex is what this project logged first.
+        let key = crate::address::decode_authority_key(&hex)
+            .ok()
+            .or_else(|| crate::authority::from_hex(&hex).ok())
+            .ok_or("authority is neither a base58 nor a hex public key")?;
+        config.pool_authority = Some(key);
     }
     if let Some(identity) = unsafe { text(raw.user_identity) } {
         config.user_identity = identity;

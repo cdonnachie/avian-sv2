@@ -9,6 +9,7 @@
 //! miner that silently earns nothing, is not a bet worth taking.
 //!
 //! ```text
+//! address     Avian addresses and the user_identity a miner opens with
 //! transport   Noise NX and framing, both roles, over a blocking socket
 //! avian       extension 0x4001 and the negotiation extension 0x0001
 //! block       header serialization, SHA256d, target arithmetic
@@ -32,6 +33,7 @@
 //! miner never does. Nor is the Template Distribution Protocol, which is a
 //! pool's business with a node and no miner ever speaks.
 
+pub mod address;
 pub mod authority;
 pub mod avian;
 pub mod block;
@@ -42,6 +44,7 @@ pub mod reconnect;
 pub mod transport;
 pub mod wire;
 
+pub use address::{Address, AddressError, Identity, Network};
 pub use avian::{PowType, EXT_AVIAN, EXT_CORE, EXT_NEGOTIATION};
 pub use client::{ClientConfig, Event, MiningClient, MiningJob};
 pub use error::{Error, Result};

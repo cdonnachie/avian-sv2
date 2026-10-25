@@ -13,6 +13,7 @@
 pub mod channel;
 pub mod job;
 pub mod pool;
+pub mod ratelimit;
 pub mod server;
 pub mod share;
 

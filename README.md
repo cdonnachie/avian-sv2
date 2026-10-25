@@ -1,7 +1,13 @@
 # avian-sv2
 
-**`libavian-sv2`**, a Stratum v2 library with a C API, and an Avian pool built
-on it.
+An Avian **Stratum v2 solo mining pool**, and **`libavian-sv2`**, the Stratum
+v2 library with a C API that it and the miners are built on.
+
+Solo: a miner puts its own payout address in `user_identity` when it opens a
+channel, the coinbase pays that address, and consensus pays the miner
+directly. The pool never holds anyone's earnings, which is the point — pooled
+mining means holding other people's money between a block and a payout, and
+solo means never touching it.
 
 The library carries the protocol core and the Mining Protocol client, so a C
 or CUDA miner links a static library and a header instead of writing Stratum
@@ -10,7 +16,7 @@ as an ordinary Rust crate and adds the two halves a miner never needs: the
 Template Distribution client it is to the node, and the Mining Protocol server
 it is to workers.
 
-Stages 2 through 4 of `Avian-Native-Stratum-V2-Mining-Plan.md` section 25.
+Stages 2 through 5 of `Avian-Native-Stratum-V2-Mining-Plan.md` section 25.
 
 ```
 crates/avian-sv2        libavian-sv2: Noise, framing, extension codecs,
@@ -22,15 +28,26 @@ crates/avian-sv2-pool   the pool binary
 crates/avian-regtest    starts a regtest node for tests; test support only
 ```
 
-**The milestone is reached, twice over.** `aviand` to pool to miner to pool to
-`aviand`, with a regtest block found by hashing, relayed by the pool, accepted
-by the node, and reported by `getblock` under the algorithm that was
-negotiated — for both algorithms, once driven from Rust and once from **a C
-program that links the static library**. Section 12 of the plan. See
-[Tests](#tests) for the output of both.
+**The milestone is reached, and it is the money one.** `aviand` to pool to
+miner to pool to `aviand`, with a regtest block found by hashing, relayed by
+the pool, accepted by the node, reported by `getblock` under the algorithm
+that was negotiated, **and paying the address the miner supplied at channel
+open** — for both algorithms, once driven from Rust and once from a C program
+that links the static library.
+
+```
+[test] x16rt block 5fbd1319084980faa39786601822107f2e5b5b564765910bf002cdda7a371775 paid 2375 AVN to mnPBEVKjU1zz9214C7M7Zp4FuurUAsU6ZS
+[test] minotaurx block 5f07e52c559346ac22e5f5eeb2b0714282ece0af892f32dab7f55f0ce63953fa paid 2375 AVN to mnPBEVKjU1zz9214C7M7Zp4FuurUAsU6ZS
+```
+
+That the coinbase pays the miner is the only part of solo mining that cannot
+be inferred from the protocol working: every protocol assertion would pass
+just as happily if the coinbase paid the operator. So it is checked against
+the node's own view of the block it accepted.
 
 ## Contents
 
+- [Solo mining](#solo-mining)
 - [The four questions that shaped this](#the-four-questions-that-shaped-this)
 - [The C API](#the-c-api)
 - [Reconnection, and what does not survive it](#reconnection-and-what-does-not-survive-it)
@@ -40,6 +57,192 @@ program that links the static library**. Section 12 of the plan. See
 - [Where doc/sv2.md falls short](#where-docsv2md-falls-short)
 - [Design](#design)
 - [What is not here](#what-is-not-here)
+
+## Solo mining
+
+A miner puts its own payout address in `user_identity` when it opens a channel.
+The pool turns that into a `scriptPubKey`, puts it in the coinbase, and
+consensus pays the miner. Nothing is held, nothing is owed, and there is no
+ledger, because there is nothing to keep a ledger of.
+
+### The identity format
+
+`address` or `address.workername`:
+
+```
+mnPBEVKjU1zz9214C7M7Zp4FuurUAsU6ZS.bitaxe-1
+```
+
+That is the Stratum v1 convention carried into v2, and it is what a miner's UI
+labels "User". The label is the operator's to read: it is logged and it never
+affects the payout.
+
+The split is on the **first** dot, not the last. No Avian address can contain
+one — neither the base58 alphabet nor the bech32 charset includes a dot — so
+the first dot is the unambiguous end of the address, and splitting there also
+tolerates a dotted label like `address.rig.1`, which splitting on the last dot
+would mis-read as an address of `address.rig` and refuse. Noted because the
+convention is usually described as splitting on the last dot, and this does
+not.
+
+### An address that does not parse refuses the channel
+
+With `OpenMiningChannel.Error`, and **never a fallback**: not a default
+address, not a burn address, not the operator's. A miner that mistypes its
+address and is quietly mined to somebody else's is the worst thing this
+codebase can do, and it would be silent in exactly the way every other problem
+found in this project has been silent.
+
+Four codes, so a miner is told what is wrong rather than only that something
+is:
+
+| Code | Meaning |
+| --- | --- |
+| `missing-payout-address` | `user_identity` was empty, or had no address before the label |
+| `invalid-payout-address` | not base58 or bech32, wrong length, or the checksum failed |
+| `wrong-network-address` | decoded cleanly, for another chain |
+| `unsupported-address-type` | a witness version or program length this pool does not pay |
+
+### What it accepts
+
+P2PKH and P2SH by base58, and segwit v0 by bech32. All three are checked
+against a real node: the `scriptPubKey` this module derives is compared with
+what `getaddressinfo` says the same address means, so a decoding bug is caught
+by the node disagreeing rather than by review. There is also a sweep that
+mutates every character of a valid address to every other base58 character and
+requires all 1,900-odd results to be refused.
+
+Avian's version bytes are **not** Bitcoin's. Mainnet is 60 for P2PKH and 122
+for P2SH, where Bitcoin is 0 and 5, and the bech32 prefixes are `avn`, `tavn`,
+`tavn4` and `avnrt`. Assuming Bitcoin's here would accept addresses from the
+wrong chain.
+
+Segwit v1 and later are refused by version, before the checksum is looked at,
+so a taproot user is told their address type is unsupported rather than that
+their address is malformed. Both are refusals, so deciding on the version first
+costs nothing and says more.
+
+**One case cannot be caught, and it is Avian's doing rather than this code's.**
+Testnet, testnet4, signet and regtest all use base58 version 111 and 196, so a
+testnet P2PKH address on a regtest pool is indistinguishable from a regtest one
+and will be accepted. Only mainnet is separable by version byte. Off mainnet
+the bech32 human-readable part is the only reliable network tag, which is why
+the bech32 prefix is checked strictly.
+
+### The operator fee
+
+Optional and zero by default, because adding a configurable second coinbase
+output now costs nothing and retrofitting coinbase structure once miners depend
+on it is disruptive.
+
+```
+--operator-fee <address> --operator-fee-bp <hundredths of a percent>
+```
+
+The fee truncates down, so rounding never short-changes the miner, and the two
+outputs always sum to exactly `coinbase_tx_value_remaining`: a coinbase that
+paid out less would silently burn the difference. A fee that rounds to zero
+produces no output at all rather than a dust one. The miner's output is first
+and the template's required outputs follow, which keeps the witness commitment
+the highest-indexed output.
+
+Checked end to end at 2.5%, against the node's own view of the block:
+
+```
+[test] worker 2315.625 AVN, operator 59.375 AVN of 2375 AVN
+```
+
+Misconfiguration is refused at startup rather than silently ignored: a fee with
+no address, an address with no fee, and more than 10000 basis points are all
+errors.
+
+### The coinbase tag
+
+`--coinbase-tag`, default `/avian-sv2/`. It goes in the scriptSig after
+`coinbase_prefix`, which is the BIP34 height push and which the node requires
+the scriptSig to start with.
+
+At most **87 bytes**, and refused at configuration time rather than when the
+node rejects the block: the scriptSig limit is 2 to 100 bytes, the height push
+is up to 5, and this pool adds 8 bytes of extranonce. Taking the worst-case
+height means a tag accepted today cannot start failing years later. Getting
+this wrong is otherwise invisible, because the Template Distribution Protocol
+has no `SubmitSolution.Error`.
+
+```
+--coinbase-tag is 100 bytes and the most that always fits is 87
+```
+
+### Submission rate limiting
+
+**Not deferrable, and in scope here**, because a public solo offering is
+untrusted workers. The reason is the one doc/sv2.md gives for the node: there
+is no cheap pre-filter for Avian's proof of work. SHA256d lets a server check a
+few leading bytes before committing to real work; X16RT and MinotaurX have no
+such form, so the only way to know whether a submission is valid is to compute
+the whole hash. A worker writing nonces as fast as its socket allows costs a
+full X16RT or MinotaurX each, and no amount of cheap field checking changes
+that.
+
+So the limiter runs **before everything else on a submission, including the job
+lookup**. A rate-refused submission costs a mutex and a subtraction.
+
+Two counters, kept apart, as the node keeps `-sv2maxrejects` apart from its own
+rate limit:
+
+- a **token bucket on every submission**, because the cost is the hash and a
+  valid submission costs exactly as much as an invalid one
+- a running total of **invalid** submissions, which drops the channel, because
+  a worker that keeps failing has been told something it is not acting on and
+  will never find a block
+
+The bucket is sized from the expected share rate rather than from an arbitrary
+constant, which a fixed `SetTarget` makes possible: the chance a random hash
+meets the target, times the hash rate the worker claimed, times a tolerance for
+the fact that shares arrive as a Poisson process and an honest worker will
+exceed its mean often over short windows. On regtest that probability is about
+a half, which is why nearly every share there is also a block.
+
+`nominal_hash_rate` is **worker-supplied and unverifiable**, so it is clamped
+before it is used, and the resulting rate is clamped again by a floor and a
+ceiling. A worker claiming a petahash gets the ceiling, not an unlimited
+budget. A rate refusal does not count as invalid, because a worker whose only
+sin is being fast should not be dropped as if it were sending rubbish.
+
+Tested by flooding, and by checking that an honest worker at the configured
+target is never refused: ten minutes of simulated mining at exactly the
+expected interval, which is the case that matters for the people using the pool
+correctly. The limit is per channel, and a test asserts a flooding worker does
+not deny service to another on its own channel.
+
+**Vardiff stays deferred**, and it is deferred *with* this rather than
+separately: the honest answer to a worker flooding cheap shares is usually to
+raise its target, which is vardiff, and building either alone invites getting
+the other wrong.
+
+### The authority key an operator publishes
+
+A miner's configuration takes the pool's authority public key as one opaque
+string pasted in, and the two stacks present x-only keys differently. The pool
+prints **both**, labelled, rather than guessing:
+
+```
+[pool] authority public key, base58 (Stratum v2 miner configuration):
+    9c8XJed4dnmErqwfn55BE9hv32YAB6rLhZCdCCb9WSRZnmX8KvA
+[pool] authority public key, hex (32-byte x-only):
+    c56eaaa66566aff4ea9d2e7da6dd172303d9d41786182343cfe2fda31aa32831
+```
+
+The base58 form is `base58check([0x01, 0x00] ++ x-only key)`, 51 characters,
+which is what SRI's `key_utils` produces and what a Stratum v2 miner expects.
+A test pins it against `key_utils` itself rather than against a hardcoded
+string, so it cannot drift into agreeing with only itself, and the C API
+accepts either form so a miner does not have to care which an operator
+published.
+
+This is a usability detail with a sharp edge: an operator who publishes the key
+in a form their miners cannot parse has a pool nobody can connect to, and the
+failure arrives as a handshake that never completes.
 
 ## The four questions that shaped this
 
@@ -413,7 +616,11 @@ cargo run -p avian-sv2-pool -- --datadir /tmp/sv2
 ```
 
 That opens one Template Distribution connection per algorithm and then serves
-the Mining Protocol on `127.0.0.1:34254`:
+the Mining Protocol on `127.0.0.1:34254`, as a solo pool:
+
+```
+avian-sv2-pool --datadir /tmp/sv2     --coinbase-tag '/blockminerz.com solo/'     --operator-fee <address> --operator-fee-bp 100
+```
 
 ```
 [pool] generated a new authority key in /tmp/pool-key
@@ -465,12 +672,37 @@ problem.
 cargo test
 ```
 
-57 tests, of which 19 start a real node and one also invokes a C compiler.
+93 tests, of which 27 start a real node and one also invokes a C compiler.
 Everything that needs a node skips with a message when `aviand` is not found;
 `AVIAND` and `AVIAN_CLI` override the default of `~/avian-build/bin`, and `CC`
 overrides `cc`. The nodes the tests start pass `-listen=0`, without which they
 bind the regtest P2P port and refuse to start if a node is already running by
 hand.
+
+### Solo mining, the money path
+
+`crates/avian-mining/tests/solo.rs`. The milestone test reads the coinbase of
+the block the node accepted and asserts it pays the miner's address, for both
+algorithms. The rest assert the behaviours rather than the units:
+
+```
+test a_mined_block_pays_the_address_the_worker_supplied ... ok
+test a_malformed_address_refuses_the_channel_and_mines_nothing ... ok
+test an_address_for_the_wrong_network_refuses_the_channel ... ok
+test the_operator_fee_appears_when_configured ... ok
+test a_flood_is_rate_limited_and_an_honest_miner_is_not ... ok
+test too_many_invalid_submissions_drops_the_channel ... ok
+test a_worker_label_does_not_change_who_is_paid ... ok
+test the_coinbase_carries_the_operator_tag ... ok
+```
+
+The malformed-address test also asserts the tip did **not** move and that an
+honest miner is still served afterwards: a refusal that took the pool down
+with it would be a worse outcome than the one it was avoiding.
+
+The wrong-network test re-encodes a known-good regtest key hash under
+mainnet's version byte, so the address is checksum-valid and the only thing
+wrong with it is the network. Otherwise it would pass for the wrong reason.
 
 ### The C program
 
@@ -595,7 +827,9 @@ a client of the node. Findings 7 through 11 are from implementing the
 **upstream** side, the pool as a server to workers, which the document
 specifies but nothing in Avian Core implements, so this is the first time
 anything has been built against that half. Finding 12 is from writing the
-miner's side, which is the first thing to have worn that shoe.
+miner's side, which is the first thing to have worn that shoe. Findings 13 and
+14 are from building a solo pool, where `user_identity` stops being a label and
+becomes an instruction about money.
 
 **All eleven are now resolved**, nine by a change to `doc/sv2.md` or the node,
 one withdrawn as wrong, and one, the Noise handshake, by a fix to Avian Core
@@ -807,10 +1041,43 @@ extension was created for — a miner hits none of these as an error, it just
 earns nothing or earns someone else's share — which is the argument for it
 being in scope rather than left to the Stratum v2 specification.
 
+### From building a solo pool
+
+**13. `OpenMiningChannel.Error` has no code for an unusable payout address.**
+The Stratum v2 specification defines `unknown-user` and `max-count-exceeded`,
+and neither fits. A solo pool reads `user_identity` as the address it will pay,
+so "I cannot read where to send the money" is its single most important
+refusal, and it has to invent a code for it. This pool sends
+`missing-payout-address`, `invalid-payout-address`, `wrong-network-address` and
+`unsupported-address-type`.
+
+`error_code` is a `STR0_255`, so inventing them is legal, but a miner cannot
+know them in advance, which is the same position the algorithm and the ntime
+bound were in before the extension existed. This is the third instance of the
+pattern findings 7 and 8 describe, and the sharpest, because it is the one with
+money behind it: a miner that cannot tell "your address is wrong" from "the
+pool is full" will retry forever against a pool that will never serve it.
+
+It is arguably more Avian's business than the specification's. Solo mining
+makes `user_identity` carry an address, the convention for that is
+`address.workername` by observation rather than by any standard, and nothing
+says what a pool does when it cannot parse one. If the extension is going to
+describe the Mining Protocol half at all, this is worth a paragraph and a code
+or two.
+
+**14. Nothing documents the `address.workername` convention.** Not a defect in
+doc/sv2.md so much as a gap in what exists anywhere: `user_identity` is a
+`STR0_255` and the specification says nothing about structure, while every
+miner in the field puts `address.workername` in it because Stratum v1 did. A
+pool that did not know that would try to parse the whole string as an address
+and refuse every real miner. Worth stating wherever Avian describes what a pool
+should do with the field, because it is load-bearing and entirely undocumented.
+
 ## Design
 
 ```
 libavian-sv2, the lift-out unit:
+  avian_sv2::address     Avian addresses, identities, authority keys
   avian_sv2::transport   SRI's Noise and framing, both roles, over a socket
   avian_sv2::avian       extension 0x4001 and negotiation extension 0x0001
   avian_sv2::block       header, SHA256d, target arithmetic
@@ -822,7 +1089,8 @@ libavian-sv2, the lift-out unit:
 
 the pool, consuming it as an ordinary Rust crate:
   avian_tdp::tdp         the stock Template Distribution messages, owned
-  avian_tdp::coinbase    the coinbase and merkle root a pool must build
+  avian_tdp::coinbase    the coinbase, payout split and merkle root
+  avian_mining::ratelimit  per-channel submission limits
   avian_tdp::session     one upstream connection, with reconnection
   avian_mining::share    the validation ladder, behind a PowHasher trait
   avian_mining::job      a job and its ntime window
@@ -903,32 +1171,35 @@ contiguous on the wire: a `SubmitShares.Success` cannot land between a
 ## What is not here
 
 - **No miner.** `ctest/session.c` is a test program and says so; it exists to
-  prove the C boundary, not to mine anything.
+  prove the C boundary, not to mine anything. The first native Avian Stratum v2
+  miner is the next stage, which means this one ships with no clients.
 - **No hashing in the library.** Deliberately, and at length above.
-- No payouts, and no share accounting beyond what validation needs.
-- No extended channels, no job declaration, no Stratum v1.
-- Anything non-loopback. Both the connection to the node and both listeners
-  refuse it.
+- **No Stratum v1**, and not as an oversight: an SV1 downstream adapter would
+  have shaped the pool around a protocol the project is trying to move past.
+- No extended channels, no job declaration.
+- Anything non-loopback. Both the connection to the node and the Mining
+  Protocol listener refuse it.
 
-### Two things that must exist before this faces anything untrusted
+### Deferred requirements, not out of scope
 
-**Share rate limiting is a hard prerequisite**, including for a public
-testnet, and it is not here. The reason is the one doc/sv2.md gives for the
-node: Avian has no cheap pre-filter, so SHA256d's trick of checking a few
-leading bytes before committing to real work does not exist. Every submission
-costs a **whole** X16RT or MinotaurX hash. A worker that submits garbage as
-fast as it can write it is a denial of service against the pool's CPU, and
-nothing in the validation ladder can make the final hash cheaper. The node has
-`-sv2maxrejects` and a submission rate limit for exactly this; the pool has
-neither, and relies entirely on being loopback.
+The pool ships, so these are things it needs and does not have yet, rather
+than things it will never have:
 
-**Vardiff** is also absent. It is left out with rate limiting rather than
-separately because the two are entangled: the honest answer to a worker
-flooding cheap shares is usually to raise its target, which is vardiff, and
-building either alone invites getting the other wrong. The share target here is
-fixed, the network target made `--share-target-shift` halvings harder.
+- **Share accounting and a payout ledger.** Not needed for solo, by
+  construction, and needed the moment pooled mining is offered.
+- **Persistence.** Everything is in memory: restart the pool and every channel,
+  job and counter is gone. A miner reconnects and carries on, so the cost is a
+  moment of lost hashrate rather than lost money, but an operator cannot answer
+  a question about yesterday.
+- **Vardiff.** The share target is fixed, the network target made
+  `--share-target-shift` halvings harder. Deferred *with* rate limiting rather
+  than separately, because the two are entangled: the honest answer to a worker
+  flooding cheap shares is usually to raise its target.
+- **An operator view.** Everything is stderr.
 
-Deferred deliberately, both of them, and neither is a small job.
+**Share rate limiting was on this list and is not any more**: it is in, because
+a public solo offering is untrusted workers and there is no cheap pre-filter
+for Avian's proof of work. See [Solo mining](#submission-rate-limiting).
 
 ### Smaller gaps
 

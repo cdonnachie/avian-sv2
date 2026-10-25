@@ -22,6 +22,75 @@ use crate::tdp::Template;
 /// requires as `vin[0]`'s whole witness stack.
 const WITNESS_RESERVED_VALUE: [u8; 32] = [0u8; 32];
 
+/// The longest operator tag that always fits.
+///
+/// The node requires a scriptSig of 2 to 100 bytes beginning with
+/// `coinbase_prefix`. That prefix is the BIP34 height push, so it is 2 bytes
+/// below height 128 and grows to 5 at the top of the range, and this pool adds
+/// 8 bytes of extranonce. 100 - 5 - 8 leaves 87, and taking the worst case
+/// rather than the current height means a tag accepted at configuration time
+/// cannot start failing years later.
+pub const MAX_COINBASE_TAG: usize = 87;
+
+/// Where a block's spendable value goes.
+///
+/// On a solo pool the worker's own address takes it, so this is the money and
+/// it comes from the channel rather than from configuration. The fee output is
+/// the operator's and defaults to nothing.
+#[derive(Debug, Clone, Default)]
+pub struct PayoutPlan {
+    pub worker_script: Vec<u8>,
+    /// Empty for no operator fee.
+    pub fee_script: Vec<u8>,
+    /// Hundredths of a percent. Zero for no operator fee.
+    pub fee_basis_points: u32,
+}
+
+/// One output the pool adds, ahead of the template's required ones.
+#[derive(Debug, Clone)]
+pub struct PoolOutput {
+    pub value: u64,
+    pub script: Vec<u8>,
+}
+
+impl PayoutPlan {
+    pub fn solo(worker_script: Vec<u8>) -> Self {
+        Self {
+            worker_script,
+            fee_script: Vec::new(),
+            fee_basis_points: 0,
+        }
+    }
+
+    /// Splits the spendable value between the worker and the operator.
+    ///
+    /// The fee is truncated down, so the worker is never short-changed by
+    /// rounding, and the two always sum to exactly `value_remaining`: a
+    /// coinbase that paid out less would silently burn the difference.
+    ///
+    /// A fee that rounds to zero produces no output at all rather than a
+    /// zero-value one, which would be dust the node has no reason to accept.
+    pub fn outputs(&self, value_remaining: u64) -> Vec<PoolOutput> {
+        let fee = if self.fee_script.is_empty() || self.fee_basis_points == 0 {
+            0
+        } else {
+            // u128 so a large subsidy times 10000 cannot overflow.
+            ((value_remaining as u128 * self.fee_basis_points as u128) / 10_000) as u64
+        };
+        let mut outputs = vec![PoolOutput {
+            value: value_remaining - fee,
+            script: self.worker_script.clone(),
+        }];
+        if fee > 0 {
+            outputs.push(PoolOutput {
+                value: fee,
+                script: self.fee_script.clone(),
+            });
+        }
+        outputs
+    }
+}
+
 /// A coinbase built the way the Template Provider says to build one.
 pub struct Coinbase {
     /// Serialized with the witness, which is what `SubmitSolution` carries.
@@ -34,36 +103,63 @@ pub struct Coinbase {
 impl Coinbase {
     /// Builds the coinbase for a template.
     ///
-    /// `extranonce` is appended to `coinbase_prefix` in the scriptSig, which
-    /// is the only part of the coinbase a pool may vary per worker. The node
-    /// requires a scriptSig of 2 to 100 bytes beginning with
-    /// `coinbase_prefix`, which is the BIP34 height push.
-    pub fn build(template: &Template, payout_script: &[u8], extranonce: &[u8]) -> Result<Self> {
-        let script_sig_len = template.coinbase_prefix.len() + extranonce.len();
-        if !(2..=100).contains(&script_sig_len) {
+    /// `outputs` are the pool's own, which go **before** the template's
+    /// required ones so the witness commitment stays the highest-indexed
+    /// output. `tag` is the operator's label and `extranonce` distinguishes
+    /// channels; both go in the scriptSig after `coinbase_prefix`, which the
+    /// node requires the scriptSig to start with.
+    pub fn build(
+        template: &Template,
+        outputs: &[PoolOutput],
+        tag: &[u8],
+        extranonce: &[u8],
+    ) -> Result<Self> {
+        if outputs.is_empty() {
+            return Err(Error::Protocol(
+                "a coinbase needs at least one output".into(),
+            ));
+        }
+        let paid: u64 = outputs.iter().map(|output| output.value).sum();
+        // Must be exact. Paying less is legal but burns the difference, and a
+        // pool that quietly burned part of a block would be a bug nobody
+        // noticed for a long time.
+        if paid != template.coinbase_tx_value_remaining {
             return Err(Error::Protocol(format!(
-                "a coinbase scriptSig is 2 to 100 bytes and this one is {script_sig_len}"
+                "the pool's outputs pay {paid} and coinbase_tx_value_remaining is {}",
+                template.coinbase_tx_value_remaining
             )));
         }
 
-        // The payout takes coinbase_tx_value_remaining, which doc/sv2.md says
-        // is already net of the founder payment, so nothing is subtracted
-        // here. The founder output is one of the required outputs and is
-        // copied verbatim below.
-        let mut outputs = Writer::new();
-        outputs
-            .u64(template.coinbase_tx_value_remaining)
-            .varint(payout_script.len() as u64)
-            .raw(payout_script);
-        let payout = outputs.finish();
+        let script_sig_len = template.coinbase_prefix.len() + tag.len() + extranonce.len();
+        if !(2..=100).contains(&script_sig_len) {
+            return Err(Error::Protocol(format!(
+                "a coinbase scriptSig is 2 to 100 bytes and this one is {script_sig_len}; the \
+                 operator tag is {} bytes",
+                tag.len()
+            )));
+        }
 
-        let output_count = 1 + template.coinbase_tx_outputs_count as u64;
+        // The pool's outputs take coinbase_tx_value_remaining, which
+        // doc/sv2.md says is already net of the founder payment, so nothing is
+        // subtracted here. The founder output is one of the required outputs
+        // and is copied verbatim below.
+        let mut writer = Writer::new();
+        for output in outputs {
+            writer
+                .u64(output.value)
+                .varint(output.script.len() as u64)
+                .raw(&output.script);
+        }
+        let pool_outputs = writer.finish();
+
+        let output_count = outputs.len() as u64 + template.coinbase_tx_outputs_count as u64;
 
         let input = |w: &mut Writer| {
             w.raw(&[0u8; 32]) // null prevout hash
                 .u32(0xffff_ffff) // null prevout index
                 .varint(script_sig_len as u64)
                 .raw(&template.coinbase_prefix)
+                .raw(tag)
                 .raw(extranonce)
                 .u32(template.coinbase_tx_input_sequence);
         };
@@ -72,7 +168,7 @@ impl Coinbase {
         without.u32(template.coinbase_tx_version).varint(1);
         input(&mut without);
         without.varint(output_count);
-        without.raw(&payout);
+        without.raw(&pool_outputs);
         // Every output in coinbase_tx_outputs, verbatim and in order. They
         // arrive concatenated with no count of their own, which is why the
         // count is a separate field, and the witness commitment is the
@@ -88,7 +184,7 @@ impl Coinbase {
             .u8(0x01)
             .varint(1);
         input(&mut with);
-        with.varint(output_count).raw(&payout);
+        with.varint(output_count).raw(&pool_outputs);
         with.raw(&template.coinbase_tx_outputs);
         // One witness stack, one item, the 32 reserved zero bytes.
         with.varint(1)
@@ -120,6 +216,74 @@ pub fn merkle_root(coinbase_txid: &[u8; 32], path: &[[u8; 32]]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_solo_plan_pays_the_whole_value_to_the_worker() {
+        let plan = PayoutPlan::solo(vec![0x51]);
+        let outputs = plan.outputs(5_000_000_000);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].value, 5_000_000_000);
+        assert_eq!(outputs[0].script, vec![0x51]);
+    }
+
+    #[test]
+    fn a_fee_is_taken_from_the_worker_and_the_two_sum_exactly() {
+        let plan = PayoutPlan {
+            worker_script: vec![0x51],
+            fee_script: vec![0x52],
+            fee_basis_points: 100, // one per cent
+        };
+        let outputs = plan.outputs(5_000_000_000);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[1].value, 50_000_000);
+        assert_eq!(outputs[0].value, 4_950_000_000);
+        assert_eq!(
+            outputs.iter().map(|o| o.value).sum::<u64>(),
+            5_000_000_000,
+            "nothing may be burned by rounding"
+        );
+        // The worker's output is first, so the witness commitment stays the
+        // highest-indexed output once the required ones follow.
+        assert_eq!(outputs[0].script, vec![0x51]);
+    }
+
+    #[test]
+    fn a_fee_that_rounds_to_nothing_produces_no_output() {
+        let plan = PayoutPlan {
+            worker_script: vec![0x51],
+            fee_script: vec![0x52],
+            fee_basis_points: 1,
+        };
+        // 1 basis point of 9999 is 0.9999, which truncates to nothing.
+        let outputs = plan.outputs(9_999);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].value, 9_999);
+    }
+
+    #[test]
+    fn a_fee_with_no_script_is_no_fee() {
+        let plan = PayoutPlan {
+            worker_script: vec![0x51],
+            fee_script: Vec::new(),
+            fee_basis_points: 10_000,
+        };
+        let outputs = plan.outputs(1_000);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].value, 1_000);
+    }
+
+    #[test]
+    fn a_fee_cannot_overflow_on_a_large_subsidy() {
+        let plan = PayoutPlan {
+            worker_script: vec![0x51],
+            fee_script: vec![0x52],
+            fee_basis_points: 10_000,
+        };
+        let outputs = plan.outputs(u64::MAX);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[1].value, u64::MAX);
+        assert_eq!(outputs[0].value, 0);
+    }
 
     #[test]
     fn an_empty_path_leaves_the_coinbase_txid_as_the_root() {

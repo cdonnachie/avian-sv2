@@ -1,45 +1,62 @@
-//! The Avian Stratum v2 pool.
+//! The Avian Stratum v2 solo pool.
 //!
 //! Upstream it is a Template Distribution client, one connection per
 //! algorithm, because one connection carries one `nBits` and `target` stream.
 //! Downstream it is a Mining Protocol server, one standard channel per worker.
-//! The two meet in an `AlgoContext` per algorithm: the thread that received a
-//! template pushes a job onto every channel mining that algorithm, and the
-//! thread reading from a worker answers its submissions and sends a winning
-//! one back up as a `SubmitSolution`.
 //!
-//! No payouts, no share accounting beyond what validation needs, no vardiff,
-//! no extended channels, no job declaration, no Stratum v1.
+//! **Solo.** A worker's own address goes in the coinbase and consensus pays it
+//! directly, so the pool never holds anyone's earnings. The address comes from
+//! `user_identity` at channel open, and an address that does not parse refuses
+//! the channel rather than falling back to anything.
+//!
+//! No accounting, no payout ledger, no persistence, no vardiff, no web or
+//! stats services, no Stratum v1.
 
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use avian_mining::server::{AlgoContext, Server, ServerConfig};
+use avian_mining::pool::{self, PoolConfig};
+use avian_mining::ratelimit::RateLimitConfig;
+use avian_mining::server::ServerConfig;
 use avian_mining::share::{AvianHasher, PowHasher};
+use avian_sv2::address::{self, Address, Network};
 use avian_sv2::avian::TimeConstraints;
 use avian_sv2::wire::{hex, hex_rev};
+use avian_sv2::Backoff;
+use avian_tdp::coinbase::MAX_COINBASE_TAG;
 use avian_tdp::tdp::PrevHash;
-use avian_tdp::{authority, chain_subdir, default_port, PowType, SessionConfig, TdpSession, Work};
+use avian_tdp::{authority, chain_subdir, default_port, PowType, Work};
 use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 
 struct Options {
     node: SocketAddr,
     mining_bind: SocketAddr,
+    network: Network,
     algorithms: Vec<PowType>,
     node_authority: Option<XOnlyPublicKey>,
     pool_authority_key: PathBuf,
-    payout_script: Vec<u8>,
+    fee_script: Vec<u8>,
+    fee_basis_points: u32,
+    coinbase_tag: Vec<u8>,
     share_target_shift: u32,
+    rate_limit: RateLimitConfig,
     verbose: bool,
     duration: Option<Duration>,
     coinbase_size: u32,
     coinbase_sigops: u16,
 }
 
+const DEFAULT_TAG: &str = "/avian-sv2/";
+
 const USAGE: &str = "\
-avian-sv2-pool: an Avian Stratum v2 pool
+avian-sv2-pool: an Avian Stratum v2 solo pool
+
+A worker puts its own payout address in user_identity when it opens a channel,
+as `address` or `address.workername`, and the coinbase pays it directly. An
+address that does not parse, or belongs to another network, refuses the
+channel. There is no fallback address, by design.
 
 Upstream, to the node:
   --datadir <path>       the node's datadir, to read sv2_authority_key from
@@ -50,14 +67,22 @@ Upstream, to the node:
   --coinbase-size <n>    coinbase_output_max_additional_size, default 1000
   --coinbase-sigops <n>  coinbase_output_max_additional_sigops, default 10
 
-Downstream, to workers:
+Downstream, to miners:
   --mining-bind <addr>   where to serve the Mining Protocol
                          (default 127.0.0.1:34254, loopback only)
   --pool-key <file>      the pool's authority private key, generated on first
                          run (default: ./avian-pool-authority-key)
-  --payout-script <hex>  scriptPubKey the pool pays itself (default 51, OP_TRUE)
+  --coinbase-tag <text>  goes in the coinbase scriptSig
+                         (default: /avian-sv2/, at most 87 bytes)
+  --operator-fee <addr>  take a fee to this address; omit for none
+  --operator-fee-bp <n>  the fee in hundredths of a percent (100 = 1%)
   --share-target-shift   halvings below the network target for the share
                          target; 0 (default) makes them the same
+
+Submission limits, per channel:
+  --share-rate-tolerance <n>   multiple of the expected rate, default 8
+  --max-invalid-shares <n>     invalid submissions before the channel is
+                               dropped, default 50
 
   --algo <name>          x16rt or minotaurx; repeatable, default: both
   --duration <seconds>   stop after this long; default: run until killed
@@ -87,7 +112,7 @@ fn run(options: Options) -> Result<(), String> {
 
     let hasher: Arc<dyn PowHasher> = Arc::new(AvianHasher);
     println!("[pool] proof of work: {}", hasher.describe());
-    if !avian_pow::AVAILABLE {
+    if hasher.hash(PowType::X16rt, &[0u8; 80]).is_none() {
         return Err(
             "the proof-of-work hashers are not available, so no share could be validated. \
              Rebuild with AVIAN_SRC pointing at the Avian Core src directory."
@@ -95,110 +120,71 @@ fn run(options: Options) -> Result<(), String> {
         );
     }
 
-    // One Template Distribution session per algorithm, opened before the
-    // listener so a worker never arrives to find no target to set.
-    let mut algos = Vec::new();
-    let mut sessions = Vec::new();
-    for pow in &options.algorithms {
-        let mut config = SessionConfig::new(options.node, *pow);
-        config.authority = options.node_authority;
-        config.coinbase_output_max_additional_size = options.coinbase_size;
-        config.coinbase_output_max_additional_sigops = options.coinbase_sigops;
-
-        let session = TdpSession::open(&config).map_err(|e| format!("{pow}: {e}"))?;
+    println!(
+        "[pool] solo on {}: a worker's own address is paid, from user_identity at channel open",
+        options.network
+    );
+    if options.fee_basis_points > 0 {
         println!(
-            "[pool] {pow}: session open, extension 0x4001 accepted, version_rolling_mask \
-             0x{:08x}, node certificate {}",
-            session.version_rolling_mask(),
-            if session.identity().verified {
-                "verified"
-            } else {
-                "accepted on first use"
-            }
+            "[pool] operator fee {}.{:02}%",
+            options.fee_basis_points / 100,
+            options.fee_basis_points % 100
         );
-        let algo = Arc::new(AlgoContext::new(*pow, session.submitter()));
-        algos.push(algo.clone());
-        sessions.push((session, algo));
     }
 
-    let server = Arc::new(Server::new(
-        ServerConfig {
-            bind: options.mining_bind,
-            authority,
-            cert_validity: avian_sv2::transport::DEFAULT_CERT_VALIDITY_SECS,
-            payout_script: options.payout_script.clone(),
-            share_target_shift: options.share_target_shift,
+    let verbose = options.verbose;
+    let observer: pool::WorkObserver =
+        Arc::new(move |pow, work: &Work| print_round(pow, work, verbose));
+
+    let handle = pool::spawn(
+        PoolConfig {
+            node: options.node,
+            node_authority: options.node_authority,
+            algorithms: options.algorithms.clone(),
+            server: ServerConfig {
+                bind: options.mining_bind,
+                authority,
+                cert_validity: avian_sv2::transport::DEFAULT_CERT_VALIDITY_SECS,
+                network: options.network,
+                fee_script: options.fee_script.clone(),
+                fee_basis_points: options.fee_basis_points,
+                coinbase_tag: options.coinbase_tag.clone(),
+                share_target_shift: options.share_target_shift,
+                rate_limit: options.rate_limit,
+            },
+            coinbase_size: options.coinbase_size,
+            coinbase_sigops: options.coinbase_sigops,
+            duration: options.duration,
+            upstream_backoff: Backoff::default(),
         },
-        algos,
         hasher,
-    ));
+        Some(observer),
+    )
+    .map_err(|e| e.to_string())?;
 
-    // The first round of work has to be in hand before a worker can be told a
-    // target, so pull one per algorithm before the listener opens.
-    for (session, algo) in &mut sessions {
-        let work = session.next_work().map_err(|e| e.to_string())?;
-        report(&options, algo.pow, &work);
-        for (id, e) in algo.publish(work) {
-            eprintln!("[pool] channel {id}: {e}");
-        }
-    }
-
-    let handle = server
-        .clone()
-        .listen()
-        .map_err(|e| format!("mining listener: {e}"))?;
     println!(
         "[pool] serving the Mining Protocol on {} for {} algorithm(s)",
-        handle.addr(),
+        handle.mining_addr(),
         options.algorithms.len()
     );
+    // Both forms, labelled. A miner's configuration takes this as one opaque
+    // string the user pastes in, and the two stacks present x-only keys
+    // differently: SRI and the miners built on it use base58check, while the
+    // node's own tooling and this project's logs have used hex. An operator
+    // who publishes the wrong one has a pool nobody can connect to, and the
+    // symptom is a handshake that never completes, so print both rather than
+    // guess.
     println!(
-        "[pool] pool authority public key {}",
+        "[pool] authority public key, base58 (Stratum v2 miner configuration):\n    {}",
+        address::encode_authority_key(&pool_pubkey)
+    );
+    println!(
+        "[pool] authority public key, hex (32-byte x-only):\n    {}",
         hex(&pool_pubkey.serialize())
     );
 
-    let deadline = options.duration.map(|d| std::time::Instant::now() + d);
-    let mut threads = Vec::new();
-    for (mut session, algo) in sessions {
-        let verbose = options.verbose;
-        threads.push(std::thread::spawn(move || {
-            loop {
-                if let Some(deadline) = deadline {
-                    let left = deadline.saturating_duration_since(std::time::Instant::now());
-                    if left.is_zero() {
-                        return;
-                    }
-                    if session.set_read_timeout(Some(left)).is_err() {
-                        return;
-                    }
-                }
-                let work = match session.next_work() {
-                    Ok(work) => work,
-                    Err(e) => {
-                        // Past the deadline any failure is the deadline, since
-                        // the read timeout is what fired.
-                        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                            return;
-                        }
-                        eprintln!("[pool] {}: {e}", algo.pow);
-                        return;
-                    }
-                };
-                print_round(algo.pow, &work, verbose);
-                for (id, e) in algo.publish(work) {
-                    eprintln!("[pool] {} channel {id}: {e}", algo.pow);
-                }
-            }
-        }));
-    }
-    for thread in threads {
-        let _ = thread.join();
-    }
+    handle.join();
     Ok(())
-}
-
-fn report(options: &Options, pow: PowType, work: &Work) {
-    print_round(pow, work, options.verbose);
 }
 
 fn print_round(pow: PowType, work: &Work, verbose: bool) {
@@ -241,7 +227,7 @@ fn agreement(prev: &PrevHash, constraints: &TimeConstraints) -> &'static str {
 
 /// Reads the pool's authority private key, creating it on first run.
 ///
-/// Mode 0600, like the node's own key files. The public half is what a worker
+/// Mode 0600, like the node's own key files. The public half is what a miner
 /// pins to know it is talking to this pool.
 fn load_or_create_pool_key(path: &Path) -> Result<Keypair, String> {
     let secp = Secp256k1::new();
@@ -269,15 +255,6 @@ fn load_or_create_pool_key(path: &Path) -> Result<Keypair, String> {
     Ok(Keypair::from_secret_key(&secp, &secret))
 }
 
-fn unhex(text: &str) -> Result<Vec<u8>, String> {
-    if text.len() % 2 != 0 {
-        return Err("hex needs an even number of characters".into());
-    }
-    (0..text.len() / 2)
-        .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).map_err(|_| "not hex".to_string()))
-        .collect()
-}
-
 fn parse_args() -> Result<Option<Options>, String> {
     let mut datadir: Option<PathBuf> = None;
     let mut chain = "regtest".to_string();
@@ -287,8 +264,11 @@ fn parse_args() -> Result<Option<Options>, String> {
     let mut algorithms: Vec<PowType> = Vec::new();
     let mut mining_bind = "127.0.0.1:34254".to_string();
     let mut pool_key = PathBuf::from("avian-pool-authority-key");
-    let mut payout_script = vec![0x51u8]; // OP_TRUE
+    let mut fee_address: Option<String> = None;
+    let mut fee_basis_points = 0u32;
+    let mut coinbase_tag = DEFAULT_TAG.to_string();
     let mut share_target_shift = 0u32;
+    let mut rate_limit = RateLimitConfig::default();
     let mut verbose = false;
     let mut duration = None;
     let mut coinbase_size = 1000u32;
@@ -313,11 +293,27 @@ fn parse_args() -> Result<Option<Options>, String> {
             "--insecure-tofu" => insecure = true,
             "--mining-bind" => mining_bind = value!(),
             "--pool-key" => pool_key = PathBuf::from(value!()),
-            "--payout-script" => payout_script = unhex(&value!())?,
+            "--coinbase-tag" => coinbase_tag = value!(),
+            "--operator-fee" => fee_address = Some(value!()),
+            "--operator-fee-bp" => {
+                fee_basis_points = value!()
+                    .parse()
+                    .map_err(|_| "--operator-fee-bp wants a number")?
+            }
             "--share-target-shift" => {
                 share_target_shift = value!()
                     .parse()
                     .map_err(|_| "--share-target-shift wants a number")?
+            }
+            "--share-rate-tolerance" => {
+                rate_limit.tolerance = value!()
+                    .parse()
+                    .map_err(|_| "--share-rate-tolerance wants a number")?
+            }
+            "--max-invalid-shares" => {
+                rate_limit.max_invalid = value!()
+                    .parse()
+                    .map_err(|_| "--max-invalid-shares wants a number")?
             }
             "--verbose" => verbose = true,
             "--algo" => {
@@ -349,8 +345,43 @@ fn parse_args() -> Result<Option<Options>, String> {
     if algorithms.is_empty() {
         algorithms = vec![PowType::X16rt, PowType::MinotaurX];
     }
-    if payout_script.is_empty() {
-        return Err("--payout-script cannot be empty".into());
+    let network = Network::parse(&chain).ok_or_else(|| format!("unknown chain {chain}"))?;
+
+    // Refused here rather than when the node silently rejects the block: the
+    // Template Distribution Protocol has no SubmitSolution.Error.
+    let coinbase_tag = coinbase_tag.into_bytes();
+    if coinbase_tag.len() > MAX_COINBASE_TAG {
+        return Err(format!(
+            "--coinbase-tag is {} bytes and the most that always fits is {MAX_COINBASE_TAG}",
+            coinbase_tag.len()
+        ));
+    }
+
+    let fee_script = match &fee_address {
+        Some(text) => {
+            let address = Address::decode(text, network)
+                .map_err(|e| format!("--operator-fee {text:?}: {e}"))?;
+            if fee_basis_points == 0 {
+                return Err(
+                    "--operator-fee was given with no --operator-fee-bp, so the fee would be \
+                     zero and the address unused"
+                        .into(),
+                );
+            }
+            address.script_pubkey()
+        }
+        None => {
+            if fee_basis_points > 0 {
+                return Err(
+                    "--operator-fee-bp was given with no --operator-fee address to pay it to"
+                        .into(),
+                );
+            }
+            Vec::new()
+        }
+    };
+    if fee_basis_points > 10_000 {
+        return Err("--operator-fee-bp cannot exceed 10000, which is the whole coinbase".into());
     }
 
     let target = connect.unwrap_or_else(|| format!("127.0.0.1:{}", default_port(&chain)));
@@ -391,11 +422,15 @@ fn parse_args() -> Result<Option<Options>, String> {
     Ok(Some(Options {
         node,
         mining_bind,
+        network,
         algorithms,
         node_authority,
         pool_authority_key: pool_key,
-        payout_script,
+        fee_script,
+        fee_basis_points,
+        coinbase_tag,
         share_target_shift,
+        rate_limit,
         verbose,
         duration,
         coinbase_size,
