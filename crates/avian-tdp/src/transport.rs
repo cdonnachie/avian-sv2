@@ -1,28 +1,27 @@
-//! Frames over a blocking socket.
+//! The Noise NX handshake and the framing above it, over a blocking socket.
 //!
-//! The header is `framing_sv2::header::Header`, SRI's, which carries any
-//! `extension_type` including `0x4001` and the `0xc001` channel-message form.
-//! The cipher layer is [`crate::noise`], which exists only because SRI's
-//! handshake cannot talk to `aviand`; see [`crate::noise::Variant`].
+//! Both halves are SRI's: `noise_sv2` does the handshake and the ciphers,
+//! `codec_sv2` does the frame encryption and chunking, and `framing_sv2` does
+//! the 6-byte header, which carries any `extension_type` including `0x4001`
+//! and the `0xc001` channel-message form.
 //!
-//! Each frame is one AEAD operation for the 6-byte header followed by the
-//! payload in chunks of at most 65519 bytes, each its own AEAD operation on
-//! the same cipher. They consume consecutive nonces, so they have to stay in
-//! order.
+//! What this adds is a blocking socket loop and an owned [`Frame`], so a
+//! caller is not holding a borrow of the decoder's buffer while it decides
+//! what to do next.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use binary_sv2::{to_bytes, GetSize, Serialize};
-use framing_sv2::header::Header;
+use binary_sv2::{GetSize, Serialize};
+use codec_sv2::{
+    Decoded, Decrypted, HandshakeMessage, InitiatorSent, MessageFrame, NoiseDecoder, NoiseEncoder,
+    SerializedFrame, TransportDecryptState, TransportEncryptState,
+};
+use noise_sv2::{Initiator, INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE};
 use secp256k1::XOnlyPublicKey;
 
 use crate::error::{Error, Result};
-use crate::noise::{
-    Certificate, CipherState, Handshake, Variant, ENCRYPTED_HEADER_SIZE, HANDSHAKE_MSG2_SIZE,
-    MAC_SIZE, MAX_PLAINTEXT_CHUNK,
-};
 
 pub const CHANNEL_MSG_BIT: u16 = 0x8000;
 
@@ -54,71 +53,74 @@ impl Frame {
 }
 
 /// What the server proved about itself during the handshake.
+///
+/// Thin because `noise_sv2` verifies the certificate inside `step_2` and
+/// returns only the ciphers, so neither the server's static key nor the
+/// certificate's validity window is available to report.
 #[derive(Debug, Clone)]
 pub struct ServerIdentity {
-    /// The x coordinate of the server's static key.
-    pub static_key: [u8; 32],
-    pub certificate: Certificate,
     /// True when the certificate was checked against an authority key rather
-    /// than accepted on first use.
+    /// than accepted on first use. `noise_sv2` returns `Ok` either way, and
+    /// says so: the engine it returns "carries no indication of which case
+    /// applies", so this is the only record.
     pub verified: bool,
 }
 
 pub struct Connection {
     stream: TcpStream,
-    send: CipherState,
-    recv: CipherState,
+    encoder: NoiseEncoder,
+    decoder: NoiseDecoder,
+    encrypt: TransportEncryptState,
+    // Taken for the duration of a decode: SRI's decoder consumes the state and
+    // hands it back only on a round that did not fail, because after a failed
+    // decryption the nonce no longer follows the peer's bytes.
+    decrypt: Option<TransportDecryptState>,
     identity: ServerIdentity,
 }
 
 impl Connection {
-    /// Connects and completes the Noise NX handshake, using the handshake
-    /// variant `aviand` implements.
+    /// Connects and completes the Noise NX handshake.
+    ///
+    /// `authority` is the pool authority x-only public key. Passing `None` is
+    /// trust on first use: the handshake still runs, but nothing says the key
+    /// that signed the certificate is the one that should have.
     pub fn connect(
         addr: SocketAddr,
         authority: Option<XOnlyPublicKey>,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::connect_with_variant(addr, authority, timeout, Variant::default())
-    }
-
-    /// Connects with an explicit handshake variant.
-    ///
-    /// `Variant::Sv2Spec` is the specification's reading and will not complete
-    /// against `aviand` today. It is here so that the day the node is fixed
-    /// this client needs a flag rather than a patch, and so the divergence can
-    /// be demonstrated rather than asserted.
-    pub fn connect_with_variant(
-        addr: SocketAddr,
-        authority: Option<XOnlyPublicKey>,
-        timeout: Duration,
-        variant: Variant,
-    ) -> Result<Self> {
-        let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
+        let stream = TcpStream::connect_timeout(&addr, timeout)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
         stream.set_nodelay(true)?;
 
-        let mut handshake = Handshake::new(variant);
-        stream.write_all(&handshake.write_msg1()?)?;
+        let verified = authority.is_some();
+        let mut encoder = NoiseEncoder::new();
 
-        let mut reply = [0u8; HANDSHAKE_MSG2_SIZE];
-        read_exact(&mut stream, &mut reply)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| Error::Protocol("the system clock is before the epoch".into()))?
-            .as_secs() as u32;
-        let session = handshake.read_msg2(&reply, authority.as_ref(), now)?;
+        let handshake = codec_sv2::Handshake::initiator(Initiator::new(authority));
+        let (message, handshake) = handshake.step_0()?;
+        let mut partial = Partial {
+            stream,
+            decoder: NoiseDecoder::new(),
+        };
+        partial.write_handshake(&mut encoder, message)?;
+
+        let mut reply = [0u8; INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE];
+        partial.read_handshake(&mut reply)?;
+        let Partial { stream, decoder } = partial;
+
+        // step_2 is where the certificate is checked: the validity window
+        // against the clock, and the signature against `authority` when one
+        // was given. A bad certificate fails here, not later.
+        let (encrypt, decrypt) = handshake.step_2(reply)?.split();
 
         Ok(Self {
             stream,
-            send: session.send,
-            recv: session.recv,
-            identity: ServerIdentity {
-                static_key: session.remote_static,
-                certificate: session.certificate,
-                verified: session.verified,
-            },
+            encoder,
+            decoder,
+            encrypt,
+            decrypt: Some(decrypt),
+            identity: ServerIdentity { verified },
         })
     }
 
@@ -142,11 +144,16 @@ impl Connection {
         channel_msg: bool,
         message: T,
     ) -> Result<()> {
-        let payload = to_bytes(message)?;
-        self.send_raw(extension_type, msg_type, channel_msg, &payload)
+        let frame = MessageFrame::from_message(message, msg_type, extension_type, channel_msg)?;
+        let bytes = self.encoder.encode_transport(frame, &mut self.encrypt)?;
+        self.stream.write_all(bytes.as_ref())?;
+        Ok(())
     }
 
     /// Sends an already-serialized payload under any `extension_type`.
+    ///
+    /// This is the path the Avian extension and the Extensions Negotiation
+    /// extension take, since SRI defines neither.
     pub fn send_raw(
         &mut self,
         extension_type: u16,
@@ -159,39 +166,38 @@ impl Connection {
         } else {
             extension_type & !CHANNEL_MSG_BIT
         };
-        let header = encode_header(extension_type, msg_type, payload.len())?;
+        let mut bytes = encode_header(extension_type, msg_type, payload.len())?.to_vec();
+        bytes.extend_from_slice(payload);
 
-        let mut out = self.send.encrypt(&header, &[])?;
-        for chunk in payload.chunks(MAX_PLAINTEXT_CHUNK) {
-            out.extend_from_slice(&self.send.encrypt(chunk, &[])?);
-        }
-        // Chunks of one frame must not be interleaved with another frame's, so
-        // the whole thing goes out in one write.
-        self.stream.write_all(&out)?;
+        let frame = SerializedFrame::from_bytes(bytes)?;
+        let out = self.encoder.encode_transport(frame, &mut self.encrypt)?;
+        self.stream.write_all(out.as_ref())?;
         Ok(())
     }
 
     /// Reads one whole frame, blocking until it arrives.
     pub fn recv(&mut self) -> Result<Frame> {
-        let mut encrypted_header = [0u8; ENCRYPTED_HEADER_SIZE];
-        read_exact(&mut self.stream, &mut encrypted_header)?;
-        let header = Header::from_bytes(&self.recv.decrypt(&encrypted_header, &[])?)?;
-
-        let length = header.payload_length();
-        let mut payload = Vec::with_capacity(length);
-        while payload.len() < length {
-            let chunk = (length - payload.len()).min(MAX_PLAINTEXT_CHUNK);
-            let mut encrypted = vec![0u8; chunk + MAC_SIZE];
-            read_exact(&mut self.stream, &mut encrypted)?;
-            payload.extend_from_slice(&self.recv.decrypt(&encrypted, &[])?);
+        loop {
+            let state = self.decrypt.take().ok_or_else(|| {
+                Error::Protocol("the connection was torn down by a failed decryption".into())
+            })?;
+            match self.decoder.next_transport_frame(state)? {
+                Decrypted::Frame(mut frame, state) => {
+                    self.decrypt = Some(state);
+                    let header = frame.header();
+                    return Ok(Frame {
+                        extension_type: header.ext_type_without_channel_msg(),
+                        channel_msg: header.channel_msg(),
+                        msg_type: header.msg_type(),
+                        payload: frame.payload().to_vec(),
+                    });
+                }
+                Decrypted::Incomplete(_, state) => {
+                    self.decrypt = Some(state);
+                    read_window(&mut self.stream, &mut self.decoder)?;
+                }
+            }
         }
-
-        Ok(Frame {
-            extension_type: header.ext_type_without_channel_msg(),
-            channel_msg: header.channel_msg(),
-            msg_type: header.msg_type(),
-            payload,
-        })
     }
 
     /// Reads one frame, requiring it to be the one named.
@@ -205,6 +211,65 @@ impl Connection {
         }
         Ok(frame)
     }
+}
+
+// The handshake needs the stream and the decoder before the Connection exists.
+struct Partial {
+    stream: TcpStream,
+    decoder: NoiseDecoder,
+}
+
+impl Partial {
+    fn write_handshake(
+        &mut self,
+        encoder: &mut NoiseEncoder,
+        message: HandshakeMessage,
+    ) -> Result<()> {
+        let bytes = encoder.encode_handshake(message);
+        self.stream.write_all(bytes.as_ref())?;
+        Ok(())
+    }
+
+    fn read_handshake(&mut self, into: &mut [u8]) -> Result<()> {
+        loop {
+            match self.decoder.next_handshake_frame::<InitiatorSent>()? {
+                Decoded::Frame(message) => {
+                    let payload = message.payload();
+                    if payload.len() != into.len() {
+                        return Err(Error::Payload(format!(
+                            "handshake message 2 is {} bytes, expected {}",
+                            payload.len(),
+                            into.len()
+                        )));
+                    }
+                    into.copy_from_slice(payload);
+                    return Ok(());
+                }
+                Decoded::Incomplete(_) => read_window(&mut self.stream, &mut self.decoder)?,
+            }
+        }
+    }
+}
+
+/// Fills the decoder's read window exactly.
+///
+/// `writable()` hands back the window the decoder will accept and has already
+/// counted those bytes as present, so a short read leaves it decrypting
+/// whatever the buffer held. Nothing recovers from that, which is why a
+/// failure here is terminal for the connection.
+fn read_window(stream: &mut TcpStream, decoder: &mut NoiseDecoder) -> Result<()> {
+    // An empty window means the bytes are already buffered: go round again.
+    let window = decoder.writable();
+    if window.is_empty() {
+        return Ok(());
+    }
+    stream.read_exact(window).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            Error::Protocol("the node closed the Stratum v2 connection".into())
+        } else {
+            Error::Io(e)
+        }
+    })
 }
 
 /// The six header bytes: `extension_type`, `msg_type`, `msg_length`.
@@ -223,19 +288,10 @@ pub fn encode_header(extension_type: u16, msg_type: u8, length: usize) -> Result
     Ok(out)
 }
 
-fn read_exact(stream: &mut TcpStream, into: &mut [u8]) -> Result<()> {
-    stream.read_exact(into).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            Error::Protocol("the node closed the Stratum v2 connection".into())
-        } else {
-            Error::Io(e)
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use framing_sv2::header::Header;
 
     #[test]
     fn a_channel_message_header_round_trips_through_sri() {

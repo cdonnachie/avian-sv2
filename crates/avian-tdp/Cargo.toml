@@ -7,13 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+codec_sv2.workspace = true
+noise_sv2.workspace = true
 framing_sv2.workspace = true
 binary_sv2.workspace = true
 common_messages_sv2.workspace = true
 template_distribution_sv2.workspace = true
 secp256k1.workspace = true
-chacha20poly1305.workspace = true
-
-[dev-dependencies]
-codec_sv2.workspace = true
-noise_sv2.workspace = true

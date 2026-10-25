@@ -3,10 +3,8 @@
 //! Layered so a Mining Protocol server can be added above it without changing
 //! anything here:
 //!
-//! - [`noise`] is the Noise NX handshake and the frame cipher. It is not
-//!   SRI's, and the module header says why: SRI's handshake cannot complete
-//!   one with `aviand`.
-//! - [`transport`] is framing over a blocking socket, using SRI's header.
+//! - [`transport`] is the Noise NX handshake and frame encryption, all of it
+//!   SRI's, with a blocking socket loop on top.
 //! - [`avian`] is extension `0x4001` and the Extensions Negotiation extension
 //!   `0x0001`, which SRI does not define. It includes
 //!   `AvianJobTimeConstraints`, the Mining Protocol half, which this client
@@ -18,7 +16,6 @@
 pub mod authority;
 pub mod avian;
 pub mod error;
-pub mod noise;
 pub mod session;
 pub mod tdp;
 pub mod transport;
@@ -26,7 +23,6 @@ pub mod wire;
 
 pub use avian::{PowType, EXT_AVIAN, EXT_CORE, EXT_NEGOTIATION};
 pub use error::{Error, Result};
-pub use noise::Variant as NoiseVariant;
 pub use session::{SessionConfig, TdpSession, Work, PROTOCOL_VERSION};
 pub use transport::{Connection, Frame};
 

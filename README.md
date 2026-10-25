@@ -15,6 +15,11 @@ crates/avian-sv2-pool   the binary: one session per algorithm
 
 ## The two findings that shaped this
 
+The second one has since been fixed in Avian Core, and this client now runs
+entirely on SRI's Noise. Both are recorded because the second is the reason
+the spike exists in the shape it does, and part B of it is the regression
+guard.
+
 ### SRI's codec carries `extension_type = 0x4001` without complaint
 
 This was the question that had to be answered before anything was built. The
@@ -35,11 +40,16 @@ Part A of `cargo run -p avian-tdp --example extension_spike` proves it: a
 `NoiseEncoder` and decoded by SRI's `NoiseDecoder` with every header field
 intact.
 
-### `aviand`'s Noise handshake does not follow the Stratum v2 specification
+### `aviand`'s Noise handshake did not follow the Stratum v2 specification
 
-Running the spike against a real node turned up a blocker that has nothing to
-do with the extension. **SRI's `noise_sv2` cannot complete a handshake with
-`aviand`**, and the reason is one hash.
+**Fixed in Avian Core; re-verified here.** Jump to
+[the verification](#verifying-the-fix) for what was run after the fix. The
+diagnosis is kept because part B of the spike is the regression guard for it,
+and because it is the reason this client exists as a second reader at all.
+
+Running the spike against a real node turned up a blocker that had nothing to
+do with the extension. **SRI's `noise_sv2` could not complete a handshake with
+`aviand`**, and the reason was one hash.
 
 Stratum v2, [04-Protocol-Security.md][spec] section 4.5.1.1, has the initiator
 do four things in handshake act 1:
@@ -54,7 +64,7 @@ do four things in handshake act 1:
 Step 4 adds no bytes to the wire and one `MixHash` to the transcript. The
 responder's step 4 is the matching `DecryptAndHash()`.
 
-`aviand` omits it. `HandshakeState::WriteMsg1` in `src/sv2/noise.cpp` is:
+`aviand` omitted it. `HandshakeState::WriteMsg1` in `src/sv2/noise.cpp` was:
 
 ```cpp
 GenerateEphemeral(m_ephemeral, m_ephemeral_pub);
@@ -62,9 +72,11 @@ std::copy(m_ephemeral_pub.begin(), m_ephemeral_pub.end(), out.begin());
 m_state.MixHash(out);
 ```
 
-and `ReadMsg1` matches, so the node is self-consistent and interoperates with
-`test_framework/sv2.py`, which omits it too. It does not interoperate with
-anything that follows the specification.
+and `ReadMsg1` matched, so the node was self-consistent and interoperated with
+`test_framework/sv2.py`, which omitted it too. It did not interoperate with
+anything that follows the specification. That is the failure mode a second
+implementation exists to catch: both of Avian's own readers agreed with each
+other and with nothing else, and the node's own test suite could not tell.
 
 The chaining key is unaffected, because `MixKey` does not read `h`. Only `h`
 diverges, and `h` is the AEAD associated data, so the first decryption in
@@ -80,32 +92,55 @@ B. SRI's noise_sv2 initiator against aviand at 127.0.0.1:18447
 `codec_sv2`'s Noise encoder and decoder cannot be reused with a handshake from
 elsewhere, either: `TransportEncryptState` can only come from
 `codec_sv2::Handshake::step_2`, and `noise_sv2::NoiseEngine` has no public
-constructor. So `crates/avian-tdp/src/noise.rs` implements the NX state
-machine and the frame cipher, taking every primitive from a crate that already
-had it — `chacha20poly1305` for the AEAD, `secp256k1` for the ElligatorSwift
-ECDH and the Schnorr verification, `secp256k1::hashes` for SHA256 and HMAC.
-SRI's `framing_sv2` still supplies the header and its codecs still decode the
-standard messages.
+constructor. So while the bug stood, this client carried its own NX state
+machine and frame cipher over `chacha20poly1305` and `secp256k1`, with both
+readings of act 1 behind a `noise::Variant` flag. All of that is gone.
 
-`noise::Variant` carries both readings. `Variant::Avian` is the default and
-the only one that works today; `Variant::Sv2Spec` is one line different and
-fails against the node in exactly the way SRI's does, which is what pins the
-cause:
-
-```
-D. the specification's reading of act 1 against aviand
-   handshake FAILED: MAC check failed
-```
-
-**This should be fixed in Avian Core.** It is a two-line change on each side of
-`src/sv2/noise.cpp` plus the matching two lines in `sv2.py`, it is wire
-compatible with nothing that exists yet, and leaving it means no third-party
-Stratum v2 stack can connect. doc/sv2.md currently claims the opposite:
+doc/sv2.md claimed the opposite of what the node did, which is what made the
+bug expensive to find:
 
 > The cryptography is the Stratum v2 spec's
 > `Noise_NX_Secp256k1+EllSwift_ChaChaPoly_SHA256` unchanged.
 
 [spec]: https://github.com/stratum-mining/sv2-spec/blob/main/04-Protocol-Security.md
+
+### Verifying the fix
+
+Avian Core now calls the specification's operations rather than open-coding
+`MixHash`: `WriteMsg1` ends with `m_state.EncryptAndHash({}, {})`, `ReadMsg1`
+with `m_state.DecryptAndHash({}, {})`, and `sv2.py`'s `msg1()` has the
+equivalent.
+
+Against a node rebuilt with that, on a fresh regtest datadir at 101 blocks,
+with no authority key supplied so a failure could not be a certificate
+problem:
+
+```
+B. SRI's noise_sv2 initiator against aviand at 127.0.0.1:18470
+   the node answered with all 234 bytes of message 2
+   handshake completed: the node's act 1 transcript is the spec's
+```
+
+Before the refactor that deleted them, the two `noise::Variant` readings were
+run against the same node and came out as the exact inverse of what they had
+been:
+
+```
+D. the specification's reading of act 1 against aviand
+   handshake completed
+C. aviand's old reading of act 1: protocol violation: MAC check failed
+```
+
+That the old transcript now *fails* is the half worth having. It rules out the
+node having become permissive rather than correct: it accepts one transcript,
+rejects the other, and the one it accepts is the specification's.
+
+`noise::Variant` and the hand-written `noise.rs` are deleted rather than kept
+behind a flag. Nothing was ever deployed against the old transcript, so there
+is nothing to be compatible with, and a flag whose wrong setting produces an
+unexplained MAC failure is a trap rather than a safety net. Part B of the
+spike is the regression guard instead, and it tests the thing that actually
+matters — SRI against the node — rather than this client against itself.
 
 ## Building
 
@@ -113,10 +148,12 @@ Stratum v2 stack can connect. doc/sv2.md currently claims the opposite:
 cargo build --release
 ```
 
-Needs Rust 1.75 or later. Dependencies are SRI's `framing_sv2`, `binary_sv2`,
-`common_messages_sv2` and `template_distribution_sv2`, plus `secp256k1` and
-`chacha20poly1305` at the versions `noise_sv2` already pins. `codec_sv2` and
-`noise_sv2` are dev-dependencies, used only by the spike.
+Needs Rust 1.75 or later. Dependencies are SRI's `codec_sv2`, `noise_sv2`,
+`framing_sv2`, `binary_sv2`, `common_messages_sv2` and
+`template_distribution_sv2`, plus `secp256k1` at the version `noise_sv2`
+already pins — needed only to turn the node's authority private key file into
+the x-only public key `noise_sv2` checks the certificate against. Nothing
+else.
 
 ## Running it against a node
 
@@ -156,9 +193,11 @@ The client connects to loopback only, and refuses anything else.
 cargo run -p avian-tdp --example extension_spike -- /tmp/sv2
 ```
 
-Five parts: SRI's codec with `0x4001` and `0xc001`, SRI's handshake against the
-node, this client's handshake against the node and the `0x4001` traffic that
-follows, and the specification's handshake against the node.
+Three parts: SRI's codec with `0x4001` and `0xc001` between two SRI roles,
+SRI's `noise_sv2` initiator against the live node, and real `0x4001` traffic
+in both directions. Part B is the regression guard for the Noise act 1 bug,
+and it connects without an authority key so a failure cannot be a certificate
+problem.
 
 ## Tests
 
@@ -185,11 +224,11 @@ P2P port and refuse to start if a node is already running by hand.
 This matters because that document is about to be used for a registry
 allocation and third-party implementers will build against it.
 
-**1. The Noise handshake, above.** The claim that the cryptography is the
-spec's "unchanged" is the single costliest thing in the document, because it
-is the one claim an implementer will not think to test: they will reach for
-SRI, get a MAC failure with no diagnostic, and have no reason to suspect the
-handshake rather than their own code.
+**1. The Noise handshake, above. Fixed in the node; the claim is now true.**
+It was the costliest thing in the document, because it was the one claim an
+implementer would not think to test: reach for SRI, get a MAC failure with no
+diagnostic, and have no reason to suspect the handshake rather than your own
+code. Kept here as the record of why this client was worth writing.
 
 **2. `SetNewPrevHash` is documented as conditional and is not.** The document
 says:
@@ -288,8 +327,7 @@ pool adds, not just its payout, would save an implementer a silent failure.
 ## Design, and the seam for Stage 3
 
 ```
-avian-tdp::noise       NX handshake, frame cipher
-avian-tdp::transport   frames over a socket, using framing_sv2's header
+avian-tdp::transport   SRI's Noise and framing, over a blocking socket
 avian-tdp::avian       extension 0x4001 and negotiation extension 0x0001
 avian-tdp::tdp         the stock Template Distribution messages, owned
 avian-tdp::session     one connection, one algorithm

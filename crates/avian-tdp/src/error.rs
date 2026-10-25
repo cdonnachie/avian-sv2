@@ -3,6 +3,8 @@ use std::fmt;
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
+    /// Noise handshake, encryption or framing failure from SRI's codec.
+    Codec(codec_sv2::Error),
     /// A frame whose header or length SRI's framing layer would not accept.
     Framing(framing_sv2::Error),
     /// A payload SRI's binary codec would not deserialize.
@@ -20,7 +22,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             // The SRI error types are no_std and implement Debug but not
-            // Display, so these two go through Debug.
+            // Display, so these three go through Debug.
+            Error::Codec(e) => write!(f, "codec: {e:?}"),
             Error::Framing(e) => write!(f, "framing: {e:?}"),
             Error::Binary(e) => write!(f, "deserialization: {e:?}"),
             Error::Io(e) => write!(f, "io: {e}"),
@@ -45,6 +48,7 @@ macro_rules! from_error {
 }
 
 from_error!(std::io::Error => Error::Io);
+from_error!(codec_sv2::Error => Error::Codec);
 from_error!(framing_sv2::Error => Error::Framing);
 from_error!(binary_sv2::Error => Error::Binary);
 from_error!(secp256k1::Error => Error::Secp);
