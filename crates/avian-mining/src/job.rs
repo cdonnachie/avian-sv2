@@ -1,8 +1,8 @@
 //! A job, and the ntime window that comes with it.
 
-use avian_tdp::avian::{PowType, TimeConstraints, TIME_MASK};
-use avian_tdp::block::{self, Coinbase};
-use avian_tdp::error::{Error, Result};
+use avian_sv2::avian::{PowType, TimeConstraints, TIME_MASK};
+use avian_sv2::error::{Error, Result};
+use avian_tdp::coinbase::{self, Coinbase};
 use avian_tdp::tdp::{PrevHash, Template};
 
 /// Everything needed to rebuild the header a worker hashed, and to turn a
@@ -101,7 +101,7 @@ pub fn build(
         version: template.version,
         prev_hash: prev.prev_hash,
         nbits: prev.nbits,
-        merkle_root: block::merkle_root(&coinbase.txid, &template.merkle_path),
+        merkle_root: coinbase::merkle_root(&coinbase.txid, &template.merkle_path),
         window,
         network_target: prev.target,
         coinbase: coinbase.with_witness,
@@ -124,7 +124,7 @@ pub fn extranonce(channel_id: u32, job_id: u32) -> [u8; 8] {
 /// The algorithm a job's version declares, which must be the one the
 /// connection selected.
 pub fn pow_type_of(job: &Job) -> Result<PowType> {
-    avian_tdp::avian::pow_type_from_version(job.version)
+    avian_sv2::avian::pow_type_from_version(job.version)
 }
 
 #[cfg(test)]

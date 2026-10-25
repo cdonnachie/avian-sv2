@@ -4,16 +4,16 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use avian_tdp::avian::{
+use avian_sv2::avian::{
     PowType, EXT_AVIAN, EXT_NEGOTIATION, MSG_REQUEST_EXTENSIONS, MSG_REQUEST_EXTENSIONS_ERROR,
     MSG_REQUEST_EXTENSIONS_SUCCESS, MSG_SELECT_ALGORITHM, MSG_SELECT_ALGORITHM_ERROR,
     MSG_SELECT_ALGORITHM_SUCCESS,
 };
-use avian_tdp::block;
-use avian_tdp::error::{Error, Result};
+use avian_sv2::block;
+use avian_sv2::error::{Error, Result};
+use avian_sv2::transport::{Connection, ConnectionReader, ConnectionWriter};
+use avian_sv2::wire::{Reader, Writer};
 use avian_tdp::tdp::PrevHash;
-use avian_tdp::transport::{Connection, ConnectionReader, ConnectionWriter};
-use avian_tdp::wire::{Reader, Writer};
 use avian_tdp::{SolutionSubmitter, Work};
 use common_messages_sv2::{
     SetupConnectionError, SetupConnectionSuccess, MESSAGE_TYPE_SETUP_CONNECTION,
@@ -28,7 +28,9 @@ use secp256k1::Keypair;
 
 use crate::channel::Channel;
 use crate::share::{PowHasher, Submission};
-use crate::{flags, EXT_CORE_MINING, PROTOCOL_VERSION};
+use avian_sv2::flags;
+
+use crate::{EXT_CORE_MINING, PROTOCOL_VERSION};
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -125,6 +127,28 @@ impl AlgoContext {
 
     pub fn channel_count(&self) -> usize {
         self.state.lock().map(|s| s.channels.len()).unwrap_or(0)
+    }
+
+    /// Withdraws every job on every channel, and forgets the current work.
+    ///
+    /// For an upstream reconnect: the new session issues new `template_id`s,
+    /// so a solution against anything held from the old one has nowhere to go.
+    /// Returns the number of channels affected. Each one's next job will be a
+    /// future job again, activated by its own `SetNewPrevHash`, because that
+    /// is what a fresh tip announcement is.
+    pub fn withdraw(&self) -> usize {
+        let channels = match self.state.lock() {
+            Ok(mut state) => {
+                state.work = None;
+                state.prev = None;
+                state.channels.clone()
+            }
+            Err(_) => return 0,
+        };
+        for channel in &channels {
+            channel.withdraw();
+        }
+        channels.len()
     }
 
     fn register(&self, channel: Arc<Channel>) -> Result<()> {

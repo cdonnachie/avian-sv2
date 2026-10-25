@@ -1,29 +1,39 @@
 # avian-sv2
 
-An Avian Stratum v2 pool. Upstream it is a Template Distribution client to
-`aviand`, one connection per algorithm. Downstream it is a Mining Protocol
-server to workers, one standard channel each. Both halves speak Avian's
-`0x4001` extension.
+**`libavian-sv2`**, a Stratum v2 library with a C API, and an Avian pool built
+on it.
 
-Stages 2 and 3 of `Avian-Native-Stratum-V2-Mining-Plan.md` section 25.
+The library carries the protocol core and the Mining Protocol client, so a C
+or CUDA miner links a static library and a header instead of writing Stratum
+v2, Noise included, a second and third time. The pool consumes the same library
+as an ordinary Rust crate and adds the two halves a miner never needs: the
+Template Distribution client it is to the node, and the Mining Protocol server
+it is to workers.
+
+Stages 2 through 4 of `Avian-Native-Stratum-V2-Mining-Plan.md` section 25.
 
 ```
-crates/avian-pow        Avian's X16RT and MinotaurX, linked from src/algo
-crates/avian-tdp        Noise, framing, codecs, the TDP session, coinbase
-crates/avian-mining     the Mining Protocol server and the pool wiring
-crates/avian-sv2-pool   the binary
+crates/avian-sv2        libavian-sv2: Noise, framing, extension codecs,
+                        the Mining Protocol client, and the C API
+crates/avian-pow        Avian's X16RT and MinotaurX. NOT in the library
+crates/avian-tdp        the pool's Template Distribution client and coinbase
+crates/avian-mining     the pool's Mining Protocol server and wiring
+crates/avian-sv2-pool   the pool binary
 crates/avian-regtest    starts a regtest node for tests; test support only
 ```
 
-**The milestone is reached.** `aviand` to pool to worker to pool to `aviand`,
-with a regtest block found by a test worker, relayed by the pool, accepted by
-the node, and reported by `getblock` under the algorithm that was negotiated —
-for both algorithms. Section 12 of the plan, with the test worker standing in
-for a real miner. See [Tests](#tests) for the output.
+**The milestone is reached, twice over.** `aviand` to pool to miner to pool to
+`aviand`, with a regtest block found by hashing, relayed by the pool, accepted
+by the node, and reported by `getblock` under the algorithm that was
+negotiated — for both algorithms, once driven from Rust and once from **a C
+program that links the static library**. Section 12 of the plan. See
+[Tests](#tests) for the output of both.
 
 ## Contents
 
-- [The three questions that shaped this](#the-three-questions-that-shaped-this)
+- [The four questions that shaped this](#the-four-questions-that-shaped-this)
+- [The C API](#the-c-api)
+- [Reconnection, and what does not survive it](#reconnection-and-what-does-not-survive-it)
 - [Building](#building)
 - [Running it](#running-it)
 - [Tests](#tests)
@@ -31,10 +41,51 @@ for a real miner. See [Tests](#tests) for the output.
 - [Design](#design)
 - [What is not here](#what-is-not-here)
 
-## The three questions that shaped this
+## The four questions that shaped this
 
 Each stage opened with one question whose wrong answer would have wasted
-everything after it. The third is Stage 3's.
+everything after it.
+
+### Can a C program actually use this? Yes, and it mines blocks
+
+Stage 4's question, and the one the whole ordering rests on. The library was
+built before the miners precisely so that Stratum v2 and Noise are written
+once rather than three times; if the C boundary did not work, that ordering
+would have bought nothing.
+
+`crates/avian-sv2/ctest/session.c` is a C miner in the shape a real one would
+take: it polls for protocol events, hashes between polls, and submits when it
+finds something. It is compiled by a C compiler with `-std=c11 -Wall -Wextra
+-Werror`, linked against `libavian_sv2.a` and `libavian_pow.a`, and run against
+a live pool backed by a live node. Not a Rust test calling the `extern "C"`
+functions: that would be the API talking to itself, which is the same mistake
+as a Noise implementation that only ever talks to itself.
+
+```
+linked libavian-sv2 0.1.0, hashers available
+connected and opened a channel
+job 1 generation 1 algo 0 ntime 1792952101..1792952101 nbits 207fffff
+  prev_hash     e6bb644ebc0376783984ad498332ffaef3c5c1efaeafa78cd3e93f52882cbb54
+  merkle_root   d73b12a907960862bb8869997c0bae737d61140c769aca592b0f995e39451f72
+  share_target  0000000000000000000000000000000000000000000000000000000000ffff7f
+submitted nonce 2 ntime 1792952101 for job 1
+share 1 accepted, 1 so far
+forcing a reconnect
+reconnected as generation 2
+done: a share was accepted and the connection was re-established
+```
+
+and the node took the block:
+
+```
+[test] a C program mined x16rt block 322a917b7eebadb9ba4469be51db5c7baaba72a1916bb47006f0a8f03449d9a4 at height 102
+[test] a C program mined minotaurx block 21b5905e19548a2102da9c6d0ae88e45f8aa5f96dd39a7b736343013223a1dee at height 103
+```
+
+That one program also demonstrates the boundary it is there to prove: the
+protocol comes from `libavian_sv2.a` and **the hashing comes from somewhere
+else entirely**, here `libavian_pow.a`. The library contains no X16RT and no
+MinotaurX, and the C program could not work if it did not bring its own.
 
 ### Can the pool compute Avian's proof-of-work hash from Rust? Yes, by FFI
 
@@ -206,24 +257,136 @@ unexplained MAC failure is a trap rather than a safety net. Part B of the
 spike is the regression guard instead, and it tests the thing that actually
 matters — SRI against the node — rather than this client against itself.
 
+## The C API
+
+`crates/avian-sv2/include/avian_sv2.h`, hand written, and kept honest by the C
+program being compiled against it with `-Werror` in CI-equivalent tests. The
+boundary is section 10 of the plan's neutral `AvianMiningJob`: the C side sees
+jobs and submits shares, and never sees Noise, framing or a Stratum v2 type.
+
+```c
+AvianSv2Client *avian_sv2_client_connect(const AvianSv2ClientConfig *, int32_t *status);
+int32_t avian_sv2_client_poll(AvianSv2Client *, uint32_t timeout_ms, AvianSv2Event *);
+int32_t avian_sv2_client_submit(AvianSv2Client *, const AvianMiningJob *, uint32_t nonce, uint32_t ntime);
+int32_t avian_sv2_client_disconnect(AvianSv2Client *);
+void    avian_sv2_client_free(AvianSv2Client *);
+
+int32_t avian_sv2_build_header(const AvianMiningJob *, uint32_t ntime, uint32_t nonce, uint8_t out[80]);
+int32_t avian_sv2_meets_target(const uint8_t hash[32], const uint8_t target[32]);
+```
+
+Four rules it keeps, because a C caller cannot be made to read Rust docs:
+
+- **No Rust type crosses.** Strings are copied into caller-owned fixed buffers
+  rather than handed out as pointers with a lifetime, so nothing allocated by
+  the library is freed by the caller except the one opaque handle.
+- **No panic crosses.** Every entry point catches one and returns
+  `AVIAN_SV2_ERROR`, because unwinding into C is undefined.
+- **A null pointer is an error, not a crash**, and freeing null is defined,
+  like `free(3)`. There is a test for exactly that.
+- **`submit` takes the job, not its id.** See below; this one cost a bug.
+
+`avian_sv2_build_header` assembles the 80 bytes and stops. Hashing them is the
+caller's, and having an optimised hasher is the entire reason the caller is a
+miner.
+
+### Linking
+
+```
+cargo build --release -p avian-sv2
+cc -I crates/avian-sv2/include my_miner.c    target/release/libavian_sv2.a -lpthread -ldl -lm -o my_miner
+```
+
+The static library carries the whole Rust standard library, so nothing else is
+needed beyond libc, libm, libdl and libpthread. The library itself needs **no
+Avian source tree**, because it does no hashing — which is also the simplest
+demonstration that the split is real.
+
+If you also link `libavian_pow.a`, as the test program does, add `-lstdc++`:
+Avian's lyra2, sponge, tiger and `uint256` are C++. That library does need the
+Avian sources, found beside this repository or at `AVIAN_SRC`.
+
+**The cost of this ordering, stated plainly for whoever does Stage 5:** the
+miner build now needs a Rust toolchain. On Linux that is `rustup` and
+`cargo build --release -p avian-sv2`. Cross-compiling for Windows and macOS
+miner releases is harder than for Linux and is the real expense; the plan says
+so and it has not got cheaper. What it buys is that Noise is written once.
+
+## Reconnection, and what does not survive it
+
+In the library rather than bolted onto the pool, so a miner gets it too. A
+miner that stops on a dropped connection is useless and nobody is watching its
+logs.
+
+Both directions:
+
+- **Downstream**, `MiningClient::poll` reconnects transparently. A drop
+  surfaces as `Event::Disconnected` and the next poll re-establishes and
+  reports `Event::Reconnected`.
+- **Upstream**, `avian_tdp::ReconnectingSession` does the same for the pool's
+  session to the node, and reports `Round::Reconnected` rather than hiding it,
+  because the caller has to act on it.
+
+Backoff is exponential, 250ms doubling to 30s, unlimited attempts by default,
+and deliberately without jitter so a test can reason about the delays. A pool
+with many miners reconnecting at once wants jitter; that belongs at the point
+where a deployment has enough miners for it to matter, and is noted in the
+code rather than guessed at now.
+
+### Nothing protocol-level survives
+
+Configuration survives. **Everything else is new**, and that is not a
+limitation of this implementation, it is what Stratum v2 is: a new Noise
+handshake, a new `SetupConnection`, a new `channel_id` and so a new coinbase
+extranonce, new `job_id`s from the pool's counter, the pool's accepted-share
+counters back at zero, and upstream, new `template_id`s so every template the
+pool was holding is unsubmittable.
+
+So both ends discard every job and template across a reconnect. The pool
+withdraws the jobs on every channel and its next job per channel is a future
+job again. The client clears its jobs and bumps a `generation` counter, which
+is on every `MiningJob` and in the C struct.
+
+**That counter is not decoration.** `submit` originally took a `job_id`, and a
+test caught the consequence: job ids restart at 1 on a new connection, so a
+nonce found for job 1 of the old connection was submitted against job 1 of the
+new one — and the pool accepted it, because it was a structurally valid share
+for a different job. It happened to be a block. `submit` now takes the whole
+`MiningJob` and refuses one from another generation, in Rust and in C alike.
+Hashrate in flight across a reconnect is lost, and there is nowhere for it to
+go.
+
+A second bug in the same area, also caught by running it: `with_retry` let the
+caller signal "do not retry" by returning a different error, which the loop
+then dutifully retried. A miner pointed at a pool that does not serve its
+algorithm sat in a reconnect loop instead of saying so. The decision now lives
+in the loop, keyed on whether the failure can change: a dropped socket is
+retried, a refusal or a bad certificate is not. There is a test with unlimited
+attempts that would hang forever if that regressed.
+
 ## Building
 
 ```
 cargo build --release
 ```
 
-Needs Rust 1.75 or later, a C and C++ toolchain, and the Avian Core source
-tree. Dependencies are SRI's `codec_sv2`, `noise_sv2`, `framing_sv2`,
-`binary_sv2`, `common_messages_sv2`, `mining_sv2` and
+Needs Rust 1.75 or later. Dependencies are SRI's `codec_sv2`, `noise_sv2`,
+`framing_sv2`, `binary_sv2`, `common_messages_sv2`, `mining_sv2` and
 `template_distribution_sv2`, plus two that were already in the tree as
 transitive dependencies at the versions SRI pins: `secp256k1`, for the
-authority keys and for SHA256, and `cc` as a build dependency, to compile
-Avian's algorithm sources. Nothing else.
+authority keys and for SHA256, and `cc` as a build dependency. Nothing else.
 
-`build.rs` looks for the Avian `src` directory beside this repository, or at
-`AVIAN_SRC`. Without it the crate still compiles, but the hashers report
-themselves unavailable and the pool refuses to start rather than accepting
-every share:
+**The library alone needs no C++ toolchain and no Avian source tree:**
+
+```
+cargo build --release -p avian-sv2
+```
+
+The pool does, because it has to check shares and so links Avian's own
+hashers. `crates/avian-pow/build.rs` looks for the Avian `src` directory
+beside this repository, or at `AVIAN_SRC`. Without it everything still
+compiles, but the hashers report themselves unavailable and the pool refuses to
+start rather than accepting every share:
 
 ```
 AVIAN_SRC=/path/to/Avian-v5.0/src cargo build --release
@@ -302,11 +465,47 @@ problem.
 cargo test
 ```
 
-43 tests, of which 15 start a real node. Everything that needs one skips with
-a message when `aviand` is not found; `AVIAND` and `AVIAN_CLI` override the
-default of `~/avian-build/bin`. The nodes the tests start pass `-listen=0`,
-without which they bind the regtest P2P port and refuse to start if a node is
-already running by hand.
+57 tests, of which 19 start a real node and one also invokes a C compiler.
+Everything that needs a node skips with a message when `aviand` is not found;
+`AVIAND` and `AVIAN_CLI` override the default of `~/avian-build/bin`, and `CC`
+overrides `cc`. The nodes the tests start pass `-listen=0`, without which they
+bind the regtest P2P port and refuse to start if a node is already running by
+hand.
+
+### The C program
+
+`crates/avian-mining/tests/c_api.rs` builds both static libraries, compiles
+`ctest/session.c` against the hand-written header with `-Werror`, links it, and
+runs it against a live pool for each algorithm. It asserts the program got a
+channel, had a share accepted, reconnected, and that the node's tip advanced
+with the right `powtype`.
+
+```
+test a_c_program_mines_a_share_through_the_static_library ... ok
+```
+
+It is the only test that can catch three things: the header drifting from
+`capi.rs` (the compile fails), the documented link line drifting from what
+actually links (the link fails), and an API that is awkward or impossible to
+use from C (the program cannot be written). The first of those also has a
+cheap unit test, `the_c_header_matches_this_module`, which compares the
+constants without needing a compiler.
+
+### Reconnection, tested as reconnection
+
+```
+test a_miner_reconnects_after_the_connection_drops_and_resumes_mining ... ok
+test work_from_before_a_reconnect_cannot_be_submitted ... ok
+test the_pool_reconnects_to_the_node_and_resumes_serving ... ok
+```
+
+Not a retry counter. The first closes the socket for real — the pool logs
+`worker session ended` — and then asserts a **new channel id**, a bumped
+generation, a fresh job, and a share accepted on it. The third **stops the
+node and starts it again** on the same datadir, and asserts the pool
+re-established its session and that work resumed all the way back to the node:
+a share on the resumed job is accepted, which can only happen if the pool got a
+new template and built a coinbase the node accepts.
 
 ### The milestone
 
@@ -329,18 +528,20 @@ negotiated, which the test asserts. Nothing about that is mocked: a real
 `aviand` issued the templates, the pool built the coinbases, the worker found
 the nonces by hashing, and the node validated the blocks.
 
-### The test worker
+### The miner side of the tests
 
-`crates/avian-mining/tests/common/worker.rs`, a subdirectory so cargo does not
-build it as a product. It opens a channel, receives jobs, searches nonces and
-submits shares, and it is a second reader of the pool's wire format, which is
-the only way to find out whether the pool's ordering and flags are what it
-believes they are.
+There is no test worker any more. It was the prototype of the Mining Protocol
+client and has been **promoted into the library**, so these tests drive the
+product rather than a parallel implementation of it. That is the failure mode a
+refactor like this has: quietly stopping exercising what it moved.
 
-It records every message **in the order it arrived**, because the properties
-worth asserting here are orderings. Asserting that `ntime_min` equals the
-activating `ntime_start` passes whatever order the two messages arrived in; the
-rule doc/sv2.md states is about order:
+The client records every protocol message **in the order it arrived**, exposed
+as `MiningClient::trace()`. That is a diagnostic any protocol library should
+have — most of what doc/sv2.md requires of a pool is ordering, and a miner
+debugging a pool needs to see it — and it is also what these tests assert
+against. Asserting that `ntime_min` equals the activating
+`ntime_start` passes whatever order the two messages arrived in; the rule
+doc/sv2.md states is about order:
 
 ```
 test constraints_precede_the_set_new_prev_hash_that_activates_a_job ... ok
@@ -351,14 +552,22 @@ test the_activation_ntime_equals_the_jobs_ntime_min ... ok
 And the flags, which are silent when wrong:
 
 ```
-test a_version_rolling_request_is_refused_rather_than_answered ... ok
 test setup_success_always_sets_fixed_version_and_never_extended_channels ... ok
-test a_worker_that_cannot_take_standard_jobs_is_refused ... ok
-test the_extension_is_required_of_a_worker_too ... ok
 test the_algorithm_reply_reports_a_zero_version_rolling_mask ... ok
 ```
 
-And the refusals, each of which a worker could otherwise mistake for silence:
+The cases that have to send something the library refuses to send — the wrong
+`SetupConnection` flags, a `RequestExtensions` without `0x4001` — go straight
+at the transport instead, because a product client should not offer a way to
+misbehave:
+
+```
+test a_version_rolling_request_is_refused_rather_than_answered ... ok
+test a_miner_that_cannot_take_standard_jobs_is_refused ... ok
+test the_extension_is_required_of_a_miner_too ... ok
+```
+
+And the refusals, each of which a miner could otherwise mistake for silence:
 
 ```
 test a_rolled_version_or_an_out_of_window_ntime_is_refused ... ok
@@ -385,7 +594,8 @@ Findings 1 through 6 are from implementing the **downstream** side, the pool as
 a client of the node. Findings 7 through 11 are from implementing the
 **upstream** side, the pool as a server to workers, which the document
 specifies but nothing in Avian Core implements, so this is the first time
-anything has been built against that half.
+anything has been built against that half. Finding 12 is from writing the
+miner's side, which is the first thing to have worn that shoe.
 
 **All eleven are now resolved**, nine by a change to `doc/sv2.md` or the node,
 one withdrawn as wrong, and one, the Noise handshake, by a fix to Avian Core
@@ -572,21 +782,71 @@ the other order**, so I cannot say whether it is refused or merely
 ill-advised; either way an implementer has to guess, and one sentence would
 remove the guess.
 
+### From writing the miner's side
+
+**12. Nothing warns that a `job_id` is only unique within a connection.** The
+extension specifies the Mining Protocol half carefully, down to the ordering of
+`AvianJobTimeConstraints` against `SetNewPrevHash`, but neither it nor the
+Stratum v2 specification says anything about identifier reuse across a
+reconnect. Both `channel_id` and `job_id` come from a pool's own counters, and
+a pool that restarts them — as this one does, and as a reasonable
+implementation would — lets a miner holding a nonce for job 1 submit it after
+a reconnect against a *different* job 1.
+
+This is not hypothetical: it is a bug this project shipped and a test caught,
+and the pool accepted the share, because it was a structurally valid submission
+for the job that now held that id. It happened to be a block. The fix is on the
+miner's side (`submit` takes the whole job, not its id, and refuses one from an
+earlier generation), but a miner author has no way to know the hazard exists
+from reading the document.
+
+One sentence in the extension would do it: that a share is only valid on the
+connection whose channel issued the job, and that a miner must discard work in
+flight when a connection drops. It is the same class of silent failure the
+extension was created for — a miner hits none of these as an error, it just
+earns nothing or earns someone else's share — which is the argument for it
+being in scope rather than left to the Stratum v2 specification.
+
 ## Design
 
 ```
-avian-pow              Avian's X16RT and MinotaurX, by FFI
-avian-tdp::transport   SRI's Noise and framing, both roles, over a socket
-avian-tdp::avian       extension 0x4001 and negotiation extension 0x0001
-avian-tdp::tdp         the stock Template Distribution messages, owned
-avian-tdp::block       coinbase, merkle folding, header, target comparison
-avian-tdp::session     one upstream connection, one algorithm
-avian-mining::share    the validation ladder, behind a PowHasher trait
-avian-mining::job      a job and its ntime window
-avian-mining::channel  one standard channel: push work, answer submissions
-avian-mining::server   the listener and each worker's session
-avian-mining::pool     the wiring, so the binary and the tests share one
+libavian-sv2, the lift-out unit:
+  avian_sv2::transport   SRI's Noise and framing, both roles, over a socket
+  avian_sv2::avian       extension 0x4001 and negotiation extension 0x0001
+  avian_sv2::block       header, SHA256d, target arithmetic
+  avian_sv2::wire        the field codecs SRI does not provide
+  avian_sv2::authority   the key a certificate is checked against
+  avian_sv2::reconnect   backoff, and what does not survive a reconnect
+  avian_sv2::client      the Mining Protocol client: what a miner needs
+  avian_sv2::capi        the same client over extern "C"
+
+the pool, consuming it as an ordinary Rust crate:
+  avian_tdp::tdp         the stock Template Distribution messages, owned
+  avian_tdp::coinbase    the coinbase and merkle root a pool must build
+  avian_tdp::session     one upstream connection, with reconnection
+  avian_mining::share    the validation ladder, behind a PowHasher trait
+  avian_mining::job      a job and its ntime window
+  avian_mining::channel  one standard channel: push work, answer submissions
+  avian_mining::server   the listener and each worker's session
+  avian_mining::pool     the wiring, so the binary and the tests share one
+
+avian-pow                Avian's X16RT and MinotaurX, by FFI. Pool only.
 ```
+
+### Where the line is drawn, and why it will feel wrong
+
+`avian-pow` is in this workspace and the library will look incomplete without
+it. It stays out. A miner already has hashing, heavily optimised, and that is
+the entire reason it is a miner; the library's job is to hand it a job and take
+back a share. The split is also what keeps the library's build free of a C++
+toolchain and of any Avian source tree at all.
+
+The pool links `avian-pow` because a pool is not a miner: it has to check a
+share and has no optimised hasher of its own. The C test program links it for
+the same reason a real miner links its own code.
+
+The Template Distribution Protocol is out of the library too, and for a
+sharper reason: no miner ever speaks it.
 
 ### The seam between the two halves
 
@@ -631,14 +891,49 @@ contiguous on the wire: a `SubmitShares.Success` cannot land between a
   there is no partial check that can stand in for the hash, which doc/sv2.md
   gives as the reason the node needs a rate limit; the same applies to a pool.
   Two tests prove the ordering by using a hasher that fails.
+- **`poll` uses a peek, not a read timeout.** SRI's decoder counts the bytes of
+  `writable()` as present before they are read, so a `read_exact` that times
+  out part way leaves it decrypting whatever the buffer held, with no way back.
+  `ConnectionReader::wait_readable` peeks one byte instead, which touches no
+  decoder state, so a caller can ask "is there anything?" as often as it likes
+  and only then commit to a blocking read. A peer that sends one byte and stops
+  still blocks that one connection for its own timeout, which is what the
+  timeout is for.
 
 ## What is not here
 
-- No miner. The test worker is test support and says so.
-- No payouts, no share accounting beyond what validation needs, no vardiff
-  beyond a fixed `SetTarget`, no extended channels, no job declaration, no
-  Stratum v1.
-- No reconnection. A session that fails reports and stops.
-- No rate limiting on submissions. The node has one and the pool relies on
-  being loopback; a pool facing untrusted workers would need its own.
-- Anything non-loopback.
+- **No miner.** `ctest/session.c` is a test program and says so; it exists to
+  prove the C boundary, not to mine anything.
+- **No hashing in the library.** Deliberately, and at length above.
+- No payouts, and no share accounting beyond what validation needs.
+- No extended channels, no job declaration, no Stratum v1.
+- Anything non-loopback. Both the connection to the node and both listeners
+  refuse it.
+
+### Two things that must exist before this faces anything untrusted
+
+**Share rate limiting is a hard prerequisite**, including for a public
+testnet, and it is not here. The reason is the one doc/sv2.md gives for the
+node: Avian has no cheap pre-filter, so SHA256d's trick of checking a few
+leading bytes before committing to real work does not exist. Every submission
+costs a **whole** X16RT or MinotaurX hash. A worker that submits garbage as
+fast as it can write it is a denial of service against the pool's CPU, and
+nothing in the validation ladder can make the final hash cheaper. The node has
+`-sv2maxrejects` and a submission rate limit for exactly this; the pool has
+neither, and relies entirely on being loopback.
+
+**Vardiff** is also absent. It is left out with rate limiting rather than
+separately because the two are entangled: the honest answer to a worker
+flooding cheap shares is usually to raise its target, which is vardiff, and
+building either alone invites getting the other wrong. The share target here is
+fixed, the network target made `--share-target-shift` halvings harder.
+
+Deferred deliberately, both of them, and neither is a small job.
+
+### Smaller gaps
+
+- A channel is only unregistered when its reader loop ends, so a job pushed to
+  a socket that has just gone away logs a broken pipe first. It self-heals on
+  the next read; the log line is noise rather than a leak.
+- Backoff has no jitter. Fine for one miner on loopback, wrong for a pool with
+  many miners reconnecting together.

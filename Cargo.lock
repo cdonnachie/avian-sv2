@@ -43,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "avian-pow",
  "avian-regtest",
+ "avian-sv2",
  "avian-tdp",
  "binary_sv2",
  "common_messages_sv2",
@@ -61,7 +62,21 @@ dependencies = [
 name = "avian-regtest"
 version = "0.1.0"
 dependencies = [
+ "avian-sv2",
  "avian-tdp",
+ "secp256k1",
+]
+
+[[package]]
+name = "avian-sv2"
+version = "0.1.0"
+dependencies = [
+ "binary_sv2",
+ "codec_sv2",
+ "common_messages_sv2",
+ "framing_sv2",
+ "mining_sv2",
+ "noise_sv2",
  "secp256k1",
 ]
 
@@ -72,6 +87,7 @@ dependencies = [
  "avian-mining",
  "avian-pow",
  "avian-regtest",
+ "avian-sv2",
  "avian-tdp",
  "secp256k1",
 ]
@@ -80,10 +96,10 @@ dependencies = [
 name = "avian-tdp"
 version = "0.1.0"
 dependencies = [
+ "avian-sv2",
  "binary_sv2",
  "codec_sv2",
  "common_messages_sv2",
- "framing_sv2",
  "noise_sv2",
  "secp256k1",
  "template_distribution_sv2",

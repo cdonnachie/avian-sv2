@@ -1,0 +1,23 @@
+[package]
+name = "avian-sv2"
+description = "Avian Stratum v2: protocol core and Mining Protocol client, with a C API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "avian_sv2"
+# `lib` for the pool, which consumes this as an ordinary Rust crate, and
+# `staticlib` for cpuminer-opt and ccminer, which link libavian_sv2.a and
+# include avian_sv2.h.
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+codec_sv2.workspace = true
+noise_sv2.workspace = true
+framing_sv2.workspace = true
+binary_sv2.workspace = true
+common_messages_sv2.workspace = true
+mining_sv2.workspace = true
+secp256k1.workspace = true

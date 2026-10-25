@@ -7,5 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+avian-sv2 = { path = "../avian-sv2" }
 avian-tdp = { path = "../avian-tdp" }
 secp256k1.workspace = true

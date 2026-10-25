@@ -35,7 +35,9 @@ pub fn binaries() -> Option<(PathBuf, PathBuf)> {
 pub struct Node {
     process: Child,
     datadir: PathBuf,
+    aviand: PathBuf,
     cli: PathBuf,
+    args: Vec<String>,
     sv2_port: u16,
     rpc_port: u16,
 }
@@ -86,7 +88,9 @@ impl Node {
         let mut node = Node {
             process,
             datadir,
+            aviand,
             cli,
+            args,
             sv2_port,
             rpc_port,
         };
@@ -136,7 +140,12 @@ impl Node {
     /// nothing says so.
     pub fn mine(&self, blocks: u32) -> String {
         if self.rpc(&["getwalletinfo"]).is_err() {
-            self.rpc(&["createwallet", "it"]).expect("createwallet");
+            // A restarted node does not load its wallet on its own, and
+            // creating one that already exists is an error, so try in that
+            // order.
+            if self.rpc(&["loadwallet", "it"]).is_err() {
+                self.rpc(&["createwallet", "it"]).expect("createwallet");
+            }
         }
         let address = self.rpc(&["getnewaddress"]).expect("getnewaddress");
         self.rpc(&["generatetoaddress", &blocks.to_string(), &address])
@@ -166,11 +175,11 @@ impl Node {
     }
 
     pub fn authority(&self) -> XOnlyPublicKey {
-        let path = avian_tdp::authority::default_key_path(
+        let path = avian_sv2::authority::default_key_path(
             &self.datadir,
             avian_tdp::chain_subdir("regtest"),
         );
-        avian_tdp::authority::from_private_key_file(&path).expect("authority key")
+        avian_sv2::authority::from_private_key_file(&path).expect("authority key")
     }
 
     pub fn sv2_addr(&self) -> SocketAddr {
@@ -190,6 +199,35 @@ impl Node {
             .filter(|line| line.contains("[sv2]"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Stops the node but keeps its datadir, so it can be started again with
+    /// the same authority key and the same chain.
+    pub fn stop(&mut self) {
+        let _ = self.rpc(&["stop"]);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.process.try_wait() {
+                Ok(Some(_)) => return,
+                _ if Instant::now() > deadline => {
+                    let _ = self.process.kill();
+                    let _ = self.process.wait();
+                    return;
+                }
+                _ => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    }
+
+    /// Starts the node again on the same datadir and ports.
+    pub fn start_again(&mut self) {
+        self.process = Command::new(&self.aviand)
+            .args(&self.args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cannot restart aviand");
+        self.wait_for_rpc();
     }
 }
 

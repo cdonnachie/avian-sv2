@@ -221,3 +221,55 @@ mod tests {
         assert_ne!(x16rt_seed(base), x16rt_seed(base + 128));
     }
 }
+
+/// The C API, for a miner that links this alongside `libavian-sv2`.
+///
+/// This is a separate library on purpose. `libavian-sv2` contains no hashing,
+/// because a miner has its own and that is the entire reason it is a miner.
+/// What this crate is for is the two consumers that are not miners: the pool,
+/// which has to check a share, and a C test program standing in for a miner's
+/// optimised hasher.
+pub mod capi {
+    use std::ffi::c_int;
+
+    pub const AVIAN_POW_OK: c_int = 0;
+    pub const AVIAN_POW_INVALID_ARGUMENT: c_int = -2;
+    pub const AVIAN_POW_UNAVAILABLE: c_int = -3;
+
+    /// Hashes a header under `pow_type` (0 = X16RT, 1 = MinotaurX) and writes
+    /// 32 bytes to `out32`, in `uint256`'s internal little-endian order.
+    ///
+    /// # Safety
+    /// `header` must point to `header_len` readable bytes and `out32` to 32
+    /// writable ones.
+    #[no_mangle]
+    pub unsafe extern "C" fn avian_pow_hash(
+        pow_type: c_int,
+        header: *const u8,
+        header_len: usize,
+        out32: *mut u8,
+    ) -> c_int {
+        if header.is_null() || out32.is_null() {
+            return AVIAN_POW_INVALID_ARGUMENT;
+        }
+        let pow = match pow_type {
+            0 => super::PowType::X16rt,
+            1 => super::PowType::MinotaurX,
+            _ => return AVIAN_POW_INVALID_ARGUMENT,
+        };
+        let header = std::slice::from_raw_parts(header, header_len);
+        match super::hash(pow, header) {
+            Some(hash) => {
+                std::ptr::copy_nonoverlapping(hash.as_ptr(), out32, 32);
+                AVIAN_POW_OK
+            }
+            None => AVIAN_POW_UNAVAILABLE,
+        }
+    }
+
+    /// Whether the hashers were compiled in. 1 or 0.
+    #[no_mangle]
+    pub extern "C" fn avian_pow_available() -> c_int {
+        super::AVAILABLE as c_int
+    }
+}

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/avian-pow",
+    "crates/avian-sv2",
     "crates/avian-regtest",
     "crates/avian-tdp",
     "crates/avian-mining",

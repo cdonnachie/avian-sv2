@@ -49,7 +49,7 @@ fn both_algorithms_receive_templates_from_a_live_node() {
         );
         let prev = work.prev_hash.as_ref().expect("SetNewPrevHash");
         assert_eq!(
-            avian_tdp::wire::hex_rev(&prev.prev_hash),
+            avian_sv2::wire::hex_rev(&prev.prev_hash),
             tip,
             "the template must be built on the current tip"
         );
@@ -100,7 +100,7 @@ fn a_tip_change_pushes_fresh_work() {
         assert!(Instant::now() < deadline, "no round carried the new tip");
         let work = session.next_work().expect("round");
         let prev = work.prev_hash.as_ref().expect("SetNewPrevHash");
-        if avian_tdp::wire::hex_rev(&prev.prev_hash) == tip {
+        if avian_sv2::wire::hex_rev(&prev.prev_hash) == tip {
             assert!(work.tip_changed);
             assert_ne!(work.template.template_id, first.template.template_id);
             break;

@@ -9,9 +9,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use avian_tdp::avian::PowType;
-use avian_tdp::error::{Error, Result};
-use avian_tdp::{SessionConfig, TdpSession, Work};
+use avian_sv2::avian::PowType;
+use avian_sv2::error::{Error, Result};
+use avian_sv2::Backoff;
+use avian_tdp::session::Round;
+use avian_tdp::{ReconnectingSession, SessionConfig, Work};
 use secp256k1::XOnlyPublicKey;
 
 use crate::server::{AlgoContext, Server, ServerConfig, ServerHandle};
@@ -31,6 +33,8 @@ pub struct PoolConfig {
     pub coinbase_sigops: u16,
     /// How long the work threads run. `None` runs until the handle is dropped.
     pub duration: Option<Duration>,
+    /// Backoff for re-establishing a dropped session to the node.
+    pub upstream_backoff: Backoff,
 }
 
 pub struct PoolHandle {
@@ -75,7 +79,9 @@ pub fn spawn(
         session_config.coinbase_output_max_additional_size = config.coinbase_size;
         session_config.coinbase_output_max_additional_sigops = config.coinbase_sigops;
 
-        let session = TdpSession::open(&session_config)?;
+        let session = ReconnectingSession::open(session_config, config.upstream_backoff)?;
+        // The submitter outlives any one connection: it resolves through the
+        // session's slot, which is re-pointed on reconnect.
         let algo = Arc::new(AlgoContext::new(*pow, session.submitter()));
         algos.push(algo.clone());
         sessions.push((session, algo));
@@ -84,7 +90,14 @@ pub fn spawn(
     let server = Arc::new(Server::new(config.server, algos.clone(), hasher));
 
     for (session, algo) in &mut sessions {
-        let work = session.next_work()?;
+        let work = match session.next_work()? {
+            Round::Work { work, .. } => work,
+            Round::Reconnected { .. } => {
+                return Err(Error::Protocol(
+                    "the node's session dropped before it issued a template".into(),
+                ))
+            }
+        };
         if let Some(observer) = &observer {
             observer(algo.pow, &work);
         }
@@ -99,33 +112,9 @@ pub fn spawn(
     let deadline = config.duration.map(|d| Instant::now() + d);
     let threads = sessions
         .into_iter()
-        .map(|(mut session, algo)| {
+        .map(|(session, algo)| {
             let observer = observer.clone();
-            std::thread::spawn(move || loop {
-                if let Some(deadline) = deadline {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() || session.set_read_timeout(Some(left)).is_err() {
-                        return;
-                    }
-                }
-                let work = match session.next_work() {
-                    Ok(work) => work,
-                    Err(e) => {
-                        // Past the deadline any failure is the deadline, since
-                        // the read timeout is what fired.
-                        if !deadline.is_some_and(|d| Instant::now() >= d) {
-                            eprintln!("[pool] {}: {e}", algo.pow);
-                        }
-                        return;
-                    }
-                };
-                if let Some(observer) = &observer {
-                    observer(algo.pow, &work);
-                }
-                for (id, e) in algo.publish(work) {
-                    eprintln!("[pool] {} channel {id}: {e}", algo.pow);
-                }
-            })
+            std::thread::spawn(move || pump(session, algo, observer, deadline))
         })
         .collect();
 
@@ -135,4 +124,54 @@ pub fn spawn(
         _server: handle,
         threads,
     })
+}
+
+fn pump(
+    mut session: ReconnectingSession,
+    algo: Arc<AlgoContext>,
+    observer: Option<WorkObserver>,
+    deadline: Option<Instant>,
+) {
+    loop {
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || session.set_read_timeout(Some(left)).is_err() {
+                return;
+            }
+        }
+        match session.next_work() {
+            Ok(Round::Work { work, .. }) => {
+                if let Some(observer) = &observer {
+                    observer(algo.pow, &work);
+                }
+                for (id, e) in algo.publish(work) {
+                    eprintln!("[pool] {} channel {id}: {e}", algo.pow);
+                }
+            }
+            Ok(Round::Reconnected {
+                generation,
+                attempts,
+            }) => {
+                // A new session means new template ids, so every template the
+                // pool held is unsubmittable and every job built from one has
+                // to be withdrawn. The next round pushes fresh jobs, and each
+                // channel's first one will be a future job again.
+                let withdrawn = algo.withdraw();
+                eprintln!(
+                    "[pool] {}: reconnected to the node after {attempts} attempt(s), session \
+                     {generation}; withdrew the jobs on {withdrawn} channel(s) because template \
+                     ids do not survive a reconnect",
+                    algo.pow
+                );
+            }
+            Err(e) => {
+                // Past the deadline any failure is the deadline, since the
+                // read timeout is what fired.
+                if !deadline.is_some_and(|d| Instant::now() >= d) {
+                    eprintln!("[pool] {}: {e}", algo.pow);
+                }
+                return;
+            }
+        }
+    }
 }

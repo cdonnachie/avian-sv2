@@ -10,10 +10,10 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use avian_tdp::avian::{self, PowType, EXT_AVIAN, MSG_JOB_TIME_CONSTRAINTS};
-use avian_tdp::error::{Error, Result};
+use avian_sv2::avian::{self, PowType, EXT_AVIAN, MSG_JOB_TIME_CONSTRAINTS};
+use avian_sv2::error::{Error, Result};
+use avian_sv2::transport::ConnectionWriter;
 use avian_tdp::tdp::PrevHash;
-use avian_tdp::transport::ConnectionWriter;
 use avian_tdp::Work;
 use binary_sv2::{Sv2Option, U256};
 use mining_sv2::{
@@ -321,6 +321,16 @@ impl Channel {
                 error_code: code.as_bytes().try_into()?,
             },
         )
+    }
+
+    /// Drops every job, so nothing from a previous upstream session can be
+    /// submitted against, and resets the channel to needing a future job.
+    pub fn withdraw(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.jobs.clear();
+            state.seen.clear();
+            state.activated = false;
+        }
     }
 
     pub fn job_count(&self) -> usize {

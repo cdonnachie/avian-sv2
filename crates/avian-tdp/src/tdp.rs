@@ -18,9 +18,9 @@ pub use template_distribution_sv2::{
     MESSAGE_TYPE_SUBMIT_SOLUTION,
 };
 
-use crate::avian::{pow_type_from_version, PowType};
-use crate::error::{Error, Result};
-use crate::wire::{hex, hex_rev, Reader};
+use avian_sv2::avian::{pow_type_from_version, PowType};
+use avian_sv2::error::{Error, Result};
+use avian_sv2::wire::{hex, hex_rev, Reader};
 
 #[derive(Debug, Clone)]
 pub struct Template {

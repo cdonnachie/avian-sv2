@@ -20,13 +20,14 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use avian_tdp::avian::{
+use avian_sv2::avian::{
     self, EXT_AVIAN, EXT_CORE, EXT_NEGOTIATION, MSG_JOB_TIME_CONSTRAINTS, MSG_REQUEST_EXTENSIONS,
     MSG_REQUEST_EXTENSIONS_SUCCESS, MSG_SELECT_ALGORITHM, MSG_SELECT_ALGORITHM_ERROR,
     MSG_SELECT_ALGORITHM_SUCCESS, MSG_TIME_CONSTRAINTS,
 };
-use avian_tdp::transport::{Connection, CHANNEL_MSG_BIT};
-use avian_tdp::{authority, chain_subdir, PowType};
+use avian_sv2::transport::{Connection, CHANNEL_MSG_BIT};
+use avian_sv2::PowType;
+use avian_tdp::{authority, chain_subdir};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -95,7 +96,7 @@ fn part_a() {
         ),
     ] {
         let mut bytes =
-            avian_tdp::transport::encode_header(extension_type, msg_type, payload.len())
+            avian_sv2::transport::encode_header(extension_type, msg_type, payload.len())
                 .unwrap()
                 .to_vec();
         bytes.extend_from_slice(&payload);
@@ -195,7 +196,7 @@ fn part_b(addr: SocketAddr) {
 }
 
 /// C: real 0x4001 traffic.
-fn part_c(datadir: &Path, addr: SocketAddr) -> avian_tdp::Result<()> {
+fn part_c(datadir: &Path, addr: SocketAddr) -> avian_sv2::Result<()> {
     println!("C. 0x4001 traffic over a verified connection");
     let key_path = authority::default_key_path(datadir, chain_subdir("regtest"));
     let pubkey = authority::from_private_key_file(&key_path)?;
@@ -290,7 +291,7 @@ fn part_c(datadir: &Path, addr: SocketAddr) -> avian_tdp::Result<()> {
     Ok(())
 }
 
-fn setup_connection(conn: &mut Connection) -> avian_tdp::Result<()> {
+fn setup_connection(conn: &mut Connection) -> avian_sv2::Result<()> {
     let host = b"127.0.0.1";
     let vendor = b"avian-sv2-spike";
     let empty: &[u8] = b"";

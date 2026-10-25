@@ -7,5 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 links = "avian_algo"
 
+[lib]
+name = "avian_pow"
+# `staticlib` so a C program, standing in for a miner's own hasher, can link
+# the algorithms without a Rust toolchain of its own at call time.
+crate-type = ["lib", "staticlib"]
+
 [build-dependencies]
 cc.workspace = true

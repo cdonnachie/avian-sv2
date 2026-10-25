@@ -1,16 +1,20 @@
 [package]
 name = "avian-tdp"
-description = "Stratum v2 Template Distribution client for Avian, with the 0x4001 extension"
+description = "Template Distribution client for the Avian pool, over libavian-sv2"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-codec_sv2.workspace = true
-noise_sv2.workspace = true
-framing_sv2.workspace = true
+avian-sv2 = { path = "../avian-sv2" }
 binary_sv2.workspace = true
 common_messages_sv2.workspace = true
 template_distribution_sv2.workspace = true
 secp256k1.workspace = true
+
+[dev-dependencies]
+# The spike's whole point is to exercise SRI's own codec and handshake
+# directly, so it needs them even though the library wraps them.
+codec_sv2.workspace = true
+noise_sv2.workspace = true

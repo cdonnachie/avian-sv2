@@ -18,9 +18,9 @@ use std::time::Duration;
 
 use avian_mining::server::{AlgoContext, Server, ServerConfig};
 use avian_mining::share::{AvianHasher, PowHasher};
-use avian_tdp::avian::TimeConstraints;
+use avian_sv2::avian::TimeConstraints;
+use avian_sv2::wire::{hex, hex_rev};
 use avian_tdp::tdp::PrevHash;
-use avian_tdp::wire::{hex, hex_rev};
 use avian_tdp::{authority, chain_subdir, default_port, PowType, SessionConfig, TdpSession, Work};
 use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 
@@ -125,7 +125,7 @@ fn run(options: Options) -> Result<(), String> {
         ServerConfig {
             bind: options.mining_bind,
             authority,
-            cert_validity: avian_tdp::transport::DEFAULT_CERT_VALIDITY_SECS,
+            cert_validity: avian_sv2::transport::DEFAULT_CERT_VALIDITY_SECS,
             payout_script: options.payout_script.clone(),
             share_target_shift: options.share_target_shift,
         },

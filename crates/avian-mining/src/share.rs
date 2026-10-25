@@ -7,8 +7,8 @@
 //! so the metadata checks can be tested without the algorithms, and so a
 //! build without them fails loudly instead of accepting everything.
 
-use avian_tdp::avian::PowType;
-use avian_tdp::block;
+use avian_sv2::avian::PowType;
+use avian_sv2::block;
 
 use crate::job::Job;
 

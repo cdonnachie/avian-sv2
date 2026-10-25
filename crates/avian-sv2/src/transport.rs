@@ -183,6 +183,41 @@ impl ConnectionReader {
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         Ok(self.stream.set_read_timeout(timeout)?)
     }
+
+    /// Waits up to `timeout` for a byte to be available, without consuming it.
+    ///
+    /// This exists because a read timeout cannot be used to poll. SRI's
+    /// decoder counts the bytes of `writable()` as present before they are
+    /// read, so a `read_exact` that times out part way leaves it decrypting
+    /// whatever the buffer held, and there is no way back from that. Peeking
+    /// touches no decoder state, so a caller can ask "is there anything?" as
+    /// often as it likes and only then commit to a blocking read.
+    ///
+    /// A peer that sends one byte and stops still blocks the following read
+    /// for the connection's own timeout. That is a slowloris against this one
+    /// connection and nothing else, and it is why the timeout exists.
+    pub fn wait_readable(&self, timeout: Duration) -> Result<bool> {
+        let previous = self.stream.read_timeout()?;
+        self.stream.set_read_timeout(Some(timeout))?;
+        let mut byte = [0u8; 1];
+        let ready = match self.stream.peek(&mut byte) {
+            Ok(0) => Err(Error::Protocol(
+                "the peer closed the Stratum v2 connection".into(),
+            )),
+            Ok(_) => Ok(true),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(Error::Io(e)),
+        };
+        self.stream.set_read_timeout(previous)?;
+        ready
+    }
 }
 
 pub struct Connection {
