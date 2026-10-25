@@ -580,7 +580,10 @@ pub unsafe extern "C" fn avian_sv2_client_job_header(
 /// This is what extended channels are for: a miner can read the outputs it is
 /// committing to instead of taking the pool's word for a merkle root. Writes
 /// at most `capacity` bytes and sets `*written` to the full length, so a
-/// caller can size a buffer by calling once with `capacity` 0.
+/// caller can size a buffer by calling once with `capacity` 0. That sizing
+/// call returns `AVIAN_SV2_OK`, so the two-call pattern works for a caller
+/// that checks the status. A non-zero `capacity` smaller than the coinbase is
+/// a caller error and returns `AVIAN_SV2_INVALID_ARGUMENT`.
 ///
 /// # Safety
 /// `client` must be a live handle, `written` must be writable, and `out` must
@@ -621,12 +624,18 @@ pub unsafe extern "C" fn avian_sv2_client_job_coinbase(
         return AVIAN_SV2_INVALID_ARGUMENT;
     };
     *written = coinbase.len();
-    if capacity >= coinbase.len() {
-        std::ptr::copy_nonoverlapping(coinbase.as_ptr(), out, coinbase.len());
-        AVIAN_SV2_OK
-    } else {
-        AVIAN_SV2_INVALID_ARGUMENT
+    if capacity == 0 {
+        // A sizing call, and it has to succeed: this is the documented way to
+        // learn the length, so a caller that checks the status, which every
+        // caller should, would otherwise have to learn to ignore it here.
+        return AVIAN_SV2_OK;
     }
+    if capacity < coinbase.len() {
+        handle.set_error("the buffer is too small for this job's coinbase");
+        return AVIAN_SV2_INVALID_ARGUMENT;
+    }
+    std::ptr::copy_nonoverlapping(coinbase.as_ptr(), out, coinbase.len());
+    AVIAN_SV2_OK
 }
 
 /// Closes the connection, so the next poll reconnects. For failover, and for

@@ -5,7 +5,7 @@
 //! export the same symbol names, so a single binary containing both resolves
 //! one side's call into the other and agreement proves nothing.
 
-use avian_pow::{hash, PowType, AVAILABLE};
+use avian_pow::{hash, x16rt_seed, PowType, AVAILABLE};
 
 fn main() {
     if !AVAILABLE {
@@ -13,6 +13,29 @@ fn main() {
         std::process::exit(2);
     }
     let mut args = std::env::args().skip(1).peekable();
+    // `seeds <ntime>...` prints SHA256d(ntime & 0xffffff80), the X16RT hash
+    // chain's seed. A comparison that swept ntime without crossing an epoch
+    // boundary would exercise one chain and look exactly like a thorough
+    // check, so a caller can count the distinct seeds it actually covered.
+    if args.peek().map(String::as_str) == Some("seeds") {
+        args.next();
+        for arg in args {
+            let Ok(ntime) = arg.parse::<u32>() else {
+                eprintln!("not a u32 ntime: {arg}");
+                std::process::exit(2);
+            };
+            let Some(seed) = x16rt_seed(ntime) else {
+                eprintln!("avian-pow could not derive the seed");
+                std::process::exit(2);
+            };
+            let mut out = String::with_capacity(64);
+            for byte in seed {
+                out.push_str(&format!("{byte:02x}"));
+            }
+            println!("{out}");
+        }
+        return;
+    }
     let pow = match args.peek().map(String::as_str) {
         Some("x16rt") => {
             args.next();

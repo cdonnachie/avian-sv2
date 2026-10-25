@@ -218,8 +218,32 @@ int main(int argc, char **argv) {
                     avian_sv2_client_free(client);
                     return 1;
                 }
-                avian_sv2_client_job_coinbase(client, job.job_id, extranonce,
-                                              job.extranonce_size, NULL, 0, &needed);
+                /* The sizing call's status is checked, not ignored. It is
+                 * the documented way to learn the length, so a caller
+                 * following the header must be able to trust it. */
+                if (avian_sv2_client_job_coinbase(client, job.job_id, extranonce,
+                                                  job.extranonce_size, NULL, 0,
+                                                  &needed)
+                    != AVIAN_SV2_OK) {
+                    fprintf(stderr, "sizing the coinbase failed: %s\n",
+                            avian_sv2_last_error(client));
+                    avian_sv2_client_free(client);
+                    return 1;
+                }
+                /* And a buffer one byte short is refused rather than
+                 * truncating, with something to print. */
+                size_t short_written = 0;
+                uint8_t one_byte = 0;
+                if (needed > 1
+                    && avian_sv2_client_job_coinbase(client, job.job_id, extranonce,
+                                                     job.extranonce_size, &one_byte,
+                                                     1, &short_written)
+                           == AVIAN_SV2_OK) {
+                    fprintf(stderr, "a 1-byte buffer was accepted for a %zu-byte coinbase\n",
+                            needed);
+                    avian_sv2_client_free(client);
+                    return 1;
+                }
                 uint8_t *coinbase = malloc(needed);
                 if (coinbase == NULL
                     || avian_sv2_client_job_coinbase(client, job.job_id, extranonce,

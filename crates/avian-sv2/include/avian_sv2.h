@@ -25,6 +25,7 @@
 #ifndef AVIAN_SV2_H
 #define AVIAN_SV2_H
 
+#include <stddef.h>  /* size_t, which several prototypes below use */
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -207,7 +208,20 @@ int32_t avian_sv2_client_job_header(AvianSv2Client *client, uint32_t job_id,
  * This is what extended channels are for: read the outputs instead of taking
  * the pool's word for a merkle root. Writes at most capacity bytes and sets
  * *written to the full length, so calling once with capacity 0 sizes a
- * buffer. */
+ * buffer.
+ *
+ * That sizing call returns AVIAN_SV2_OK, so the two-call pattern works for a
+ * caller that checks the status, which every caller should:
+ *
+ *     size_t needed = 0;
+ *     if (avian_sv2_client_job_coinbase(c, id, xn, xn_len, NULL, 0, &needed)
+ *         != AVIAN_SV2_OK) { ... }
+ *     uint8_t *buf = malloc(needed);
+ *     if (avian_sv2_client_job_coinbase(c, id, xn, xn_len, buf, needed,
+ *                                       &needed) != AVIAN_SV2_OK) { ... }
+ *
+ * A non-zero capacity smaller than the coinbase is a caller error: it returns
+ * AVIAN_SV2_INVALID_ARGUMENT with a message, and *written is still set. */
 int32_t avian_sv2_client_job_coinbase(AvianSv2Client *client, uint32_t job_id,
                                       const uint8_t *extranonce,
                                       size_t extranonce_len, uint8_t *out,
