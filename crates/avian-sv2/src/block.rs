@@ -106,6 +106,63 @@ pub fn harder_by(target: &[u8; 32], shift: u32) -> [u8; 32] {
     out
 }
 
+/// The target a compact `nBits` encodes, as a little-endian integer.
+///
+/// The sign bit is dropped rather than honoured, matching what consensus does
+/// with a negative compact target: nothing can meet it, and treating it as
+/// positive keeps this a pure decoder with no error case.
+pub fn target_from_nbits(nbits: u32) -> [u8; 32] {
+    let exponent = (nbits >> 24) as usize;
+    let mantissa = nbits & 0x007f_ffff;
+    let mut out = [0u8; 32];
+    if exponent <= 3 {
+        let shifted = mantissa >> (8 * (3 - exponent));
+        for i in 0..3 {
+            out[i] = ((shifted >> (8 * i)) & 0xff) as u8;
+        }
+    } else {
+        let offset = exponent - 3;
+        for i in 0..3 {
+            if offset + i < 32 {
+                out[offset + i] = ((mantissa >> (8 * i)) & 0xff) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// The target made easier by `shift` halvings of difficulty.
+///
+/// The counterpart to [`harder_by`], and the one a share target wants:
+/// halving the difficulty doubles the target, so this shifts the integer up
+/// rather than down. Saturates at the largest representable target instead of
+/// wrapping, because a wrapped share target would come out harder than the
+/// one asked for, which is the opposite of what the caller wanted and would
+/// be invisible.
+pub fn easier_by(target: &[u8; 32], shift: u32) -> [u8; 32] {
+    // Work most-significant first, which is index 31 downwards.
+    let mut big = [0u8; 32];
+    for i in 0..32 {
+        big[i] = target[31 - i];
+    }
+    for _ in 0..shift {
+        let mut carry = 0u8;
+        for byte in big.iter_mut().rev() {
+            let next = *byte >> 7;
+            *byte = (*byte << 1) | carry;
+            carry = next;
+        }
+        if carry != 0 {
+            return [0xff; 32];
+        }
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = big[31 - i];
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +234,64 @@ mod tests {
         assert!(meets_target(&once, &target), "harder is still under");
         assert!(!meets_target(&target, &once));
         assert_eq!(harder_by(&target, 0), target);
+    }
+
+    #[test]
+    fn nbits_decodes_to_a_little_endian_target() {
+        // Bitcoin's difficulty-1 target, which is quoted big-endian as
+        // 00000000ffff0000... So the mantissa sits at big-endian bytes four
+        // and five, which are indices 27 and 26 here.
+        let target = target_from_nbits(0x1d00_ffff);
+        assert_eq!(target[31], 0x00);
+        assert_eq!(target[28], 0x00);
+        assert_eq!(target[27], 0xff);
+        assert_eq!(target[26], 0xff);
+        assert_eq!(target[25], 0x00);
+
+        // Regtest's limit, which is as easy as a target gets.
+        let regtest = target_from_nbits(0x207f_ffff);
+        assert_eq!(regtest[31], 0x7f);
+        assert_eq!(regtest[30], 0xff);
+        assert_eq!(regtest[29], 0xff);
+        assert!(meets_target(&target, &regtest), "difficulty 1 is under regtest's limit");
+
+        // An exponent of three puts the mantissa in the lowest bytes with no
+        // shift at all.
+        let tiny = target_from_nbits(0x0300_00ff);
+        assert_eq!(tiny[0], 0xff);
+        assert!(tiny[1..].iter().all(|b| *b == 0));
+
+        // Below three the mantissa is shifted down, and far enough down it
+        // vanishes. Consensus does the same, and such a target is unmeetable
+        // rather than invalid.
+        assert_eq!(target_from_nbits(0x0100_00ff), [0u8; 32]);
+    }
+
+    #[test]
+    fn easier_by_is_the_other_direction() {
+        let mut target = [0u8; 32];
+        target[31] = 0x3f;
+        target[30] = 0xff;
+        let once = easier_by(&target, 1);
+        assert_eq!(once[31], 0x7f);
+        assert_eq!(once[30], 0xfe);
+        // Easier means a hash that misses the original can still meet this.
+        assert!(meets_target(&target, &once));
+        assert!(!meets_target(&once, &target));
+        assert_eq!(easier_by(&target, 0), target);
+        // And it undoes harder_by, which is what makes the shift a dial
+        // rather than two unrelated knobs.
+        assert_eq!(easier_by(&harder_by(&target, 5), 5), target);
+    }
+
+    #[test]
+    fn easier_by_saturates_rather_than_wrapping() {
+        let mut target = [0u8; 32];
+        target[31] = 0x80;
+        // One shift takes the top bit out of the integer. Wrapping would make
+        // the result harder than the input, so it clamps instead.
+        assert_eq!(easier_by(&target, 1), [0xff; 32]);
+        assert_eq!(easier_by(&[0xff; 32], 1), [0xff; 32]);
+        assert_eq!(easier_by(&target, 300), [0xff; 32]);
     }
 }

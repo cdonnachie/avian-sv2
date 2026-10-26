@@ -84,7 +84,11 @@ Downstream, to miners:
   --operator-fee <addr>  take a fee to this address; omit for none
   --operator-fee-bp <n>  the fee in hundredths of a percent (100 = 1%)
   --share-target-shift   halvings below the network target for the share
-                         target; 0 (default) makes them the same
+                         target, so N means roughly 2^N shares per block
+                         (default 4). 0 makes a share and a block the same
+                         thing, which gives a miner no feedback short of
+                         winning. Raise it on a harder chain: there is no
+                         vardiff, so this one number serves every miner
 
 Submission limits, per channel:
   --share-rate-tolerance <n>   multiple of the expected rate, default 8
@@ -300,7 +304,7 @@ fn parse_args() -> Result<Option<Options>, String> {
     let mut fee_address: Option<String> = None;
     let mut fee_basis_points = 0u32;
     let mut coinbase_tag = DEFAULT_TAG.to_string();
-    let mut share_target_shift = 0u32;
+    let mut share_target_shift = 4u32;
     let mut rate_limit = RateLimitConfig::default();
     let mut verbose = false;
     let mut duration = None;

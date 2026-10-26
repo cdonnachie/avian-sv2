@@ -21,6 +21,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use avian_sv2::avian::PowType;
+use avian_sv2::block;
 use avian_sv2::client::{Event, MiningClient, Trace};
 use avian_sv2::flags;
 use common::{
@@ -335,34 +336,59 @@ fn a_rolled_version_or_an_out_of_window_ntime_is_refused() {
 
 #[test]
 fn a_share_below_the_network_target_is_accepted_but_not_submitted() {
-    // Eight halvings harder than the network target, so most nonces miss it;
-    // what this checks is the refusal.
+    // The gap between the two targets is the whole point of a share target:
+    // it lets a miner see that it is working without pretending it won. With
+    // the shift at zero the two targets are the same and every accepted share
+    // is a block, which is what this used to be configured for.
+    //
+    // This test previously passed a shift of eight and expected refusals,
+    // because the share target was being computed harder than the network
+    // target rather than easier. It therefore asserted the inverted
+    // behaviour, and never checked the property its name describes.
     let rig = rig!("sharediff", 20, &[PowType::X16rt], 8);
     let mut miner = rig.miner(PowType::X16rt);
     let job = miner.active_job().expect("an active job").clone();
 
-    // Twelve, which is inside the default burst of sixteen: any more and the
-    // submission rate limiter would refuse them as too-many-shares before the
-    // target was ever compared, which is exactly what it is for and not what
-    // this test is about.
-    let mut refused = 0;
-    for nonce in 0..12u32 {
-        miner
-            .submit_exact(job.job_id, nonce, job.ntime_min, job.version)
-            .unwrap();
-        match poll_event(&mut miner, Duration::from_secs(10)) {
-            Some(Event::ShareRejected { code, .. }) => {
-                assert_eq!(code, "difficulty-too-low");
-                refused += 1;
-            }
-            Some(Event::ShareAccepted { .. }) => {}
-            other => panic!("unexpected {other:?}"),
+    // A miner is never sent the network target, so derive it from the nBits
+    // the job carries. Regtest's limit is near the top of the range, so the
+    // share target saturates and cannot be used to recover it.
+    let network_target = block::target_from_nbits(job.nbits);
+
+    // A nonce whose hash clears the share target but not the network target.
+    // That is the case with no other way to be observed: the pool accepts it
+    // and must not hand it to the node.
+    let mut found = None;
+    for nonce in 0..2000u32 {
+        let header = job.header(job.ntime_min, nonce);
+        let hash = avian_pow::hash(avian_pow::PowType::X16rt, &header).expect("a hash");
+        if block::meets_target(&hash, &job.share_target)
+            && !block::meets_target(&hash, &network_target)
+        {
+            found = Some(nonce);
+            break;
         }
     }
+    let nonce = found.expect("a share that is not also a block");
+
+    let before = rig.node.height();
+    miner
+        .submit_exact(job.job_id, nonce, job.ntime_min, job.version)
+        .unwrap();
+    match poll_event(&mut miner, Duration::from_secs(10)) {
+        Some(Event::ShareAccepted { .. }) => {}
+        other => panic!("a share over the share target should be accepted, got {other:?}"),
+    }
+
+    // Nothing was forwarded, so the tip is where it was. Polling again also
+    // proves no AvianBlockFound arrived, since a block would report one.
     assert!(
-        refused > 0,
-        "with the share target eight halvings harder than the network target, some nonces \
-         should have been refused as difficulty-too-low"
+        poll_event(&mut miner, Duration::from_millis(500)).is_none(),
+        "a share under the network target must not be reported as a block"
+    );
+    assert_eq!(
+        rig.node.height(),
+        before,
+        "a share under the network target must not reach the node"
     );
 }
 

@@ -551,10 +551,15 @@ impl Server {
             Error::Protocol("no template has arrived yet, so there is no target to set".into())
         })?;
 
-        // The share target is the network target made harder by a fixed
+        // The share target is the network target made easier by a fixed
         // number of halvings, then clamped to whatever the worker said it
         // could accept. There is no vardiff.
-        let mut share_target = block::harder_by(&prev.target, self.config.share_target_shift);
+        //
+        // Easier, not harder. This called harder_by, which divides the target
+        // and so made a share rarer than a block: with the shift at its old
+        // default of zero the two were identical and every accepted share was
+        // a block, and raising it to see more shares produced fewer.
+        let mut share_target = block::easier_by(&prev.target, self.config.share_target_shift);
         if !block::meets_target(&share_target, &worker_max_target) {
             share_target = worker_max_target;
         }
