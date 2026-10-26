@@ -1573,6 +1573,12 @@ AvianNetwork/ccminer-avian
 AvianNetwork/libavian-sv2
     shared client library, extracted from the pool
     and linked by both miners over a C API
+
+AvianNetwork/avian-sv2-deploy
+    compose stack, container images and the status
+    page. Spans all of the above and belongs in none
+    of them, and deliberately not in the consensus
+    repository
 ```
 
 This prevents the consensus repository from accumulating pool or miner-specific code.
