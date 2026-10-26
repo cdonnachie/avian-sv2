@@ -369,10 +369,13 @@ fn too_many_invalid_submissions_drops_the_channel() {
     let mut miner = connect_as(&rig, PowType::X16rt, WORKER_ADDRESS).expect("channel");
     let job = common::expect_job(&mut miner);
 
-    // Each of these is invalid for a different reason, and all of them are
-    // cheap to refuse.
+    // Genuinely bad work, against a job the pool does have. These used to be
+    // unknown job ids, which no longer count: an unknown job id means the pool
+    // and the miner disagree about state, which is nearly always the pool's
+    // end, so it prompts a reissue instead. A wrong version is the miner's
+    // fault, is cheap to refuse, and is what this limit is for.
     for i in 0..10u32 {
-        let _ = miner.submit_exact(job.job_id + 1000 + i, i, job.ntime_min, job.version);
+        let _ = miner.submit_exact(job.job_id, i, job.ntime_min, job.version ^ 0xff);
     }
 
     let mut refusals = 0;

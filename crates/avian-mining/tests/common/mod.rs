@@ -89,6 +89,9 @@ impl Rig {
                 node_authority: Some(node.authority()),
                 algorithms: algorithms.to_vec(),
                 server: ServerConfig {
+                    // The tests all bind loopback, so this never matters to
+                    // them; it is named so a new field cannot be forgotten.
+                    allow_public_bind: false,
                     // Port 0 lets the OS pick, so parallel tests cannot clash.
                     bind: "127.0.0.1:0".parse().unwrap(),
                     authority,

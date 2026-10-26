@@ -162,7 +162,7 @@ impl AvianSv2Event {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct AvianSv2ClientConfig {
-    /// `"host:port"`, NUL-terminated. Loopback only.
+    /// `"host:port"`, NUL-terminated. Loopback unless `allow_public_pool`.
     pub pool: *const c_char,
     /// The pool's authority public key as the operator published it: either
     /// the base58 form a Stratum v2 miner configuration takes, or 64 hex
@@ -187,6 +187,15 @@ pub struct AvianSv2ClientConfig {
     /// The least extranonce to ask for on an extended channel. 0 for the
     /// default of 8.
     pub min_extranonce_size: c_uint,
+    /// Non-zero to allow a pool that is not on this machine.
+    ///
+    /// Zero, the default a zeroed config gets, restricts this library to
+    /// loopback. That was the right default while every caller was a test on
+    /// one host, and it is the wrong one the moment a miner points at a real
+    /// pool, so it is a field rather than a rule. A miner dialling out is not
+    /// the same risk as a pool listening: nothing is exposed by connecting,
+    /// and the handshake authenticates the pool to the miner.
+    pub allow_public_pool: c_int,
 }
 
 /// The opaque handle. A `MiningClient` plus the last error, since a C caller
@@ -218,8 +227,8 @@ fn build_config(raw: &AvianSv2ClientConfig) -> Result<ClientConfig, &'static str
         .map_err(|_| "pool could not be resolved")?
         .next()
         .ok_or("pool resolved to nothing")?;
-    if !addr.ip().is_loopback() {
-        return Err("this library connects to loopback only");
+    if !addr.ip().is_loopback() && raw.allow_public_pool == 0 {
+        return Err("refusing a pool that is not loopback; set allow_public_pool to connect to it");
     }
     let pow = pow_from_c(raw.pow_type).ok_or("pow_type must be 0 (x16rt) or 1 (minotaurx)")?;
 
@@ -824,6 +833,7 @@ mod tests {
             max_reconnects: 1,
             extended: 0,
             min_extranonce_size: 0,
+            allow_public_pool: 0,
         };
         let mut status = AVIAN_SV2_OK;
         let handle = unsafe { avian_sv2_client_connect(&config, &mut status) };
@@ -831,6 +841,39 @@ mod tests {
         assert_eq!(status, AVIAN_SV2_INVALID_ARGUMENT);
         let reason = unsafe { CStr::from_ptr(avian_sv2_last_connect_error()) };
         assert!(reason.to_str().unwrap().contains("loopback"));
+    }
+
+    #[test]
+    fn allow_public_pool_gets_past_the_address_check() {
+        // A miner's whole job is to dial a pool elsewhere, so the opt-in has
+        // to actually opt in. 192.0.2.1 is TEST-NET-1 and routes nowhere, so
+        // this fails on the connection rather than on the argument, which is
+        // the distinction being asserted: a different failure, not the same
+        // one.
+        let pool = std::ffi::CString::new("192.0.2.1:34254").unwrap();
+        let config = AvianSv2ClientConfig {
+            pool: pool.as_ptr(),
+            authority_hex: std::ptr::null(),
+            pow_type: AVIAN_SV2_POW_X16RT,
+            user_identity: std::ptr::null(),
+            nominal_hash_rate: 1.0,
+            timeout_ms: 100,
+            backoff_initial_ms: 0,
+            backoff_max_ms: 0,
+            max_reconnects: 1,
+            extended: 0,
+            min_extranonce_size: 0,
+            allow_public_pool: 1,
+        };
+        let mut status = AVIAN_SV2_OK;
+        let handle = unsafe { avian_sv2_client_connect(&config, &mut status) };
+        assert!(handle.is_null(), "nothing is listening there");
+        let reason = unsafe { CStr::from_ptr(avian_sv2_last_connect_error()) };
+        let reason = reason.to_str().unwrap();
+        assert!(
+            !reason.contains("loopback"),
+            "the address check should have been skipped, got {reason:?}"
+        );
     }
 
     #[test]

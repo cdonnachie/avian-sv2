@@ -50,6 +50,9 @@ struct Options {
     duration: Option<Duration>,
     coinbase_size: u32,
     coinbase_sigops: u16,
+    /// Passed through to ServerConfig. Loopback-only is the library's default
+    /// and stays so; a container has to ask.
+    allow_public_bind: bool,
 }
 
 const DEFAULT_TAG: &str = "/avian-sv2/";
@@ -154,6 +157,7 @@ fn run(options: Options) -> Result<(), String> {
             algorithms: options.algorithms.clone(),
             server: ServerConfig {
                 bind: options.mining_bind,
+                allow_public_bind: options.allow_public_bind,
                 authority,
                 cert_validity: avian_sv2::transport::DEFAULT_CERT_VALIDITY_SECS,
                 network: options.network,
@@ -304,10 +308,23 @@ fn parse_args() -> Result<Option<Options>, String> {
     let mut coinbase_sigops = 10u16;
 
     let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
+    while let Some(whole) = args.next() {
+        // --option=value as well as --option value. Both forms are what anyone
+        // expects, and a compose file or a systemd unit nearly always writes
+        // the first. Rejecting it produced a usage dump and a restart loop,
+        // which is a poor way to learn about a spelling.
+        let (arg, inline) = match whole.split_once('=') {
+            Some((name, rest)) if name.starts_with("--") => {
+                (name.to_string(), Some(rest.to_string()))
+            }
+            _ => (whole, None),
+        };
         macro_rules! value {
             () => {
-                args.next().ok_or_else(|| format!("{arg} needs a value"))?
+                match inline.clone() {
+                    Some(value) => value,
+                    None => args.next().ok_or_else(|| format!("{arg} needs a value"))?,
+                }
             };
         }
         match arg.as_str() {
@@ -449,7 +466,9 @@ fn parse_args() -> Result<Option<Options>, String> {
         // necessary; on a host it means the mining port is reachable from the
         // network, which is a decision rather than an accident.
         eprintln!(
-            "[pool] --allow-public-bind: listeners may be on non-loopback addresses.              Publish the mining port only, never the node's Stratum v2 port or this              pool's stats port."
+            "[pool] --allow-public-bind: listeners may be on non-loopback \
+             addresses. Publish the mining port only, never the node's \
+             Stratum v2 port or this pool's stats port."
         );
     }
 
@@ -494,6 +513,7 @@ fn parse_args() -> Result<Option<Options>, String> {
         duration,
         coinbase_size,
         coinbase_sigops,
+        allow_public_bind,
     }))
 }
 

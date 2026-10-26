@@ -118,7 +118,8 @@ typedef struct {
 } AvianSv2Event;
 
 typedef struct {
-    /* "host:port", NUL-terminated. Loopback only. */
+    /* "host:port", NUL-terminated. Must be loopback unless
+     * allow_public_pool is set below. */
     const char *pool;
     /* The pool's authority x-only public key as 64 hex characters, or NULL for
      * trust on first use. NULL leaves the session encrypted but says nothing
@@ -144,6 +145,14 @@ typedef struct {
      * much, because the scriptSig is only 100 bytes and the height push and
      * the operator tag are in there too. */
     uint32_t min_extranonce_size;
+    /* Non-zero to allow a pool that is not on this machine.
+     *
+     * Zero, which is what a zeroed config gets, restricts this library to
+     * loopback. Set it for any real deployment: a miner dialling out exposes
+     * nothing, and the handshake authenticates the pool to the miner. It is a
+     * field rather than a rule so that the conservative behaviour stays the
+     * default. */
+    int32_t allow_public_pool;
 } AvianSv2ClientConfig;
 
 typedef struct AvianSv2Client AvianSv2Client;

@@ -107,6 +107,17 @@ struct ChannelState {
     /// Shares that were also blocks, so the page can say so per channel
     /// rather than only per algorithm.
     blocks: u32,
+    /// Shares naming a job this channel does not have.
+    ///
+    /// Counted apart from invalid shares deliberately. An unknown job id is
+    /// not bad work: it is the pool and the miner disagreeing about state, and
+    /// that is nearly always the pool's end. Counting it as invalid punished a
+    /// miner for the pool losing track of it, and the disconnect that followed
+    /// repaired the symptom, which is how the real bug stayed hidden.
+    desync: u32,
+    /// Set when this channel has asked for a job it does not have, so the
+    /// server knows to push it work. Cleared by a successful push.
+    wants_work: bool,
     last_sequence: u32,
     seen: HashSet<(u32, u32, u32)>,
     limiter: Limiter,
@@ -152,6 +163,8 @@ impl Channel {
                 accepted: 0,
                 shares: 0,
                 blocks: 0,
+                desync: 0,
+                wants_work: false,
                 last_sequence: 0,
                 seen: HashSet::new(),
                 limiter: Limiter::new(&share_target, nominal_hash_rate, rate_limit),
@@ -240,13 +253,12 @@ impl Channel {
         // SetNewPrevHash having arrived from the node: aviand sends one every
         // round whether the tip moved or not.
         let activate = !state.activated || work.tip_changed;
-        if work.tip_changed {
-            // Work on a superseded tip can never produce a connecting block,
-            // so it goes immediately, exactly as the node drops its own.
-            state.jobs.clear();
-            state.seen.clear();
-        }
 
+        // Nothing is cleared yet, and the ordering is deliberate. This used to
+        // drop the channel's jobs here, before building the replacement, so
+        // every error below left the channel with no jobs and nothing to
+        // replace them: the same stranding by another route. A channel left
+        // holding stale work is strictly better than one holding none.
         let job_id = state.next_job_id;
         state.next_job_id = state.next_job_id.wrapping_add(1).max(1);
 
@@ -362,6 +374,14 @@ impl Channel {
         }
         drop(writer);
 
+        // Now, and only now. Work on a superseded tip can never produce a
+        // connecting block, so it goes exactly as the node drops its own, but
+        // not one line before there is a replacement for it.
+        if work.tip_changed {
+            state.jobs.clear();
+            state.seen.clear();
+        }
+        state.wants_work = false;
         state.jobs.push_back(job);
         while state.jobs.len() > JOBS_RETAINED {
             state.jobs.pop_front();
@@ -412,9 +432,20 @@ impl Channel {
             .find(|job| job.job_id == submission.job_id)
             .cloned()
         else {
-            state.limiter.record_invalid();
+            // Not record_invalid(). A miner submitting against the only job
+            // it holds has done nothing wrong, and dropping it for that
+            // punishes the wrong party.
+            state.desync = state.desync.saturating_add(1);
+            state.wants_work = true;
+            let desync = state.desync;
             drop(state);
             self.send_error(sequence_number, Refusal::InvalidJobId)?;
+            if desync == 1 {
+                eprintln!(
+                    "[pool] channel {} asked for job {}, which it does not have:                      reissuing work rather than counting this against it",
+                    self.id, submission.job_id
+                );
+            }
             return Ok(None);
         };
 
@@ -513,6 +544,16 @@ impl Channel {
     /// Shares from this channel that were at or under the network target.
     pub fn blocks(&self) -> u32 {
         self.state.lock().map(|s| s.blocks).unwrap_or(0)
+    }
+
+    /// Shares this channel sent against a job it did not have.
+    pub fn desync(&self) -> u32 {
+        self.state.lock().map(|s| s.desync).unwrap_or(0)
+    }
+
+    /// Whether this channel is waiting for work it can submit against.
+    pub fn wants_work(&self) -> bool {
+        self.state.lock().map(|s| s.wants_work).unwrap_or(false)
     }
 
     /// Counted here rather than only at the algorithm, because "which worker

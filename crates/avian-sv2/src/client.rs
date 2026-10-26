@@ -1005,6 +1005,17 @@ impl MiningClient {
                     job_id: job.job_id,
                     future,
                 });
+                // A job that carries min_ntime is active now, not when some
+                // later SetNewPrevHash says so. The pool sends one of these on
+                // every template refresh, and this used to file it and do
+                // nothing, so the miner kept hashing the job it already had
+                // until the pool pruned that job out from under it and refused
+                // every share with invalid-job-id. The event itself is left to
+                // the constraints that always follow: a job whose ntime_max is
+                // unknown must not be mined.
+                if !future {
+                    self.active = Some(job.job_id);
+                }
                 Ok(Event::Idle)
             }
             (EXT_CORE, MESSAGE_TYPE_NEW_MINING_JOB) => {
@@ -1048,6 +1059,12 @@ impl MiningClient {
                     job_id: job.job_id,
                     future,
                 });
+                // Same as the extended case above: a job carrying min_ntime is
+                // active now, so it becomes the current one and the
+                // constraints that follow report it.
+                if !future {
+                    self.active = Some(job.job_id);
+                }
                 Ok(Event::Idle)
             }
             (EXT_AVIAN, MSG_JOB_TIME_CONSTRAINTS) => {

@@ -64,6 +64,17 @@ pub struct ServerConfig {
     /// [`avian_tdp::coinbase::MAX_COINBASE_TAG`] bytes; longer is refused when
     /// the server is built, not when the node rejects the block.
     pub coinbase_tag: Vec<u8>,
+    /// Whether the Mining Protocol listener may be on an address that is not
+    /// loopback.
+    ///
+    /// False by default, and the default is the point: a pool's Mining
+    /// Protocol port is as exposed as its Template Distribution one, and Noise
+    /// NX authenticates the server to the worker and not the worker to the
+    /// server, so it is transport security rather than access control. Inside
+    /// a container the listener has to be on the container's network for a
+    /// published port to reach it, which is a deliberate act by whoever wrote
+    /// the deployment rather than something to allow quietly.
+    pub allow_public_bind: bool,
     /// How many halvings below the network target a share must be. Zero makes
     /// the share target the network target, which on regtest is the
     /// algorithm's own floor, so nearly every share is also a block.
@@ -296,9 +307,9 @@ impl Server {
     /// worker and not the worker to the server, so it is transport security
     /// rather than access control.
     pub fn listen(self: Arc<Self>) -> Result<ServerHandle> {
-        if !self.config.bind.ip().is_loopback() {
+        if !self.config.bind.ip().is_loopback() && !self.config.allow_public_bind {
             return Err(Error::Protocol(format!(
-                "refusing to bind {}: loopback only",
+                "refusing to bind {}: loopback only unless allow_public_bind is set",
                 self.config.bind
             )));
         }
@@ -585,11 +596,30 @@ impl Server {
                         continue;
                     }
                     let submit = SubmitMeta { sequence_number };
-                    if let Some(candidate) = channel.handle_submit(
+                    let outcome = channel.handle_submit(
                         submission,
                         submit.sequence_number,
                         self.hasher.as_ref(),
-                    )? {
+                    )?;
+                    // A channel that submitted against a job it does not have
+                    // is desynchronised from the pool, and the repair is work,
+                    // not a disconnect. Pushing here means the first refused
+                    // share fixes the channel instead of starting a countdown.
+                    if channel.wants_work() {
+                        if let Some((work, prev)) = algo.current() {
+                            match channel.push_work(&work, &prev) {
+                                Ok(()) => eprintln!(
+                                    "[pool] channel {} reissued work after a desync",
+                                    channel.id
+                                ),
+                                Err(e) => eprintln!(
+                                    "[pool] channel {} could not be reissued work: {e}",
+                                    channel.id
+                                ),
+                            }
+                        }
+                    }
+                    if let Some(candidate) = outcome {
                         // A share at or under the network target is a block,
                         // so it goes up to the node. There is no reply to a
                         // SubmitSolution: the only way to see it refused is
