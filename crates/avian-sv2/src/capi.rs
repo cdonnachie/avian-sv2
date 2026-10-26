@@ -250,14 +250,7 @@ fn build_config(raw: &AvianSv2ClientConfig) -> Result<ClientConfig, &'static str
 
     let mut config = ClientConfig::new(addr, pow);
     if let Some(hex) = unsafe { text(raw.authority_hex) } {
-        // Either form, because an operator may publish either and a miner
-        // should not have to care which: base58 is what SRI-derived miner
-        // configurations take, hex is what this project logged first.
-        let key = crate::address::decode_authority_key(&hex)
-            .ok()
-            .or_else(|| crate::authority::from_hex(&hex).ok())
-            .ok_or("authority is neither a base58 nor a hex public key")?;
-        config.pool_authority = Some(key);
+        config.pool_authority = Some(parse_authority(&hex)?);
     }
     if let Some(identity) = unsafe { text(raw.user_identity) } {
         config.user_identity = identity;
@@ -764,6 +757,39 @@ pub unsafe extern "C" fn avian_sv2_meets_target(hash: *const u8, target: *const 
     std::ptr::copy_nonoverlapping(hash, h.as_mut_ptr(), 32);
     std::ptr::copy_nonoverlapping(target, t.as_mut_ptr(), 32);
     block::meets_target(&h, &t) as c_int
+}
+
+/// An authority public key in either form an operator might publish it.
+///
+/// base58 is what SRI-derived miner configurations take, hex is what this
+/// project logged first, and a miner should not have to care which it was
+/// handed.
+fn parse_authority(text: &str) -> Result<secp256k1::XOnlyPublicKey, &'static str> {
+    crate::address::decode_authority_key(text)
+        .ok()
+        .or_else(|| crate::authority::from_hex(text).ok())
+        .ok_or("authority is neither a base58 nor a hex public key")
+}
+
+/// Whether `key` is an authority public key this library would accept.
+///
+/// Exists so a caller can reject a mistyped key while starting up rather than
+/// while connecting. Without it the only way to find out is to attempt a
+/// session, and a configuration error then arrives dressed as a connection
+/// failure, after a wasted connection and a pointless retry on the other
+/// channel type.
+///
+/// # Safety
+/// `key` must be NUL-terminated or null.
+#[no_mangle]
+pub unsafe extern "C" fn avian_sv2_check_authority(key: *const c_char) -> c_int {
+    let Some(text) = (unsafe { text(key) }) else {
+        return AVIAN_SV2_INVALID_ARGUMENT;
+    };
+    match parse_authority(&text) {
+        Ok(_) => AVIAN_SV2_OK,
+        Err(_) => AVIAN_SV2_INVALID_ARGUMENT,
+    }
 }
 
 /// The library version, NUL-terminated and statically allocated.

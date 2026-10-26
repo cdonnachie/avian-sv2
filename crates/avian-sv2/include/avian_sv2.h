@@ -280,6 +280,12 @@ int32_t avian_sv2_build_header(const AvianMiningJob *job, uint32_t ntime,
 int32_t avian_sv2_meets_target(const uint8_t *hash, const uint8_t *target);
 
 /* The library version, NUL-terminated and statically allocated. */
+/* Whether key is an authority public key this library would accept, in
+ * either the base58 or the 64-character hex form. Returns AVIAN_SV2_OK or
+ * AVIAN_SV2_INVALID_ARGUMENT, and touches no network: it is for rejecting a
+ * mistyped key at startup rather than part way through a handshake. */
+int32_t avian_sv2_check_authority(const char *key);
+
 const char *avian_sv2_version(void);
 
 /* Checks that this header agrees with the library about struct layout.
