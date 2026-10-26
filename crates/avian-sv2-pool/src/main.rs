@@ -21,6 +21,7 @@ use avian_mining::pool::{self, PoolConfig};
 use avian_mining::ratelimit::RateLimitConfig;
 use avian_mining::server::ServerConfig;
 use avian_mining::share::{AvianHasher, PowHasher};
+use avian_mining::stats::{self, Snapshot};
 use avian_sv2::address::{self, Address, Network};
 use avian_sv2::avian::TimeConstraints;
 use avian_sv2::wire::{hex, hex_rev};
@@ -33,6 +34,9 @@ use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 struct Options {
     node: SocketAddr,
     mining_bind: SocketAddr,
+    /// Read-only JSON, for a renderer to poll. `None` leaves it off, which is
+    /// the default: a port nobody asked for should not exist.
+    stats_bind: Option<SocketAddr>,
     network: Network,
     algorithms: Vec<PowType>,
     node_authority: Option<XOnlyPublicKey>,
@@ -84,6 +88,13 @@ Submission limits, per channel:
   --max-invalid-shares <n>     invalid submissions before the channel is
                                dropped, default 50
 
+  --stats-bind <addr>    serve read-only JSON here; off by default. JSON
+                         only, never HTML: a renderer is a separate service.
+                         Do not publish this port.
+  --allow-public-bind    permit --mining-bind and --stats-bind on addresses
+                         that are not loopback. Needed inside a container,
+                         where the listener has to be on the container's
+                         network for a published port to reach it.
   --algo <name>          x16rt or minotaurx; repeatable, default: both
   --duration <seconds>   stop after this long; default: run until killed
   --verbose              print every template in full
@@ -167,6 +178,22 @@ fn run(options: Options) -> Result<(), String> {
         handle.mining_addr(),
         options.algorithms.len()
     );
+
+    // Held for as long as the pool runs; dropping it stops the listener.
+    let _stats = match options.stats_bind {
+        Some(bind) => {
+            let algos: Vec<_> = handle.algos().to_vec();
+            let started_at = handle.started_at();
+            let handle = stats::serve(bind, move || Snapshot::gather(started_at, &algos))
+                .map_err(|e| format!("--stats-bind {bind}: {e}"))?;
+            println!(
+                "[pool] read-only stats JSON on {} at /stats. Do not publish this port.",
+                handle.addr()
+            );
+            Some(handle)
+        }
+        None => None,
+    };
     // Both forms, labelled. A miner's configuration takes this as one opaque
     // string the user pastes in, and the two stacks present x-only keys
     // differently: SRI and the miners built on it use base58check, while the
@@ -263,6 +290,8 @@ fn parse_args() -> Result<Option<Options>, String> {
     let mut insecure = false;
     let mut algorithms: Vec<PowType> = Vec::new();
     let mut mining_bind = "127.0.0.1:34254".to_string();
+    let mut stats_bind: Option<String> = None;
+    let mut allow_public_bind = false;
     let mut pool_key = PathBuf::from("avian-pool-authority-key");
     let mut fee_address: Option<String> = None;
     let mut fee_basis_points = 0u32;
@@ -292,6 +321,8 @@ fn parse_args() -> Result<Option<Options>, String> {
             "--authority" => authority_hex = Some(value!()),
             "--insecure-tofu" => insecure = true,
             "--mining-bind" => mining_bind = value!(),
+            "--stats-bind" => stats_bind = Some(value!()),
+            "--allow-public-bind" => allow_public_bind = true,
             "--pool-key" => pool_key = PathBuf::from(value!()),
             "--coinbase-tag" => coinbase_tag = value!(),
             "--operator-fee" => fee_address = Some(value!()),
@@ -388,11 +419,38 @@ fn parse_args() -> Result<Option<Options>, String> {
     let node = resolve(&target)?;
     let mining_bind = resolve(&mining_bind)?;
 
-    if !node.ip().is_loopback() {
-        return Err(format!("refusing to connect to {node}: loopback only"));
+    let stats_bind = match &stats_bind {
+        Some(text) => Some(resolve(text)?),
+        None => None,
+    };
+
+    // Connecting out stays loopback-only with no override. The node is
+    // reached over the container network in a deployment, which is loopback
+    // from nobody's point of view, so this is relaxed by the same flag.
+    if !node.ip().is_loopback() && !allow_public_bind {
+        return Err(format!(
+            "refusing to connect to {node}: loopback only without --allow-public-bind"
+        ));
     }
-    if !mining_bind.ip().is_loopback() {
-        return Err(format!("refusing to bind {mining_bind}: loopback only"));
+    if !mining_bind.ip().is_loopback() && !allow_public_bind {
+        return Err(format!(
+            "refusing to bind {mining_bind}: loopback only without --allow-public-bind"
+        ));
+    }
+    if let Some(stats) = stats_bind {
+        if !stats.ip().is_loopback() && !allow_public_bind {
+            return Err(format!(
+                "refusing to bind {stats}: loopback only without --allow-public-bind"
+            ));
+        }
+    }
+    if allow_public_bind {
+        // Worth a line in the log. Inside a container this is correct and
+        // necessary; on a host it means the mining port is reachable from the
+        // network, which is a decision rather than an accident.
+        eprintln!(
+            "[pool] --allow-public-bind: listeners may be on non-loopback addresses.              Publish the mining port only, never the node's Stratum v2 port or this              pool's stats port."
+        );
     }
 
     // Verification is the default. Trust on first use has to be asked for.
@@ -422,6 +480,7 @@ fn parse_args() -> Result<Option<Options>, String> {
     Ok(Some(Options {
         node,
         mining_bind,
+        stats_bind,
         network,
         algorithms,
         node_authority,

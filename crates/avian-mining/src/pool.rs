@@ -39,6 +39,7 @@ pub struct PoolConfig {
 
 pub struct PoolHandle {
     mining_addr: SocketAddr,
+    started_at: Instant,
     algos: Vec<Arc<AlgoContext>>,
     _server: ServerHandle,
     threads: Vec<std::thread::JoinHandle<()>>,
@@ -51,6 +52,17 @@ impl PoolHandle {
 
     pub fn algo(&self, pow: PowType) -> Option<&Arc<AlgoContext>> {
         self.algos.iter().find(|algo| algo.pow == pow)
+    }
+
+    /// Every algorithm the pool serves, for the stats endpoint.
+    pub fn algos(&self) -> &[Arc<AlgoContext>] {
+        &self.algos
+    }
+
+    /// When the pool started serving. There is no persistence, so this is also
+    /// how far back every counter on the stats endpoint reaches.
+    pub fn started_at(&self) -> Instant {
+        self.started_at
     }
 
     pub fn join(self) {
@@ -120,6 +132,7 @@ pub fn spawn(
 
     Ok(PoolHandle {
         mining_addr,
+        started_at: Instant::now(),
         algos,
         _server: handle,
         threads,

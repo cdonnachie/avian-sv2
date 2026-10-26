@@ -113,6 +113,10 @@ pub struct AlgoContext {
     pub pow: PowType,
     submitter: SolutionSubmitter,
     state: Mutex<AlgoState>,
+    /// Blocks this algorithm has forwarded to the node. Not a count of blocks
+    /// the node accepted: SubmitSolution has no reply, so the pool cannot know
+    /// that, and the stats endpoint says so rather than implying otherwise.
+    blocks: AtomicU32,
 }
 
 #[derive(Default)]
@@ -132,11 +136,31 @@ impl AlgoContext {
             pow,
             submitter,
             state: Mutex::new(AlgoState::default()),
+            blocks: AtomicU32::new(0),
         }
     }
 
     pub fn submitter(&self) -> &SolutionSubmitter {
         &self.submitter
+    }
+
+    /// Every channel on this algorithm, for the stats endpoint. A clone of the
+    /// list, so nothing holds the lock while a snapshot is rendered.
+    pub fn channels(&self) -> Vec<Arc<Channel>> {
+        self.state
+            .lock()
+            .map(|s| s.channels.clone())
+            .unwrap_or_default()
+    }
+
+    /// Blocks forwarded upstream for this algorithm.
+    pub fn blocks(&self) -> u32 {
+        self.blocks.load(Ordering::Relaxed)
+    }
+
+    /// The prev hash in force, so the page can show which tip is being mined.
+    pub fn prev_hash(&self) -> Option<[u8; 32]> {
+        self.state.lock().ok()?.prev.as_ref().map(|p| p.prev_hash)
     }
 
     /// Records a round of work and pushes a job to every channel.
@@ -469,6 +493,7 @@ impl Server {
             share_target,
             payout,
             parsed.worker.clone(),
+            parsed.address_text.clone(),
             self.config.coinbase_tag.clone(),
             nominal_hash_rate,
             self.config.rate_limit,
@@ -573,6 +598,8 @@ impl Server {
                             "[pool] channel {} found a block for template {}, submitting",
                             channel.id, candidate.template_id
                         );
+                        channel.record_block();
+                        algo.blocks.fetch_add(1, Ordering::Relaxed);
                         algo.submitter().submit(
                             candidate.template_id,
                             candidate.version,

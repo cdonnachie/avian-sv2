@@ -16,6 +16,7 @@ pub mod pool;
 pub mod ratelimit;
 pub mod server;
 pub mod share;
+pub mod stats;
 
 /// The Mining Protocol lives under `extension_type = 0`, like the core
 /// messages: a protocol is chosen by `SetupConnection.protocol`, not by an

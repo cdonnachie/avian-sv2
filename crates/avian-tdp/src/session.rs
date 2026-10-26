@@ -113,6 +113,13 @@ impl SubmitterSlot {
         SolutionSubmitter { slot: self.clone() }
     }
 
+    /// Whether a connection is installed. False between a drop and the
+    /// reconnect that replaces it, which is what "upstream unhealthy" means
+    /// for the stats endpoint.
+    fn connected(&self) -> bool {
+        self.0.lock().map(|slot| slot.is_some()).unwrap_or(false)
+    }
+
     fn install(&self, writer: Arc<Mutex<ConnectionWriter>>) {
         if let Ok(mut slot) = self.0.lock() {
             *slot = Some(writer);
@@ -142,6 +149,13 @@ impl SolutionSubmitter {
     /// Fails if the session is between connections, which is the honest
     /// answer: a solution for a template from the previous connection has
     /// nowhere to go, because template ids do not survive a reconnect.
+    /// Whether the session currently holds a connection. The stats endpoint
+    /// reports this as upstream health; a pool with no upstream can still
+    /// serve jobs it already has, but it cannot forward a block.
+    pub fn is_connected(&self) -> bool {
+        self.slot.connected()
+    }
+
     pub fn submit(
         &self,
         template_id: u64,

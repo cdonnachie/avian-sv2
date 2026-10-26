@@ -9,6 +9,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use avian_sv2::avian::{self, PowType, EXT_AVIAN, MSG_JOB_TIME_CONSTRAINTS};
 use avian_sv2::error::{Error, Result};
@@ -84,6 +85,12 @@ pub struct Channel {
     pub payout: PayoutPlan,
     /// The worker label after the address, for logging only.
     pub worker: String,
+    /// The payout address as the worker wrote it. Kept so the stats endpoint
+    /// can show a prefix: enough for someone to recognise their own channel,
+    /// not enough to publish where everyone is paid.
+    pub payout_address: String,
+    /// When the channel opened, which is what turns a share count into a rate.
+    pub opened_at: Instant,
     coinbase_tag: Vec<u8>,
     writer: Arc<Mutex<ConnectionWriter>>,
     state: Mutex<ChannelState>,
@@ -97,6 +104,9 @@ struct ChannelState {
     activated: bool,
     accepted: u32,
     shares: u64,
+    /// Shares that were also blocks, so the page can say so per channel
+    /// rather than only per algorithm.
+    blocks: u32,
     last_sequence: u32,
     seen: HashSet<(u32, u32, u32)>,
     limiter: Limiter,
@@ -111,6 +121,7 @@ impl Channel {
         share_target: [u8; 32],
         payout: PayoutPlan,
         worker: String,
+        payout_address: String,
         coinbase_tag: Vec<u8>,
         nominal_hash_rate: f32,
         rate_limit: RateLimitConfig,
@@ -130,6 +141,8 @@ impl Channel {
             },
             payout,
             worker,
+            payout_address,
+            opened_at: Instant::now(),
             coinbase_tag,
             writer,
             state: Mutex::new(ChannelState {
@@ -138,6 +151,7 @@ impl Channel {
                 activated: false,
                 accepted: 0,
                 shares: 0,
+                blocks: 0,
                 last_sequence: 0,
                 seen: HashSet::new(),
                 limiter: Limiter::new(&share_target, nominal_hash_rate, rate_limit),
@@ -488,6 +502,25 @@ impl Channel {
 
     pub fn job_count(&self) -> usize {
         self.state.lock().map(|s| s.jobs.len()).unwrap_or(0)
+    }
+
+    /// The newest job pushed to this channel, which is the one a miner should
+    /// be working on.
+    pub fn current_job_id(&self) -> Option<u32> {
+        self.state.lock().ok()?.jobs.back().map(|job| job.job_id)
+    }
+
+    /// Shares from this channel that were at or under the network target.
+    pub fn blocks(&self) -> u32 {
+        self.state.lock().map(|s| s.blocks).unwrap_or(0)
+    }
+
+    /// Counted here rather than only at the algorithm, because "which worker
+    /// found it" is the first thing anyone asks.
+    pub fn record_block(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.blocks = state.blocks.saturating_add(1);
+        }
     }
 
     pub fn accepted(&self) -> u32 {
