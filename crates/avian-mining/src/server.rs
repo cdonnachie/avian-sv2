@@ -1,5 +1,6 @@
 //! The worker-facing listener and the session each worker gets.
 
+use std::collections::VecDeque;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -124,10 +125,18 @@ pub struct AlgoContext {
     pub pow: PowType,
     submitter: SolutionSubmitter,
     state: Mutex<AlgoState>,
-    /// Blocks this algorithm has forwarded to the node. Not a count of blocks
-    /// the node accepted: SubmitSolution has no reply, so the pool cannot know
-    /// that, and the stats endpoint says so rather than implying otherwise.
+    /// Blocks this algorithm has forwarded to the node.
     blocks: AtomicU32,
+    /// Blocks whose hash later became the tip, which is the only honest way to
+    /// count accepted ones: SubmitSolution has no reply, so the node cannot
+    /// say, but the next SetNewPrevHash carries the new tip and a match is
+    /// proof the block connected.
+    confirmed: AtomicU32,
+    /// Hashes forwarded and not yet seen as a tip, with the channel and
+    /// sequence number they came from so the miner can be told which share it
+    /// was. Bounded: an unconfirmed block either becomes the tip within a few
+    /// rounds or lost a race, and the pool cannot tell which.
+    pending: Mutex<VecDeque<(u32, u32, [u8; 32])>>,
 }
 
 #[derive(Default)]
@@ -148,6 +157,8 @@ impl AlgoContext {
             submitter,
             state: Mutex::new(AlgoState::default()),
             blocks: AtomicU32::new(0),
+            confirmed: AtomicU32::new(0),
+            pending: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -167,6 +178,57 @@ impl AlgoContext {
     /// Blocks forwarded upstream for this algorithm.
     pub fn blocks(&self) -> u32 {
         self.blocks.load(Ordering::Relaxed)
+    }
+
+    /// Blocks whose hash was later seen as the tip.
+    pub fn confirmed(&self) -> u32 {
+        self.confirmed.load(Ordering::Relaxed)
+    }
+
+    /// Records a forwarded block so a later tip can confirm it.
+    fn remember_block(&self, channel_id: u32, sequence_number: u32, hash: [u8; 32]) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.push_back((channel_id, sequence_number, hash));
+            // A dozen rounds is generous. Past that it lost a race, and the
+            // pool has no way to know that rather than guess it.
+            while pending.len() > 16 {
+                pending.pop_front();
+            }
+        }
+    }
+
+    /// Tells any channel whose block is now the tip that it connected.
+    ///
+    /// Called with the new tip, from the SetNewPrevHash that moved it. This is
+    /// the whole confirmation mechanism: not the absence of a complaint from
+    /// the node, which cannot complain, but the hash actually appearing as the
+    /// tip.
+    fn confirm_tip(&self, tip: &[u8; 32], channels: &[Arc<Channel>]) {
+        let matched: Vec<(u32, u32)> = match self.pending.lock() {
+            Ok(mut pending) => {
+                let mut hits = Vec::new();
+                pending.retain(|(channel_id, sequence, hash)| {
+                    if hash == tip {
+                        hits.push((*channel_id, *sequence));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                hits
+            }
+            Err(_) => return,
+        };
+        for (channel_id, sequence) in matched {
+            self.confirmed.fetch_add(1, Ordering::Relaxed);
+            if let Some(channel) = channels.iter().find(|c| c.id == channel_id) {
+                if let Err(e) = channel.send_block_found(sequence, tip, true) {
+                    eprintln!("[pool] channel {channel_id}: could not confirm its block: {e}");
+                } else {
+                    eprintln!("[pool] channel {channel_id}'s block is the tip now, told it so");
+                }
+            }
+        }
     }
 
     /// The prev hash in force, so the page can show which tip is being mined.
@@ -201,6 +263,13 @@ impl AlgoContext {
             state.work = Some(work.clone());
             (work, prev, state.channels.clone())
         };
+
+        // A moved tip is the only evidence the pool can have that a block it
+        // forwarded was accepted, so it is checked here, before the new work
+        // goes out. SubmitSolution has no reply; the node cannot say yes.
+        if work.tip_changed {
+            self.confirm_tip(&prev.prev_hash, &channels);
+        }
 
         channels
             .iter()
@@ -630,6 +699,17 @@ impl Server {
                         );
                         channel.record_block();
                         algo.blocks.fetch_add(1, Ordering::Relaxed);
+                        algo.remember_block(channel.id, submit.sequence_number, candidate.hash);
+                        // Told before the node is, because the node has no
+                        // reply to give and the miner is the one that cares.
+                        if let Err(e) =
+                            channel.send_block_found(submit.sequence_number, &candidate.hash, false)
+                        {
+                            eprintln!(
+                                "[pool] channel {}: could not tell it about its block: {e}",
+                                channel.id
+                            );
+                        }
                         algo.submitter().submit(
                             candidate.template_id,
                             candidate.version,

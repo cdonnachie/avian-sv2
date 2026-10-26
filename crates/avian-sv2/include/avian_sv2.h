@@ -51,6 +51,21 @@ extern "C" {
 #define AVIAN_SV2_EVENT_SHARE_REJECTED 4
 #define AVIAN_SV2_EVENT_RECONNECTED 5
 #define AVIAN_SV2_EVENT_DISCONNECTED 6
+/* One of this miner's shares was a block.
+ *
+ * block_confirmed is 0 when the pool has forwarded it and 1 once that hash is
+ * the chain tip. There is no "lost": a pool cannot tell a block that lost a
+ * race from one still propagating, so no second event is unresolved rather
+ * than failure.
+ *
+ * Nothing in the Mining Protocol carries this. A miner is given a share
+ * target and never the network target, so it cannot work out that its own
+ * share was a block, which for a solo pool is backwards: consensus pays the
+ * miner directly for exactly these. It is AvianBlockFound (0x05) in the
+ * Avian extension, and is deliberately excluded from the registry submission
+ * because it belongs in core Stratum v2 rather than in an extension
+ * allocated for multi-algorithm work. */
+#define AVIAN_SV2_EVENT_BLOCK_FOUND 7
 
 #define AVIAN_SV2_MESSAGE_LEN 256
 
@@ -115,6 +130,15 @@ typedef struct {
     /* NUL-terminated: the refusal code for a rejected share, or the reason for
      * a disconnect. */
     char message[AVIAN_SV2_MESSAGE_LEN];
+    /* Meaningful when kind == AVIAN_SV2_EVENT_BLOCK_FOUND.
+     *
+     * In uint256's internal little-endian order, the reverse of how a block
+     * hash is printed, like every other hash in this header. After message on
+     * purpose: avian_sv2_abi_check pins offsetof(message), so a field added
+     * here cannot shift an existing one. */
+    uint8_t block_hash[32];
+    /* Non-zero once block_hash is the chain tip. */
+    int32_t block_confirmed;
 } AvianSv2Event;
 
 typedef struct {

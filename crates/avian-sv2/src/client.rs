@@ -270,6 +270,18 @@ pub enum Event {
         accepted_count: u32,
         shares_sum: u64,
     },
+    /// One of this miner's shares was a block.
+    ///
+    /// `confirmed` is false when the pool forwarded it and true once that hash
+    /// became the chain tip. A block that lost a race gets no second event,
+    /// because a pool cannot tell that from one still propagating, so the
+    /// absence of confirmation is unresolved rather than failure.
+    BlockFound {
+        sequence_number: u32,
+        /// uint256's internal order, the reverse of how a block hash prints.
+        block_hash: [u8; 32],
+        confirmed: bool,
+    },
     ShareRejected {
         sequence_number: u32,
         code: String,
@@ -1066,6 +1078,20 @@ impl MiningClient {
                     self.active = Some(job.job_id);
                 }
                 Ok(Event::Idle)
+            }
+            (EXT_AVIAN, avian::MSG_BLOCK_FOUND) => {
+                if !frame.channel_msg {
+                    return Err(Error::Protocol(
+                        "AvianBlockFound must set the channel_msg bit, so that it travels                          under 0xc001"
+                            .into(),
+                    ));
+                }
+                let found = avian::decode_block_found(&frame.payload)?;
+                Ok(Event::BlockFound {
+                    sequence_number: found.sequence_number,
+                    block_hash: found.block_hash,
+                    confirmed: found.confirmed,
+                })
             }
             (EXT_AVIAN, MSG_JOB_TIME_CONSTRAINTS) => {
                 if !frame.channel_msg {

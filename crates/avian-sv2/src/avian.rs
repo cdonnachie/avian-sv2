@@ -29,6 +29,17 @@ pub const MSG_TIME_CONSTRAINTS: u8 = 0x03;
 /// client never sees one; it is here because Stage 3 is the side that does.
 pub const MSG_JOB_TIME_CONSTRAINTS: u8 = 0x04;
 
+/// `AvianBlockFound`, upstream to downstream, on the Mining Protocol.
+///
+/// A channel message, so bit 15 of `extension_type` is set.
+///
+/// This one is not really Avian's: nothing about it concerns multiple
+/// algorithms or time bounds, and any solo pool on any chain has the same gap.
+/// It is deliberately excluded from the registry submission for that reason,
+/// and belongs in core Stratum v2. It lives here because the gap is real now
+/// and the specification process is not fast.
+pub const MSG_BLOCK_FOUND: u8 = 0x05;
+
 /// X16RT rederives its hash chain every 128 seconds.
 pub const TIME_MASK: u32 = 0xffff_ff80;
 
@@ -203,6 +214,45 @@ pub struct JobTimeConstraints {
     pub job_id: u32,
     pub ntime_min: u32,
     pub ntime_max: u32,
+}
+
+/// A share that was a block, and later whether it became the tip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockFound {
+    pub channel_id: u32,
+    /// The `SubmitShares` sequence number this refers to, so a miner can say
+    /// which of its shares it was.
+    pub sequence_number: u32,
+    /// In uint256's internal order, which is the reverse of how a block hash
+    /// is printed.
+    pub block_hash: [u8; 32],
+    /// False when the pool forwarded it, true once that hash became the tip.
+    ///
+    /// There is no false-after-the-fact: a pool cannot tell a block that lost
+    /// a race from one still propagating, so the absence of a second message
+    /// is unresolved rather than failure.
+    pub confirmed: bool,
+}
+
+pub fn encode_block_found(b: &BlockFound) -> Vec<u8> {
+    Writer::new()
+        .u32(b.channel_id)
+        .u32(b.sequence_number)
+        .u256(&b.block_hash)
+        .boolean(b.confirmed)
+        .finish()
+}
+
+pub fn decode_block_found(payload: &[u8]) -> Result<BlockFound> {
+    let mut r = Reader::new(payload);
+    let out = BlockFound {
+        channel_id: r.u32()?,
+        sequence_number: r.u32()?,
+        block_hash: r.u256()?,
+        confirmed: r.boolean()?,
+    };
+    r.done()?;
+    Ok(out)
 }
 
 pub fn encode_job_time_constraints(c: &JobTimeConstraints) -> Vec<u8> {

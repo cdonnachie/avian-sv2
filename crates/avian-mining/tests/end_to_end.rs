@@ -380,10 +380,24 @@ fn a_duplicate_share_is_refused() {
     ));
 
     miner.submit(&job, nonce, ntime).unwrap();
-    match poll_event(&mut miner, Duration::from_secs(10)) {
-        Some(Event::ShareRejected { code, .. }) => assert_eq!(code, "duplicate-share"),
-        other => panic!("a resubmission should be refused, got {other:?}"),
+    // On regtest the share target is the network target, so that first share
+    // was also a block and an AvianBlockFound is on its way. Skip past
+    // anything that is not a verdict on the resubmission.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut verdict = None;
+    while Instant::now() < deadline && verdict.is_none() {
+        match poll_event(&mut miner, Duration::from_millis(300)) {
+            Some(Event::ShareRejected { code, .. }) => verdict = Some(code),
+            Some(Event::ShareAccepted { .. }) => {
+                panic!("a resubmission was accepted twice")
+            }
+            _ => {}
+        }
     }
+    assert_eq!(
+        verdict.expect("a resubmission should get a verdict"),
+        "duplicate-share"
+    );
 }
 
 /// Two algorithms, two channels, two independent job streams.

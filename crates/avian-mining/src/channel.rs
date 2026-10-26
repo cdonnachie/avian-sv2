@@ -507,6 +507,30 @@ impl Channel {
         }
     }
 
+    /// Tells the miner one of its shares was a block, and later that the
+    /// block became the tip.
+    ///
+    /// Nothing in the Mining Protocol carries this: a miner is given a share
+    /// target and never the network target, so it cannot work out that its own
+    /// share was a block. For a pool paying by share that does not matter. For
+    /// a solo pool it is backwards, because consensus pays the miner directly
+    /// for exactly these.
+    pub fn send_block_found(
+        &self,
+        sequence_number: u32,
+        block_hash: &[u8; 32],
+        confirmed: bool,
+    ) -> Result<()> {
+        let payload = avian::encode_block_found(&avian::BlockFound {
+            channel_id: self.id,
+            sequence_number,
+            block_hash: *block_hash,
+            confirmed,
+        });
+        self.lock_writer()?
+            .send_raw(EXT_AVIAN, avian::MSG_BLOCK_FOUND, true, &payload)
+    }
+
     pub fn send_error(&self, sequence_number: u32, refusal: Refusal) -> Result<()> {
         let code = refusal.code();
         self.lock_writer()?.send(

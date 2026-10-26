@@ -68,6 +68,27 @@ impl<'a> Reader<'a> {
         (0..count).map(|_| self.u16()).collect()
     }
 
+    /// A U256: thirty-two raw bytes, in uint256's internal order like
+    /// everything else on this wire.
+    pub fn u256(&mut self) -> Result<[u8; 32]> {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(self.take(32)?);
+        Ok(out)
+    }
+
+    /// A BOOL. Anything but 0 and 1 is a malformed payload rather than
+    /// something to coerce, because a peer that sends 2 has a bug worth
+    /// hearing about.
+    pub fn boolean(&mut self) -> Result<bool> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(Error::Payload(format!(
+                "a BOOL field carried {other}, which is neither 0 nor 1"
+            ))),
+        }
+    }
+
     pub fn done(self) -> Result<()> {
         if self.pos != self.data.len() {
             return Err(Error::Payload(format!(
@@ -113,6 +134,16 @@ impl Writer {
     }
 
     /// A B0_255: a one-byte length then the bytes.
+    pub fn u256(&mut self, value: &[u8; 32]) -> &mut Self {
+        self.0.extend_from_slice(value);
+        self
+    }
+
+    pub fn boolean(&mut self, value: bool) -> &mut Self {
+        self.0.push(u8::from(value));
+        self
+    }
+
     pub fn bytes_u8(&mut self, bytes: &[u8]) -> &mut Self {
         self.u8(bytes.len() as u8).raw(bytes)
     }

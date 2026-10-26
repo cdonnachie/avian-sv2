@@ -45,6 +45,8 @@ pub const AVIAN_SV2_EVENT_SHARE_ACCEPTED: c_int = 3;
 pub const AVIAN_SV2_EVENT_SHARE_REJECTED: c_int = 4;
 pub const AVIAN_SV2_EVENT_RECONNECTED: c_int = 5;
 pub const AVIAN_SV2_EVENT_DISCONNECTED: c_int = 6;
+/// A share was a block. `confirmed` says whether it is the tip yet.
+pub const AVIAN_SV2_EVENT_BLOCK_FOUND: c_int = 7;
 
 /// How much room a message or error code gets in an event.
 pub const AVIAN_SV2_MESSAGE_LEN: usize = 256;
@@ -134,6 +136,18 @@ pub struct AvianSv2Event {
     /// NUL-terminated. The refusal code for a rejected share, or the reason
     /// for a disconnect.
     pub message: [c_char; AVIAN_SV2_MESSAGE_LEN],
+    /// The block, when  is .
+    ///
+    /// The block, when the event kind is AVIAN_SV2_EVENT_BLOCK_FOUND.
+    /// After `message` on purpose: avian_sv2_abi_check pins
+    /// offsetof(message), so adding a field here cannot shift an existing one.
+    /// uint256's internal order, the reverse of how a block hash prints.
+    pub block_hash: [u8; 32],
+    /// Non-zero once that hash is the chain tip. Zero means the pool has
+    /// forwarded it and nothing has confirmed it yet, which is not the same as
+    /// failure: a pool cannot tell a block that lost a race from one still
+    /// propagating, so it says nothing rather than something false.
+    pub block_confirmed: c_int,
 }
 
 impl AvianSv2Event {
@@ -145,6 +159,8 @@ impl AvianSv2Event {
             accepted_count: 0,
             generation: 0,
             message: [0; AVIAN_SV2_MESSAGE_LEN],
+            block_hash: [0; 32],
+            block_confirmed: 0,
         }
     }
 
@@ -405,6 +421,17 @@ pub unsafe extern "C" fn avian_sv2_client_poll(
             out.kind = AVIAN_SV2_EVENT_SHARE_ACCEPTED;
             out.sequence_number = sequence_number;
             out.accepted_count = accepted_count;
+            AVIAN_SV2_OK
+        }
+        Ok(Ok(Event::BlockFound {
+            sequence_number,
+            block_hash,
+            confirmed,
+        })) => {
+            out.kind = AVIAN_SV2_EVENT_BLOCK_FOUND;
+            out.sequence_number = sequence_number;
+            out.block_hash = block_hash;
+            out.block_confirmed = c_int::from(confirmed);
             AVIAN_SV2_OK
         }
         Ok(Ok(Event::ShareRejected {

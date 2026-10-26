@@ -17,9 +17,12 @@
 //!
 //! - **Full payout addresses.** A prefix is enough for someone to recognise
 //!   their own channel and not enough to publish where everyone is paid.
-//! - **Blocks the node accepted.** `SubmitSolution` has no reply, so the pool
-//!   genuinely does not know. The field is named `blocks_submitted` for that
-//!   reason.
+//! - **Blocks the node accepted, at the moment it accepts them.**
+//!   `SubmitSolution` has no reply, so the pool is never told. It can still
+//!   prove acceptance after the fact, because the next `SetNewPrevHash`
+//!   carries the new tip and the pool knows the hash it submitted: that is
+//!   `blocks_confirmed`. `blocks_submitted` is the weaker number, and both
+//!   are reported because the gap between them is real.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -47,6 +50,11 @@ pub struct AlgoSnapshot {
     pub pow: PowType,
     pub upstream_connected: bool,
     pub blocks_submitted: u32,
+    /// Blocks whose hash was later seen as the chain tip. The only count the
+    /// pool can prove, and now it can: SubmitSolution has no reply, but the
+    /// next SetNewPrevHash carries the new tip and a match is proof the block
+    /// connected.
+    pub blocks_confirmed: u32,
     pub prev_hash: Option<[u8; 32]>,
     pub channels: Vec<ChannelSnapshot>,
 }
@@ -148,6 +156,7 @@ impl Snapshot {
                     pow: algo.pow,
                     upstream_connected: algo.submitter().is_connected(),
                     blocks_submitted: algo.blocks(),
+                    blocks_confirmed: algo.confirmed(),
                     prev_hash: algo.prev_hash(),
                     channels,
                 }
@@ -190,6 +199,11 @@ impl Snapshot {
             out.push_str(&format!(
                 "      \"blocks_submitted\": {},\n",
                 algo.blocks_submitted
+            ));
+            // Provable, unlike blocks_submitted: this hash was seen as the tip.
+            out.push_str(&format!(
+                "      \"blocks_confirmed\": {},\n",
+                algo.blocks_confirmed
             ));
             match &algo.prev_hash {
                 Some(hash) => out.push_str(&format!(
