@@ -192,7 +192,10 @@ fn run(options: Options) -> Result<(), String> {
         Some(bind) => {
             let algos: Vec<_> = handle.algos().to_vec();
             let started_at = handle.started_at();
-            let handle = stats::serve(bind, move || Snapshot::gather(started_at, &algos))
+            let published_key = address::encode_authority_key(&pool_pubkey);
+            let handle = stats::serve(bind, move || {
+                Snapshot::gather(started_at, &algos, published_key.clone())
+            })
                 .map_err(|e| format!("--stats-bind {bind}: {e}"))?;
             println!(
                 "[pool] read-only stats JSON on {} at /stats. Do not publish this port.",

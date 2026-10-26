@@ -49,11 +49,18 @@ fn request(addr: SocketAddr, line: &str) -> (String, String) {
     (head.to_string(), body.to_string())
 }
 
+/// The key the endpoint should publish, checked below. Any base58 string
+/// will do here: what matters is that whatever the pool was given comes back
+/// out, because a miner pastes it into --sv2-authority and a wrong one is
+/// worse than none.
+const PUBLISHED_KEY: &str = "9cZsf3kvbayTC4M2bamzCoHkmcSneX68fb7Yc3JEfwtEsk2cXDA";
+
 fn serve(rig: &Rig) -> stats::StatsHandle {
     let algos: Vec<_> = rig.pool.algos().to_vec();
     let started_at = rig.pool.started_at();
+    let authority = PUBLISHED_KEY.to_string();
     stats::serve("127.0.0.1:0".parse().unwrap(), move || {
-        Snapshot::gather(started_at, &algos)
+        Snapshot::gather(started_at, &algos, authority.clone())
     })
     .expect("the stats listener should bind")
 }
@@ -146,6 +153,12 @@ fn shares_move_the_counters_and_an_estimate_appears() {
     );
     assert!(body.contains("\"estimated_hashrate\""), "{body}");
     assert!(body.contains("\"share_target\""), "{body}");
+    // Published verbatim, so a miner can paste it straight into
+    // --sv2-authority without the operator reading it out of a log.
+    assert!(
+        body.contains(&format!("\"authority_public_key\": \"{PUBLISHED_KEY}\"")),
+        "{body}"
+    );
     // blocks_submitted, not blocks_found: SubmitSolution has no reply, so the
     // pool cannot know what the node did with it.
     assert!(body.contains("\"blocks_submitted\""), "{body}");

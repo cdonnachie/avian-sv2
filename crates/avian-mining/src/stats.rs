@@ -41,6 +41,15 @@ const ADDRESS_PREFIX: usize = 8;
 /// Everything the endpoint reports, gathered in one pass.
 pub struct Snapshot {
     pub uptime: Duration,
+    /// The pool's authority public key, base58, as a miner would paste it.
+    ///
+    /// Reported rather than left to the operator to copy out of a log,
+    /// because a miner that does not pin this gets an encrypted connection
+    /// that authenticates nobody. Taken from the running key, so it cannot
+    /// drift from the one in use: publishing a stale authority key is worse
+    /// than publishing none, since a miner would pin to something that either
+    /// fails or belongs to whoever holds it now.
+    pub authority_public_key: String,
     /// There is no persistence, so every count below starts at this process's
     /// start. The endpoint says so rather than leaving it to be assumed.
     pub algorithms: Vec<AlgoSnapshot>,
@@ -114,7 +123,11 @@ fn hex_reversed(bytes: &[u8; 32]) -> String {
 }
 
 impl Snapshot {
-    pub fn gather(started_at: Instant, algos: &[Arc<AlgoContext>]) -> Self {
+    pub fn gather(
+        started_at: Instant,
+        algos: &[Arc<AlgoContext>],
+        authority_public_key: String,
+    ) -> Self {
         let now = Instant::now();
         let algorithms = algos
             .iter()
@@ -164,6 +177,7 @@ impl Snapshot {
             .collect();
         Snapshot {
             uptime: now.saturating_duration_since(started_at),
+            authority_public_key,
             algorithms,
         }
     }
@@ -183,6 +197,12 @@ impl Snapshot {
             "  \"counters_since\": \"pool start, there is no persistence\",\n  \
              \"vardiff\": false,\n",
         );
+        // base58 has no quote, backslash or control character in its
+        // alphabet, so this needs no escaping the way a worker label does.
+        out.push_str(&format!(
+            "  \"authority_public_key\": \"{}\",\n",
+            self.authority_public_key
+        ));
         out.push_str("  \"miners\": ");
         let miners: usize = self.algorithms.iter().map(|algo| algo.channels.len()).sum();
         out.push_str(&format!("{miners},\n"));
@@ -455,6 +475,7 @@ mod tests {
     fn an_empty_pool_still_renders_valid_json() {
         let snapshot = Snapshot {
             uptime: Duration::from_secs(42),
+            authority_public_key: "9cZsf3kvbayTC4M2bamzCoHkmcSneX68fb7Yc3JEfwtEsk2cXDA".into(),
             algorithms: vec![],
         };
         let json = snapshot.to_json();

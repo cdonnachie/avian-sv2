@@ -1,0 +1,19 @@
+# Docker sends the whole context to the daemon before the build starts, and
+# walks every file to do it. target/ is two gigabytes of build output that the
+# image rebuilds from source anyway, so sending it buys nothing and costs the
+# entire transfer.
+#
+# This matters for the named build contexts the miner and pool images use
+# (--build-context avian-sv2=../avian-sv2). Building through
+# scripts/stage-sources.sh in avian-sv2-deploy sidesteps it by exporting
+# tracked files only, but building straight from a checkout does not.
+target/
+
+# Not read by any build here: nothing uses git describe or a vergen-style
+# build script.
+.git/
+.gitignore
+
+*.swp
+*~
+.DS_Store
