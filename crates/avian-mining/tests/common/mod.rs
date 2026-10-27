@@ -126,7 +126,7 @@ impl Rig {
     }
 
     pub fn client_config(&self, pow: PowType) -> ClientConfig {
-        let mut config = ClientConfig::new(self.pool.mining_addr(), pow);
+        let mut config = ClientConfig::new(vec![self.pool.mining_addr()], pow);
         config.pool_authority = Some(self.pool_authority);
         config.user_identity = format!("{}.test-rig", worker_address());
         config.timeout = Duration::from_secs(30);

@@ -232,6 +232,37 @@ impl Connection {
     /// `authority` is the pool authority x-only public key. Passing `None` is
     /// trust on first use: the handshake still runs, but nothing says the key
     /// that signed the certificate is the one that should have.
+    /// Tries each address in turn, returning the first connection that
+    /// succeeds. A name that resolves to several addresses usually has
+    /// something listening on only one of them, so giving up after the
+    /// first is how `--sv2=localhost:3333` came to fail silently on
+    /// Windows.
+    pub fn connect_any(
+        addrs: &[SocketAddr],
+        authority: Option<XOnlyPublicKey>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let mut last = None;
+        for addr in addrs {
+            match Self::connect(*addr, authority, timeout) {
+                Ok(conn) => return Ok(conn),
+                // Kept, so the caller can say which address refused rather
+                // than retrying for ever against one of several and never
+                // naming it. This crate has no logger and should not grow one
+                // to say this.
+                Err(err) => last = Some(format!("{addr}: {err}")),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            match last {
+                Some(why) => format!("no pool address accepted a connection, last was {why}"),
+                None => "pool resolved to nothing".to_string(),
+            },
+        )
+        .into())
+    }
+
     pub fn connect(
         addr: SocketAddr,
         authority: Option<XOnlyPublicKey>,

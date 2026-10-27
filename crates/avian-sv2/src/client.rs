@@ -56,7 +56,12 @@ const TRACE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    pub pool: SocketAddr,
+    /// Every address the pool name resolved to, in the order the
+    /// resolver gave them. All of them, because a name commonly
+    /// resolves to both an IPv6 and an IPv4 address and only one of
+    /// them may have anything listening: `localhost` on Windows yields
+    /// ::1 first, and a pool published by Docker is IPv4 only.
+    pub pool: Vec<SocketAddr>,
     /// The pool's authority x-only public key. `None` is trust on first use:
     /// the session is still encrypted, but nothing says the peer is the pool
     /// you meant.
@@ -83,7 +88,7 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
-    pub fn new(pool: SocketAddr, pow: PowType) -> Self {
+    pub fn new(pool: Vec<SocketAddr>, pow: PowType) -> Self {
         Self {
             pool,
             pool_authority: None,
@@ -687,7 +692,8 @@ impl MiningClient {
     }
 
     fn open_session(config: &ClientConfig, trace: &mut Vec<Trace>) -> Result<Session> {
-        let conn = Connection::connect(config.pool, config.pool_authority, config.timeout)?;
+        let conn =
+            Connection::connect_any(&config.pool, config.pool_authority, config.timeout)?;
         let (reader, writer) = conn.split();
         let mut session = Session {
             reader,

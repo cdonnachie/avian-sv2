@@ -238,17 +238,27 @@ unsafe fn text(pointer: *const c_char) -> Option<String> {
 
 fn build_config(raw: &AvianSv2ClientConfig) -> Result<ClientConfig, &'static str> {
     let pool = unsafe { text(raw.pool) }.ok_or("pool must be a NUL-terminated UTF-8 string")?;
-    let addr = pool
+    let mut addrs: Vec<_> = pool
         .to_socket_addrs()
         .map_err(|_| "pool could not be resolved")?
-        .next()
-        .ok_or("pool resolved to nothing")?;
-    if !addr.ip().is_loopback() && raw.allow_public_pool == 0 {
-        return Err("refusing a pool that is not loopback; set allow_public_pool to connect to it");
+        .collect();
+    if addrs.is_empty() {
+        return Err("pool resolved to nothing");
+    }
+    if raw.allow_public_pool == 0 {
+        // Drop rather than reject outright: a name can resolve to a loopback
+        // address and a routable one at once, and the loopback one is the
+        // one that was meant.
+        addrs.retain(|a| a.ip().is_loopback());
+        if addrs.is_empty() {
+            return Err(
+                "refusing a pool that is not loopback; set allow_public_pool to connect to it",
+            );
+        }
     }
     let pow = pow_from_c(raw.pow_type).ok_or("pow_type must be 0 (x16rt) or 1 (minotaurx)")?;
 
-    let mut config = ClientConfig::new(addr, pow);
+    let mut config = ClientConfig::new(addrs, pow);
     if let Some(hex) = unsafe { text(raw.authority_hex) } {
         config.pool_authority = Some(parse_authority(&hex)?);
     }
