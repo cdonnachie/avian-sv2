@@ -280,8 +280,10 @@ impl AlgoContext {
     fn remember_block(&self, channel_id: u32, sequence_number: u32, hash: [u8; 32]) {
         if let Ok(mut pending) = self.pending.lock() {
             pending.push_back((channel_id, sequence_number, hash));
-            // A dozen rounds is generous. Past that it lost a race, and the
-            // pool has no way to know that rather than guess it.
+            // Sixteen unconfirmed blocks, not sixteen rounds: one that
+            // becomes the tip is removed by confirm_tip, so only blocks that
+            // look like they lost a race accumulate here, and the pool cannot
+            // tell those from one whose tip announcement has not arrived yet.
             while pending.len() > 16 {
                 pending.pop_front();
             }
