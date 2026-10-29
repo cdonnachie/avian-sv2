@@ -44,7 +44,7 @@ macro_rules! rig {
 /// The milestone, now routed through the library.
 #[test]
 fn a_miner_mines_a_regtest_block_through_the_pool() {
-    let rig = rig!("milestone", 10, &[PowType::X16rt, PowType::MinotaurX], 0);
+    let rig = rig!("milestone", 10, &[PowType::X16rt, PowType::MinotaurX], None);
 
     for pow in [PowType::X16rt, PowType::MinotaurX] {
         let before = rig.node.height();
@@ -98,7 +98,7 @@ fn a_miner_mines_a_regtest_block_through_the_pool() {
 /// then quietly held to a fixed version.
 #[test]
 fn a_version_rolling_request_is_refused_rather_than_answered() {
-    let rig = rig!("rolling", 11, &[PowType::X16rt], 0);
+    let rig = rig!("rolling", 11, &[PowType::X16rt], None);
     match raw_setup(
         &rig,
         flags::REQUIRES_STANDARD_JOBS | flags::REQUIRES_VERSION_ROLLING,
@@ -119,7 +119,7 @@ fn a_version_rolling_request_is_refused_rather_than_answered() {
 
 #[test]
 fn setup_success_always_sets_fixed_version_and_never_extended_channels() {
-    let rig = rig!("flags", 12, &[PowType::X16rt], 0);
+    let rig = rig!("flags", 12, &[PowType::X16rt], None);
     match raw_setup(&rig, flags::REQUIRES_STANDARD_JOBS) {
         SetupAnswer::Success { flags: answered } => {
             assert_ne!(
@@ -139,7 +139,7 @@ fn setup_success_always_sets_fixed_version_and_never_extended_channels() {
 
 #[test]
 fn a_miner_that_cannot_take_standard_jobs_is_refused() {
-    let rig = rig!("stdjobs", 13, &[PowType::X16rt], 0);
+    let rig = rig!("stdjobs", 13, &[PowType::X16rt], None);
     match raw_setup(&rig, 0) {
         SetupAnswer::Error { flags: named, code } => {
             assert_eq!(code, "unsupported-feature-flags");
@@ -153,7 +153,7 @@ fn a_miner_that_cannot_take_standard_jobs_is_refused() {
 /// requires it of the pool: every failure mode it prevents is silent.
 #[test]
 fn the_extension_is_required_of_a_miner_too() {
-    let rig = rig!("extreq", 14, &[PowType::X16rt], 0);
+    let rig = rig!("extreq", 14, &[PowType::X16rt], None);
     let (unsupported, required, accepted) = raw_request_extensions(&rig, &[0x0002]);
     assert!(!accepted);
     assert_eq!(unsupported, vec![0x0002]);
@@ -173,7 +173,7 @@ fn the_extension_is_required_of_a_miner_too() {
 /// algorithm switch.
 #[test]
 fn the_algorithm_reply_reports_a_zero_version_rolling_mask() {
-    let rig = rig!("algomask", 15, &[PowType::MinotaurX], 0);
+    let rig = rig!("algomask", 15, &[PowType::MinotaurX], None);
     let miner = rig.miner(PowType::MinotaurX);
     let entries = trace(&miner);
     let mask = entries
@@ -206,7 +206,7 @@ fn the_algorithm_reply_reports_a_zero_version_rolling_mask() {
 /// instant is idle."
 #[test]
 fn constraints_precede_the_set_new_prev_hash_that_activates_a_job() {
-    let rig = rig!("ordering", 16, &[PowType::X16rt], 0);
+    let rig = rig!("ordering", 16, &[PowType::X16rt], None);
     let miner = rig.miner(PowType::X16rt);
     let entries = trace(&miner);
     let job_id = miner.active_job().expect("an active job").job_id;
@@ -242,7 +242,7 @@ fn constraints_precede_the_set_new_prev_hash_that_activates_a_job() {
 /// so every connection meets that case before it meets the other.
 #[test]
 fn the_first_job_on_a_channel_is_a_future_job() {
-    let rig = rig!("futurejob", 17, &[PowType::X16rt], 0);
+    let rig = rig!("futurejob", 17, &[PowType::X16rt], None);
     let miner = rig.miner(PowType::X16rt);
     let entries = trace(&miner);
     let first = entries
@@ -265,7 +265,7 @@ fn the_first_job_on_a_channel_is_a_future_job() {
 /// active job at all is half the assertion; this pins the value too.
 #[test]
 fn the_activation_ntime_equals_the_jobs_ntime_min() {
-    let rig = rig!("ntimeagree", 18, &[PowType::X16rt], 0);
+    let rig = rig!("ntimeagree", 18, &[PowType::X16rt], None);
     let miner = rig.miner(PowType::X16rt);
     let job = miner.active_job().expect("an active job");
     let entries = trace(&miner);
@@ -292,7 +292,7 @@ fn the_activation_ntime_equals_the_jobs_ntime_min() {
 /// The two things the extension exists to stop, refused rather than mined.
 #[test]
 fn a_rolled_version_or_an_out_of_window_ntime_is_refused() {
-    let rig = rig!("refusals", 19, &[PowType::X16rt], 0);
+    let rig = rig!("refusals", 19, &[PowType::X16rt], None);
     let mut miner = rig.miner(PowType::X16rt);
     let job = miner.active_job().expect("an active job").clone();
     let (nonce, ntime) = find_share(&job, 400).expect("a share should be findable");
@@ -345,7 +345,7 @@ fn a_share_below_the_network_target_is_accepted_but_not_submitted() {
     // because the share target was being computed harder than the network
     // target rather than easier. It therefore asserted the inverted
     // behaviour, and never checked the property its name describes.
-    let rig = rig!("sharediff", 20, &[PowType::X16rt], 8);
+    let rig = rig!("sharediff", 20, &[PowType::X16rt], Some([0xff; 32]));
     let mut miner = rig.miner(PowType::X16rt);
     let job = miner.active_job().expect("an active job").clone();
 
@@ -394,7 +394,7 @@ fn a_share_below_the_network_target_is_accepted_but_not_submitted() {
 
 #[test]
 fn a_duplicate_share_is_refused() {
-    let rig = rig!("duplicate", 21, &[PowType::X16rt], 0);
+    let rig = rig!("duplicate", 21, &[PowType::X16rt], None);
     let mut miner = rig.miner(PowType::X16rt);
     let job = miner.active_job().expect("an active job").clone();
     let (nonce, ntime) = find_share(&job, 400).expect("a share");
@@ -429,7 +429,7 @@ fn a_duplicate_share_is_refused() {
 /// Two algorithms, two channels, two independent job streams.
 #[test]
 fn each_algorithm_gets_its_own_channel_and_job_stream() {
-    let rig = rig!("twoalgos", 22, &[PowType::X16rt, PowType::MinotaurX], 0);
+    let rig = rig!("twoalgos", 22, &[PowType::X16rt, PowType::MinotaurX], None);
     let x16rt = rig.miner(PowType::X16rt);
     let minotaurx = rig.miner(PowType::MinotaurX);
 
@@ -458,7 +458,7 @@ fn each_algorithm_gets_its_own_channel_and_job_stream() {
 /// handshake and opens a new channel.
 #[test]
 fn a_miner_reconnects_after_the_connection_drops_and_resumes_mining() {
-    let rig = rig!("reconnect-down", 23, &[PowType::X16rt], 0);
+    let rig = rig!("reconnect-down", 23, &[PowType::X16rt], None);
     let mut miner = rig.miner(PowType::X16rt);
 
     let first_generation = miner.generation();
@@ -512,7 +512,7 @@ fn a_miner_reconnects_after_the_connection_drops_and_resumes_mining() {
 /// the generation counter exists.
 #[test]
 fn work_from_before_a_reconnect_cannot_be_submitted() {
-    let rig = rig!("reconnect-stale", 24, &[PowType::X16rt], 0);
+    let rig = rig!("reconnect-stale", 24, &[PowType::X16rt], None);
     let mut miner = rig.miner(PowType::X16rt);
     let stale = miner.active_job().expect("a job").clone();
 
@@ -542,7 +542,7 @@ fn the_pool_reconnects_to_the_node_and_resumes_serving() {
         return;
     };
     node.mine(101);
-    let Some(mut rig) = Rig::attach(node, &[PowType::X16rt], 0) else {
+    let Some(mut rig) = Rig::attach(node, &[PowType::X16rt], None) else {
         return;
     };
 

@@ -21,9 +21,18 @@
 //!   because a worker that keeps failing has been told something it is not
 //!   acting on and will never find a block
 //!
-//! What is deliberately absent is vardiff. The honest answer to a worker
-//! flooding cheap shares is usually to raise its target, and that is vardiff,
-//! which is entangled with this and deferred. The share target here is fixed.
+//! The budget is sized from the pool's configured shares a minute, not from
+//! anything the worker said. Each channel's target is derived so that it
+//! averages that cadence, so the expected rate is the same for every channel
+//! by construction and `nominal_hash_rate` never reaches this file. That is
+//! the point: it was the one unverifiable, worker-supplied number on the path
+//! that decides whether the pool spends a hash.
+//!
+//! It also decides what happens to a worker that understates itself. It is
+//! handed a target that is too easy, finds shares far faster than the pool
+//! asked for, and is refused here rather than served. Raising its target
+//! instead would be vardiff, which stays out: the target is set once, when
+//! the channel opens, and never moves.
 
 use std::time::Instant;
 
@@ -37,18 +46,15 @@ pub struct RateLimitConfig {
     /// expected rate will exceed it often over short windows. This is the
     /// headroom for that, not a licence to flood.
     pub tolerance: f64,
-    /// Allowed regardless of the expected rate, so a slow worker is not
-    /// throttled to nothing by arithmetic.
+    /// Allowed regardless of the expected rate, so that a pool configured for
+    /// a very slow cadence does not throttle its workers to nothing.
     pub floor_per_second: f64,
-    /// A hard ceiling, because the expected rate is derived in part from a
-    /// number the worker supplied.
+    /// A hard ceiling, for a pool configured for an absurd one. Every admitted
+    /// submission costs a full X16RT or MinotaurX hash, so this is the bound
+    /// on what a single channel can make the pool spend.
     pub ceiling_per_second: f64,
     /// How many submissions may arrive at once.
     pub burst: f64,
-    /// `nominal_hash_rate` above this is ignored. The field is worker-supplied
-    /// and unverifiable: a worker claiming a petahash would otherwise be
-    /// granting itself an unlimited budget.
-    pub max_nominal_hash_rate: f64,
     /// Invalid submissions before the channel is dropped, in the spirit of
     /// the node's `-sv2maxrejects`.
     pub max_invalid: u32,
@@ -58,12 +64,12 @@ impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
             tolerance: 8.0,
-            floor_per_second: 2.0,
+            // The expected rate no longer depends on the worker, so this is
+            // a guard for a very low configured cadence rather than the
+            // allowance every slow worker used to land on.
+            floor_per_second: 1.0,
             ceiling_per_second: 50.0,
             burst: 16.0,
-            // 1 TH/s. Far above any Avian CPU or GPU miner, and far below a
-            // number that would make the ceiling irrelevant.
-            max_nominal_hash_rate: 1e12,
             max_invalid: 50,
         }
     }
@@ -84,20 +90,15 @@ pub fn target_probability(target: &[u8; 32]) -> f64 {
     probability
 }
 
-/// Shares per second a worker claiming `nominal_hash_rate` should find at
-/// `target`.
-pub fn expected_share_rate(
-    target: &[u8; 32],
-    nominal_hash_rate: f32,
-    config: &RateLimitConfig,
-) -> f64 {
-    let claimed = (nominal_hash_rate as f64)
-        .max(0.0)
-        .min(config.max_nominal_hash_rate);
-    if !claimed.is_finite() {
+/// Shares per second a channel aiming at `shares_per_minute` should find.
+///
+/// Every channel's target is derived to hit that cadence, so this is the
+/// expected rate for all of them and the worker's own figures do not appear.
+pub fn expected_share_rate(shares_per_minute: f64) -> f64 {
+    if !shares_per_minute.is_finite() || shares_per_minute <= 0.0 {
         return 0.0;
     }
-    claimed * target_probability(target)
+    shares_per_minute / 60.0
 }
 
 /// What the limiter decided.
@@ -122,10 +123,10 @@ pub struct Limiter {
 }
 
 impl Limiter {
-    /// Sizes the bucket from the channel's target and the hash rate the worker
-    /// claimed.
-    pub fn new(target: &[u8; 32], nominal_hash_rate: f32, config: RateLimitConfig) -> Self {
-        let expected = expected_share_rate(target, nominal_hash_rate, &config);
+    /// Sizes the bucket from the cadence the pool asked every channel to aim
+    /// at, which is the same for all of them.
+    pub fn new(shares_per_minute: f64, config: RateLimitConfig) -> Self {
+        let expected = expected_share_rate(shares_per_minute);
         let rate = (expected * config.tolerance)
             .max(config.floor_per_second)
             .min(config.ceiling_per_second);
@@ -229,37 +230,37 @@ mod tests {
         assert_eq!(target_probability(&[0u8; 32]), 0.0);
     }
 
-    #[test]
-    fn the_expected_rate_ignores_an_absurd_hash_rate_claim() {
-        let config = RateLimitConfig::default();
-        let honest = expected_share_rate(&regtest_target(), 1.0, &config);
-        assert!((0.49..0.51).contains(&honest), "{honest}");
+    /// Thirty shares a minute is half a share a second, which at eight times
+    /// tolerance is four a second: above the floor and below the ceiling, so
+    /// neither clamp hides what the tests below are checking.
+    const UNCLAMPED: f64 = 30.0;
 
-        // A worker claiming a petahash is clamped to the configured maximum,
-        // so its budget stops growing with its claim. The comparison is
-        // approximate because nominal_hash_rate is an f32 and neither 1e12 nor
-        // 1e15 is exact in one.
-        let absurd = expected_share_rate(&regtest_target(), 1e15, &config);
-        let ceiling = config.max_nominal_hash_rate * target_probability(&regtest_target());
-        assert!(
-            absurd <= ceiling * 1.001,
-            "a petahash claim bought {absurd}, and the cap is {ceiling}"
-        );
-        // And what actually matters: the budget is the same either way,
-        // because both land on the ceiling.
-        assert_eq!(
-            Limiter::new(&regtest_target(), 1e15, config).rate(),
-            Limiter::new(&regtest_target(), 1e12, config).rate()
-        );
+    #[test]
+    fn the_expected_rate_is_the_configured_cadence() {
+        assert_eq!(expected_share_rate(60.0), 1.0);
+        assert_eq!(expected_share_rate(UNCLAMPED), 0.5);
+        assert_eq!(expected_share_rate(4.5), 4.5 / 60.0);
+        // Unusable configuration buys nothing rather than an endless budget.
+        assert_eq!(expected_share_rate(0.0), 0.0);
+        assert_eq!(expected_share_rate(-1.0), 0.0);
+        assert_eq!(expected_share_rate(f64::NAN), 0.0);
+        assert_eq!(expected_share_rate(f64::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn the_default_cadence_lands_on_the_floor() {
+        // 4.5 a minute at eight times tolerance is 0.6 a second, under the
+        // floor, so every channel on the default configuration gets the floor.
+        // Worth pinning: it is the allowance almost every real channel has.
+        let config = RateLimitConfig::default();
+        let limiter = Limiter::new(4.5, config);
+        assert_eq!(limiter.rate(), config.floor_per_second);
     }
 
     #[test]
     fn a_limiter_lets_a_burst_through_and_then_throttles() {
         let config = RateLimitConfig::default();
-        let mut limiter = Limiter::new(&regtest_target(), 1.0, config);
-        // Half a share a second at eight times tolerance is four a second,
-        // which is above the floor and below the ceiling, so neither clamp
-        // applies.
+        let mut limiter = Limiter::new(UNCLAMPED, config);
         let rate = limiter.rate();
         assert!(
             (3.9..4.1).contains(&rate),
@@ -281,7 +282,7 @@ mod tests {
     #[test]
     fn tokens_come_back_with_time() {
         let config = RateLimitConfig::default();
-        let mut limiter = Limiter::new(&regtest_target(), 1.0, config);
+        let mut limiter = Limiter::new(UNCLAMPED, config);
         let start = Instant::now();
         for _ in 0..config.burst as u32 {
             limiter.admit_at(start);
@@ -308,10 +309,8 @@ mod tests {
         // correctly. Ten minutes of simulated mining, submitting on the
         // expected interval.
         let config = RateLimitConfig::default();
-        let target = regtest_target();
-        let hash_rate = 20.0f32;
-        let expected = expected_share_rate(&target, hash_rate, &config);
-        let mut limiter = Limiter::new(&target, hash_rate, config);
+        let expected = expected_share_rate(UNCLAMPED);
+        let mut limiter = Limiter::new(UNCLAMPED, config);
 
         let interval = Duration::from_secs_f64(1.0 / expected);
         let mut now = Instant::now();
@@ -333,7 +332,7 @@ mod tests {
             max_invalid: 3,
             ..RateLimitConfig::default()
         };
-        let mut limiter = Limiter::new(&regtest_target(), 1.0, config);
+        let mut limiter = Limiter::new(UNCLAMPED, config);
         let now = Instant::now();
         for _ in 0..3 {
             assert_eq!(limiter.admit_at(now), Decision::Allow);
@@ -348,7 +347,7 @@ mod tests {
         // Otherwise a flood would be punished twice, and a worker whose only
         // sin is being fast would be dropped as if it were sending rubbish.
         let config = RateLimitConfig::default();
-        let mut limiter = Limiter::new(&regtest_target(), 1.0, config);
+        let mut limiter = Limiter::new(UNCLAMPED, config);
         let now = Instant::now();
         for _ in 0..100 {
             limiter.admit_at(now);
@@ -359,10 +358,11 @@ mod tests {
     }
 
     #[test]
-    fn a_very_fast_worker_is_capped_by_the_ceiling() {
+    fn an_absurd_configured_cadence_is_capped_by_the_ceiling() {
         let config = RateLimitConfig::default();
-        // A claim that would otherwise buy an enormous rate.
-        let limiter = Limiter::new(&regtest_target(), 1e9, config);
+        // An operator asking for a thousand shares a minute would otherwise
+        // let one channel spend 133 hashes a second of the pool's time.
+        let limiter = Limiter::new(1000.0, config);
         assert_eq!(limiter.rate(), config.ceiling_per_second);
     }
 }

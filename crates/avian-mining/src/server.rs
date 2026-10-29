@@ -76,10 +76,45 @@ pub struct ServerConfig {
     /// published port to reach it, which is a deliberate act by whoever wrote
     /// the deployment rather than something to allow quietly.
     pub allow_public_bind: bool,
-    /// How many halvings below the network target a share must be. Zero makes
-    /// the share target the network target, which on regtest is the
-    /// algorithm's own floor, so nearly every share is also a block.
-    pub share_target_shift: u32,
+    /// How many shares a minute each channel should average.
+    ///
+    /// Each channel's target is derived from this and the hash rate the worker
+    /// declared when it opened, so a 1 kH/s CPU and a 25 MH/s card aim at the
+    /// same cadence instead of differing by the ratio of their hardware. There
+    /// is still no vardiff: the target is set once and never moves, so a
+    /// worker whose declaration was wrong keeps a cadence that is wrong by the
+    /// same factor for the life of the channel.
+    ///
+    /// Nothing is paid by share weight here, so that costs a dashboard some
+    /// liveliness and costs nobody any money. On a pool that shared a reward
+    /// it would not be an acceptable trade.
+    pub shares_per_minute: f64,
+    /// The slowest worker the pool will believe in, in hashes a second.
+    ///
+    /// A declaration below this is raised to it. `nominal_hash_rate` is
+    /// worker-supplied and unverifiable, and a worker that never sets it sends
+    /// 1.0, which would otherwise derive a target of a few dozen hashes a
+    /// share. Erring upwards costs an honestly slow worker part of its cadence
+    /// and costs the pool nothing, which is not true of the other direction.
+    pub min_hash_rate: f64,
+    /// The fastest, for the same reason the other way about: a worker claiming
+    /// a petahash would be handed a target nothing it owns can meet, and would
+    /// sit there submitting nothing at all.
+    pub max_hash_rate: f64,
+    /// A share target set outright, instead of derived from the declaration.
+    ///
+    /// For regtest, where the derivation cannot do anything useful: one
+    /// share's worth of work at any believable hash rate is already more than
+    /// a regtest block, so the derived target always clamps to the network
+    /// target and every share is also a block. That is correct, but it leaves
+    /// no way to exercise a share that is not a block, which is most of what
+    /// share handling does.
+    ///
+    /// Still bounded by the network target at the hard end and by the worker's
+    /// own `max_target`, so it cannot lose a block or hand out a target the
+    /// worker said it could not take. There is deliberately no command-line
+    /// flag for it: on a real chain the cadence is the thing to set.
+    pub share_target_override: Option<[u8; 32]>,
     pub rate_limit: RateLimitConfig,
 }
 
@@ -115,7 +150,63 @@ impl ServerConfig {
                 "an operator fee address was configured with a fee of zero".into(),
             ));
         }
+        if !self.shares_per_minute.is_finite() || self.shares_per_minute <= 0.0 {
+            return Err(Error::Protocol(format!(
+                "shares per minute must be above zero, not {}",
+                self.shares_per_minute
+            )));
+        }
+        if !self.min_hash_rate.is_finite() || self.min_hash_rate <= 0.0 {
+            return Err(Error::Protocol(format!(
+                "the slowest believed hash rate must be above zero, not {}",
+                self.min_hash_rate
+            )));
+        }
+        if !(self.max_hash_rate >= self.min_hash_rate) {
+            return Err(Error::Protocol(format!(
+                "the fastest believed hash rate ({}) is below the slowest ({})",
+                self.max_hash_rate, self.min_hash_rate
+            )));
+        }
         Ok(())
+    }
+
+    /// The target one channel's shares are judged against.
+    ///
+    /// Derived from the hash rate the worker declared, so that it averages
+    /// [`Self::shares_per_minute`], then bounded at the hard end by the
+    /// network target itself: a share must never be rarer than a block. On
+    /// regtest the network target is the algorithm's own floor, so that bound
+    /// is the one that applies and nearly every share is also a block.
+    ///
+    /// The easy end needs no separate bound. [`Self::min_hash_rate`] is what
+    /// limits how easy the derivation can get, and the per-channel submission
+    /// limiter is sized from `shares_per_minute` rather than from anything the
+    /// worker said, so a worker that understates itself gets more shares than
+    /// it should and is refused by the limiter rather than served by the pool.
+    pub fn share_target(&self, declared: f32, network_target: &[u8; 32]) -> [u8; 32] {
+        let target = match self.share_target_override {
+            Some(target) => target,
+            None => {
+                let declared = f64::from(declared);
+                // Not `clamp`, which panics on a NaN bound and would pass a
+                // NaN declaration straight through.
+                let believed = if declared.is_finite() {
+                    declared.max(self.min_hash_rate).min(self.max_hash_rate)
+                } else {
+                    self.min_hash_rate
+                };
+                let work = block::hashes_per_share_for(believed, self.shares_per_minute);
+                // Saturating, which is what `as` does to a float too large to
+                // fit an integer.
+                block::target_for_hashes_per_share(work as u128)
+            }
+        };
+        if block::meets_target(network_target, &target) {
+            target
+        } else {
+            *network_target
+        }
     }
 }
 
@@ -551,15 +642,10 @@ impl Server {
             Error::Protocol("no template has arrived yet, so there is no target to set".into())
         })?;
 
-        // The share target is the network target made easier by a fixed
-        // number of halvings, then clamped to whatever the worker said it
-        // could accept. There is no vardiff.
-        //
-        // Easier, not harder. This called harder_by, which divides the target
-        // and so made a share rarer than a block: with the shift at its old
-        // default of zero the two were identical and every accepted share was
-        // a block, and raising it to see more shares produced fewer.
-        let mut share_target = block::easier_by(&prev.target, self.config.share_target_shift);
+        // Derived from the rate this worker declared, so it aims at the
+        // configured cadence rather than at a fixed distance below the network
+        // target, then clamped to whatever the worker said it could accept.
+        let mut share_target = self.config.share_target(nominal_hash_rate, &prev.target);
         if !block::meets_target(&share_target, &worker_max_target) {
             share_target = worker_max_target;
         }
@@ -609,7 +695,7 @@ impl Server {
             parsed.worker.clone(),
             parsed.address_text.clone(),
             self.config.coinbase_tag.clone(),
-            nominal_hash_rate,
+            self.config.shares_per_minute,
             self.config.rate_limit,
             writer.clone(),
         ));
@@ -961,4 +1047,161 @@ fn select_algorithm(
         &payload,
     )?;
     Ok(pow)
+}
+
+#[cfg(test)]
+mod share_target_tests {
+    use super::*;
+    use crate::stats::hashes_per_share;
+
+    /// Regtest's own target: the algorithm's floor, met by about half of all
+    /// nonces.
+    fn regtest_target() -> [u8; 32] {
+        let mut target = [0u8; 32];
+        target[31] = 0x7f;
+        target[30] = 0xff;
+        target[29] = 0xff;
+        target
+    }
+
+    /// A network target of one: harder than any target the derivation can
+    /// produce, so the never-rarer-than-a-block bound cannot fire and the
+    /// derivation itself is what is under test. Absurd as a real chain, which
+    /// is why it is only here.
+    fn no_block_bound() -> [u8; 32] {
+        let mut target = [0u8; 32];
+        target[0] = 0x01;
+        target
+    }
+
+    fn config(shares_per_minute: f64) -> ServerConfig {
+        ServerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            authority: Keypair::from_seckey_slice(&secp256k1::Secp256k1::new(), &[1u8; 32])
+                .unwrap(),
+            cert_validity: 3600,
+            network: Network::Regtest,
+            fee_script: Vec::new(),
+            fee_basis_points: 0,
+            coinbase_tag: b"/test/".to_vec(),
+            allow_public_bind: false,
+            shares_per_minute,
+            min_hash_rate: 1000.0,
+            max_hash_rate: 1e12,
+            share_target_override: None,
+            rate_limit: RateLimitConfig::default(),
+        }
+    }
+
+    #[test]
+    fn a_declared_rate_becomes_the_cadence_the_pool_asked_for() {
+        // The first row is this machine's measured MinotaurX rate; the third
+        // is the RX 6900 XT on X16RT. They differ by a factor of 1400 and must
+        // come out at the same cadence, which is the whole point.
+        for (declared, shares_per_minute) in [
+            (17_440.0f32, 4.5f64),
+            (1_200.0, 4.5),
+            (25_000_000.0, 6.0),
+            (1_000_000.0, 1.0),
+        ] {
+            let target = config(shares_per_minute).share_target(declared, &no_block_bound());
+            let work = hashes_per_share(&target);
+            let want = f64::from(declared) * 60.0 / shares_per_minute;
+            assert!(
+                // Not exact: the work is truncated to an integer before the
+                // target is built, and `hashes_per_share` reads it back as
+                // `2^256 / (t + 1)` rather than `(2^256 - t) / (t + 1)`.
+                // Both are worth about one hash in a quarter million.
+                (work - want).abs() / want < 1e-4,
+                "{declared} H/s at {shares_per_minute} a minute wanted {want} \
+                 hashes a share and got {work}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declaration_below_the_floor_is_not_believed() {
+        let config = config(4.5);
+        // 1.0 is what a worker that never sets the field sends, and is the
+        // default in this library's own client. Taken at face value it would
+        // derive a target of thirteen hashes a share.
+        let unset = config.share_target(1.0, &no_block_bound());
+        let floored = config.share_target(config.min_hash_rate as f32, &no_block_bound());
+        assert_eq!(unset, floored);
+        assert!(
+            hashes_per_share(&unset) > 10_000.0,
+            "the protocol default was taken at face value"
+        );
+    }
+
+    #[test]
+    fn a_declaration_above_the_ceiling_is_capped() {
+        let config = config(4.5);
+        let work = hashes_per_share(&config.share_target(1e15, &no_block_bound()));
+        let want = config.max_hash_rate * 60.0 / config.shares_per_minute;
+        assert!(
+            (work - want).abs() / want < 1e-4,
+            "a petahash claim bought {work} hashes a share and the cap is {want}"
+        );
+        // Everything past the cap lands in the same place. Compared this
+        // way round rather than against `max_hash_rate as f32`, which is
+        // not 1e12: an f32 has 24 bits of mantissa and that needs 40.
+        assert_eq!(
+            config.share_target(1e15, &no_block_bound()),
+            config.share_target(1e20, &no_block_bound())
+        );
+    }
+
+    #[test]
+    fn an_unusable_declaration_falls_back_to_the_floor() {
+        let config = config(4.5);
+        let floored = config.share_target(config.min_hash_rate as f32, &no_block_bound());
+        for declared in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -5.0, 0.0] {
+            assert_eq!(
+                config.share_target(declared, &no_block_bound()),
+                floored,
+                "a declaration of {declared} should fall back to the floor"
+            );
+        }
+    }
+
+    #[test]
+    fn a_share_is_never_rarer_than_a_block() {
+        // On regtest one share's worth of work at any believable rate is more
+        // than a whole block, so the derivation is clamped and every share is
+        // also a block. Without this bound the pool would reject a hash that
+        // met the network target, which is to say it would throw away a block.
+        let network = regtest_target();
+        assert_eq!(config(4.5).share_target(17_440.0, &network), network);
+        assert_eq!(config(600.0).share_target(1_000.0, &network), network);
+    }
+
+    #[test]
+    fn an_override_replaces_the_derivation_but_not_the_block_bound() {
+        let mut config = config(4.5);
+        config.share_target_override = Some([0xff; 32]);
+        assert_eq!(config.share_target(17_440.0, &no_block_bound()), [0xff; 32]);
+        // An override harder than the network target would lose blocks the
+        // same way the derivation would, so it is bounded too.
+        let network = regtest_target();
+        config.share_target_override = Some(block::harder_by(&network, 40));
+        assert_eq!(config.share_target(17_440.0, &network), network);
+    }
+
+    #[test]
+    fn an_impossible_cadence_is_refused_at_startup() {
+        assert!(config(4.5).validate().is_ok());
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                config(bad).validate().is_err(),
+                "a cadence of {bad} should be refused"
+            );
+        }
+        let mut zero_floor = config(4.5);
+        zero_floor.min_hash_rate = 0.0;
+        assert!(zero_floor.validate().is_err());
+        let mut inverted = config(4.5);
+        inverted.max_hash_rate = 1.0;
+        assert!(inverted.validate().is_err());
+    }
 }

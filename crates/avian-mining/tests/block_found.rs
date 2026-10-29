@@ -22,7 +22,7 @@ use common::{find_share, Rig};
 
 macro_rules! rig {
     ($tag:expr, $slot:expr) => {
-        match Rig::start($tag, $slot, &[PowType::MinotaurX], 0) {
+        match Rig::start($tag, $slot, &[PowType::MinotaurX], None) {
             Some(rig) => rig,
             None => {
                 eprintln!("skipping: aviand or avian-cli not found");

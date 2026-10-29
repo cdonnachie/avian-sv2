@@ -60,7 +60,7 @@ fn extended_miner(rig: &Rig, pow: PowType, identity: &str) -> MiningClient {
 
 macro_rules! rig {
     ($tag:expr, $slot:expr, $algos:expr) => {
-        match Rig::start($tag, $slot, $algos, 0) {
+        match Rig::start($tag, $slot, $algos, None) {
             Some(rig) => rig,
             None => {
                 eprintln!("skipping: aviand or avian-cli not found");
@@ -154,7 +154,7 @@ fn the_miner_can_see_what_it_is_committing_to() {
         .expect("sendtoaddress");
     eprintln!("[test] mempool transaction {funded}");
 
-    let Some(rig) = Rig::attach(node, &[PowType::X16rt], 0) else {
+    let Some(rig) = Rig::attach(node, &[PowType::X16rt], None) else {
         return;
     };
     let mut miner = extended_miner(&rig, PowType::X16rt, WORKER_ADDRESS);

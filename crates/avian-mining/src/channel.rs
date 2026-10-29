@@ -134,7 +134,7 @@ impl Channel {
         worker: String,
         payout_address: String,
         coinbase_tag: Vec<u8>,
-        nominal_hash_rate: f32,
+        shares_per_minute: f64,
         rate_limit: RateLimitConfig,
         writer: Arc<Mutex<ConnectionWriter>>,
     ) -> Self {
@@ -167,7 +167,7 @@ impl Channel {
                 wants_work: false,
                 last_sequence: 0,
                 seen: HashSet::new(),
-                limiter: Limiter::new(&share_target, nominal_hash_rate, rate_limit),
+                limiter: Limiter::new(shares_per_minute, rate_limit),
             }),
         }
     }

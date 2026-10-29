@@ -163,6 +163,88 @@ pub fn easier_by(target: &[u8; 32], shift: u32) -> [u8; 32] {
     out
 }
 
+/// How much work one share should cost, for a worker at `hash_rate` hashes a
+/// second to average `shares_per_minute` of them.
+///
+/// The whole of the pool's share cadence is this one line. It is a function so
+/// that [`target_for_hashes_per_share`], which is meaningless without it, has
+/// something to point at.
+///
+/// Returns zero for an unusable rate, which yields the easiest target there
+/// is, so callers clamp the hash rate before asking rather than after.
+pub fn hashes_per_share_for(hash_rate: f64, shares_per_minute: f64) -> f64 {
+    if !hash_rate.is_finite() || !(shares_per_minute > 0.0) {
+        return 0.0;
+    }
+    hash_rate * 60.0 / shares_per_minute
+}
+
+/// The target at which finding a share costs `hashes_per_share` hashes.
+///
+/// A hash is a uniform draw from `2^256` values of which `t + 1` succeed, so
+/// the expected number of draws before one lands at or under `t` is
+/// `(2^256 - t) / (t + 1)`. Setting that equal to the work we want a share to
+/// cost and solving for `t` gives
+///
+/// ```text
+/// t = (2^256 - s) / (s + 1)
+/// ```
+///
+/// which is the same derivation the Stratum v2 reference implementation uses,
+/// so a worker built against another pool's arithmetic meets this one.
+///
+/// Little-endian, like every other target here.
+pub fn target_for_hashes_per_share(hashes_per_share: u128) -> [u8; 32] {
+    // No work per share would be the easiest target there is, and the formula
+    // divides by `s + 1`, so one is the floor rather than a special case.
+    let s = hashes_per_share.max(1);
+    // The division below holds its remainder in a u128 and shifts it a byte at
+    // a time, so the divisor needs eight bits of headroom. Callers clamp the
+    // hash rate far below this; saturating keeps one that stops doing so from
+    // wrapping into an easier target than it asked for.
+    let s = s.min((1u128 << 120) - 1);
+
+    // The numerator is 2^256 - s, which does not fit in 32 bytes written that
+    // way round, so build it as (2^256 - 1) - (s - 1). Big-endian, for the
+    // division.
+    let mut subtrahend = [0u8; 32];
+    let below = s - 1;
+    for i in 0..16 {
+        subtrahend[31 - i] = ((below >> (8 * i)) & 0xff) as u8;
+    }
+    let mut numerator = [0xffu8; 32];
+    let mut borrow = 0u16;
+    for i in (0..32).rev() {
+        let lhs = u16::from(numerator[i]);
+        let rhs = u16::from(subtrahend[i]) + borrow;
+        if lhs >= rhs {
+            numerator[i] = (lhs - rhs) as u8;
+            borrow = 0;
+        } else {
+            numerator[i] = (lhs + 256 - rhs) as u8;
+            borrow = 1;
+        }
+    }
+
+    // Long division, most significant byte first. Every remainder is below the
+    // divisor, so `remainder * 256 + byte` stays below `divisor * 256` and each
+    // quotient digit fits in a byte.
+    let divisor = s + 1;
+    let mut quotient = [0u8; 32];
+    let mut remainder = 0u128;
+    for i in 0..32 {
+        remainder = (remainder << 8) | u128::from(numerator[i]);
+        quotient[i] = (remainder / divisor) as u8;
+        remainder %= divisor;
+    }
+
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = quotient[31 - i];
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +375,81 @@ mod tests {
         assert_eq!(easier_by(&target, 1), [0xff; 32]);
         assert_eq!(easier_by(&[0xff; 32], 1), [0xff; 32]);
         assert_eq!(easier_by(&target, 300), [0xff; 32]);
+    }
+
+    /// The expected number of hashes before one lands at or under `target`,
+    /// read back out of the target itself. The inverse of
+    /// [`target_for_hashes_per_share`], in f64, for checking round trips.
+    fn expected_draws(target: &[u8; 32]) -> f64 {
+        let mut t = 0.0f64;
+        for byte in target.iter().rev() {
+            t = t * 256.0 + f64::from(*byte);
+        }
+        (2.0f64.powi(256) - t) / (t + 1.0)
+    }
+
+    #[test]
+    fn one_hash_per_share_is_half_the_space() {
+        // t = (2^256 - 1) / 2 = 2^255 - 1, which is exact and so pins the
+        // arithmetic without going through f64.
+        let mut want = [0xffu8; 32];
+        want[31] = 0x7f;
+        assert_eq!(target_for_hashes_per_share(1), want);
+        // Zero work per share cannot mean a target easier than everything, so
+        // it floors to the same place rather than dividing by zero.
+        assert_eq!(target_for_hashes_per_share(0), want);
+    }
+
+    #[test]
+    fn a_target_costs_the_work_it_was_asked_for() {
+        // The middle value is this machine's measured MinotaurX rate of
+        // 17,440 H/s at 4.5 shares a minute, which is the case the pool
+        // actually runs.
+        for work in [1u128, 2, 1_000, 13_333, 232_533, 333_333_333, 5_000_000_000_000] {
+            let target = target_for_hashes_per_share(work);
+            let back = expected_draws(&target);
+            let error = (back - work as f64).abs() / work as f64;
+            assert!(
+                error < 1e-9,
+                "asked for {work} hashes a share and got {back}, off by {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn more_work_per_share_means_a_harder_target() {
+        let mut previous = target_for_hashes_per_share(1);
+        for work in [2u128, 100, 10_000, 1_000_000, 1_000_000_000] {
+            let target = target_for_hashes_per_share(work);
+            // Harder means smaller, so the previous target must not be met by
+            // a hash that only just meets this one.
+            assert!(
+                meets_target(&target, &previous) && target != previous,
+                "{work} hashes a share did not come out harder"
+            );
+            previous = target;
+        }
+    }
+
+    #[test]
+    fn an_absurd_hash_rate_saturates_instead_of_wrapping() {
+        // Past the u120 headroom the division needs. The target must stay
+        // sane, not wrap into an easy one.
+        let huge = target_for_hashes_per_share(u128::MAX);
+        let capped = target_for_hashes_per_share((1u128 << 120) - 1);
+        assert_eq!(huge, capped);
+        assert!(meets_target(&huge, &target_for_hashes_per_share(1)));
+    }
+
+    #[test]
+    fn the_share_cadence_is_rate_times_sixty_over_shares() {
+        assert_eq!(hashes_per_share_for(17_440.0, 4.5), 17_440.0 * 60.0 / 4.5);
+        assert_eq!(hashes_per_share_for(1_000.0, 6.0), 10_000.0);
+        // Unusable inputs give zero, which the target floor then turns into
+        // the easiest target, so the caller has to clamp first.
+        assert_eq!(hashes_per_share_for(f64::NAN, 4.5), 0.0);
+        assert_eq!(hashes_per_share_for(f64::INFINITY, 4.5), 0.0);
+        assert_eq!(hashes_per_share_for(1_000.0, 0.0), 0.0);
+        assert_eq!(hashes_per_share_for(1_000.0, -1.0), 0.0);
     }
 }

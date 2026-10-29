@@ -106,7 +106,7 @@ fn a_c_program_mines_a_share_through_the_static_library() {
         return;
     };
 
-    let rig = match Rig::start("capi", 30, &[PowType::X16rt, PowType::MinotaurX], 0) {
+    let rig = match Rig::start("capi", 30, &[PowType::X16rt, PowType::MinotaurX], None) {
         Some(rig) => rig,
         None => {
             eprintln!("skipping: aviand or avian-cli not found");

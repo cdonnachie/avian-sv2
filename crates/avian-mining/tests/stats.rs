@@ -18,7 +18,7 @@ use common::{Rig, WORKER_ADDRESS};
 
 macro_rules! rig {
     ($tag:expr, $slot:expr, $algos:expr) => {
-        match Rig::start($tag, $slot, $algos, 0) {
+        match Rig::start($tag, $slot, $algos, None) {
             Some(rig) => rig,
             None => {
                 eprintln!("skipping: aviand or avian-cli not found");

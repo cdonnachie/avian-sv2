@@ -44,7 +44,9 @@ struct Options {
     fee_script: Vec<u8>,
     fee_basis_points: u32,
     coinbase_tag: Vec<u8>,
-    share_target_shift: u32,
+    shares_per_minute: f64,
+    min_hash_rate: f64,
+    max_hash_rate: f64,
     rate_limit: RateLimitConfig,
     verbose: bool,
     duration: Option<Duration>,
@@ -93,12 +95,19 @@ Downstream, to miners:
   --operator-fee-bp <n>  the fee in hundredths of a percent (100 = 1%).
                          Leave at zero to charge nothing and still accept
                          donations, which is the 100%-to-the-miner setup
-  --share-target-shift   halvings below the network target for the share
-                         target, so N means roughly 2^N shares per block
-                         (default 4). 0 makes a share and a block the same
-                         thing, which gives a miner no feedback short of
-                         winning. Raise it on a harder chain: there is no
-                         vardiff, so this one number serves every miner
+  --shares-per-minute    how often each worker should find a share
+                         (default 4.5). Each channel's target is worked out
+                         from this and the hash rate the worker declared when
+                         it opened, so a CPU and a GPU aim at the same
+                         cadence. Set once per channel and never adjusted:
+                         there is no vardiff
+  --min-hash-rate <n>    the slowest worker to believe, in hashes a second
+                         (default 1000). A worker that declares less is
+                         treated as this fast, because the protocol default
+                         is 1 H/s and taking that at face value would hand
+                         out a target of a few dozen hashes a share
+  --max-hash-rate <n>    and the fastest (default 1e12). Above this a worker
+                         would be handed a target nothing it owns can meet
 
 Submission limits, per channel:
   --share-rate-tolerance <n>   multiple of the expected rate, default 8
@@ -178,7 +187,12 @@ fn run(options: Options) -> Result<(), String> {
                 fee_script: options.fee_script.clone(),
                 fee_basis_points: options.fee_basis_points,
                 coinbase_tag: options.coinbase_tag.clone(),
-                share_target_shift: options.share_target_shift,
+                shares_per_minute: options.shares_per_minute,
+                min_hash_rate: options.min_hash_rate,
+                max_hash_rate: options.max_hash_rate,
+                // No flag: on a real chain the cadence above is
+                // the thing to set.
+                share_target_override: None,
                 rate_limit: options.rate_limit,
             },
             coinbase_size: options.coinbase_size,
@@ -317,7 +331,12 @@ fn parse_args() -> Result<Option<Options>, String> {
     let mut fee_address: Option<String> = None;
     let mut fee_basis_points = 0u32;
     let mut coinbase_tag = DEFAULT_TAG.to_string();
-    let mut share_target_shift = 4u32;
+    // Four and a half a minute: often enough that a dashboard shows
+    // something within a minute of a worker connecting, rare enough that the
+    // pool spends a hash per share without noticing.
+    let mut shares_per_minute = 4.5f64;
+    let mut min_hash_rate = 1000.0f64;
+    let mut max_hash_rate = 1e12f64;
     let mut rate_limit = RateLimitConfig::default();
     let mut verbose = false;
     let mut duration = None;
@@ -365,10 +384,20 @@ fn parse_args() -> Result<Option<Options>, String> {
                     .parse()
                     .map_err(|_| "--operator-fee-bp wants a number")?
             }
-            "--share-target-shift" => {
-                share_target_shift = value!()
+            "--shares-per-minute" => {
+                shares_per_minute = value!()
                     .parse()
-                    .map_err(|_| "--share-target-shift wants a number")?
+                    .map_err(|_| "--shares-per-minute wants a number")?
+            }
+            "--min-hash-rate" => {
+                min_hash_rate = value!()
+                    .parse()
+                    .map_err(|_| "--min-hash-rate wants a number")?
+            }
+            "--max-hash-rate" => {
+                max_hash_rate = value!()
+                    .parse()
+                    .map_err(|_| "--max-hash-rate wants a number")?
             }
             "--share-rate-tolerance" => {
                 rate_limit.tolerance = value!()
@@ -524,7 +553,9 @@ fn parse_args() -> Result<Option<Options>, String> {
         fee_script,
         fee_basis_points,
         coinbase_tag,
-        share_target_shift,
+        shares_per_minute,
+        min_hash_rate,
+        max_hash_rate,
         rate_limit,
         verbose,
         duration,

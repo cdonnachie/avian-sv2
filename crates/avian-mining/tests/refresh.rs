@@ -31,7 +31,7 @@ fn quiet_rig(tag: &str, slot: u16) -> Option<Rig> {
     // what took 90 seconds in the field takes a moment here.
     let node = Node::start(tag, slot, &["-sv2interval=1", "-sv2maxtemplates=2"])?;
     node.mine(101);
-    Rig::attach(node, &[PowType::MinotaurX], 0)
+    Rig::attach(node, &[PowType::MinotaurX], None)
 }
 
 macro_rules! quiet {

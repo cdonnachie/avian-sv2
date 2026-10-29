@@ -21,7 +21,7 @@ use common::{
 
 macro_rules! rig {
     ($tag:expr, $slot:expr, $algos:expr) => {
-        match Rig::start($tag, $slot, $algos, 0) {
+        match Rig::start($tag, $slot, $algos, None) {
             Some(rig) => rig,
             None => {
                 eprintln!("skipping: aviand or avian-cli not found");
@@ -230,7 +230,7 @@ fn the_operator_fee_appears_when_configured() {
     let Some(rig) = Rig::attach_with(
         node,
         &[PowType::X16rt],
-        0,
+        None,
         (script_for(FEE_ADDRESS), 250),
         RateLimitConfig::default(),
     ) else {
@@ -291,9 +291,15 @@ fn a_flood_is_rate_limited_and_an_honest_miner_is_not() {
         max_invalid: 100_000,
         ..RateLimitConfig::default()
     };
-    // Four halvings below the network target, so an honest miner still finds
-    // a share in a handful of nonces while the flood below is mostly waste.
-    let Some(rig) = Rig::attach_with(node, &[PowType::X16rt], 4, (Vec::new(), 0), limits) else {
+    // The easiest target there is, so an honest miner finds a share in a
+    // handful of nonces while the flood below is mostly waste.
+    let Some(rig) = Rig::attach_with(
+        node,
+        &[PowType::X16rt],
+        Some([0xff; 32]),
+        (Vec::new(), 0),
+        limits,
+    ) else {
         return;
     };
 
@@ -362,7 +368,7 @@ fn too_many_invalid_submissions_drops_the_channel() {
         floor_per_second: 1000.0,
         ..RateLimitConfig::default()
     };
-    let Some(rig) = Rig::attach_with(node, &[PowType::X16rt], 0, (Vec::new(), 0), limits) else {
+    let Some(rig) = Rig::attach_with(node, &[PowType::X16rt], None, (Vec::new(), 0), limits) else {
         return;
     };
 

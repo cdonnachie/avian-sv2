@@ -44,18 +44,22 @@ impl Rig {
         tag: &str,
         slot: u16,
         algorithms: &[PowType],
-        share_target_shift: u32,
+        share_target: Option<[u8; 32]>,
     ) -> Option<Rig> {
         let node = Node::start(tag, slot, &[])?;
         node.mine(101);
-        Self::attach(node, algorithms, share_target_shift)
+        Self::attach(node, algorithms, share_target)
     }
 
-    pub fn attach(node: Node, algorithms: &[PowType], share_target_shift: u32) -> Option<Rig> {
+    pub fn attach(
+        node: Node,
+        algorithms: &[PowType],
+        share_target: Option<[u8; 32]>,
+    ) -> Option<Rig> {
         Self::attach_with(
             node,
             algorithms,
-            share_target_shift,
+            share_target,
             (Vec::new(), 0),
             RateLimitConfig::default(),
         )
@@ -65,7 +69,7 @@ impl Rig {
     pub fn attach_with(
         node: Node,
         algorithms: &[PowType],
-        share_target_shift: u32,
+        share_target: Option<[u8; 32]>,
         fee: (Vec<u8>, u32),
         rate_limit: RateLimitConfig,
     ) -> Option<Rig> {
@@ -100,7 +104,10 @@ impl Rig {
                     fee_script: fee.0,
                     fee_basis_points: fee.1,
                     coinbase_tag: b"/avian-sv2-test/".to_vec(),
-                    share_target_shift,
+                    shares_per_minute: 4.5,
+                    min_hash_rate: 1000.0,
+                    max_hash_rate: 1e12,
+                    share_target_override: share_target,
                     rate_limit,
                 },
                 coinbase_size: 1000,
