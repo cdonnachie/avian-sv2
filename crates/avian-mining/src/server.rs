@@ -564,10 +564,39 @@ impl Server {
             share_target = worker_max_target;
         }
 
+        // A donation adds to whatever the operator charges and goes to the
+        // same script, so PayoutPlan needs to know nothing about it.
+        //
+        // With no fee script configured there is nowhere to send it, and the
+        // miner simply keeps everything. Refusing the channel instead would
+        // punish a miner for the operator's configuration, and paying them
+        // more than they asked wrongs nobody, which is not true of the
+        // reverse. It is logged so it is visible rather than silent.
+        let mut fee_basis_points = self.config.fee_basis_points;
+        if parsed.donation_basis_points > 0 {
+            if self.config.fee_script.is_empty() {
+                eprintln!(
+                    "[pool] {} offered {}.{:02}% but no donation address is set, \
+                     so it keeps the lot",
+                    parsed.address_text,
+                    parsed.donation_basis_points / 100,
+                    parsed.donation_basis_points % 100
+                );
+            } else {
+                // Capped, because the two are set by different people and
+                // nothing else stops them summing past everything. At the cap
+                // the worker output rounds to zero and PayoutPlan emits no
+                // dust output for it.
+                fee_basis_points = fee_basis_points
+                    .saturating_add(parsed.donation_basis_points)
+                    .min(10_000);
+            }
+        }
+
         let payout = PayoutPlan {
             worker_script: parsed.address.script_pubkey(),
             fee_script: self.config.fee_script.clone(),
-            fee_basis_points: self.config.fee_basis_points,
+            fee_basis_points,
         };
 
         let id = self.next_channel_id.fetch_add(1, Ordering::SeqCst);

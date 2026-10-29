@@ -146,6 +146,13 @@ pub enum AddressError {
     /// Segwit v1 and later. Refused rather than guessed at.
     UnsupportedWitnessVersion(u8),
     UnsupportedProgramLength(usize),
+    /// A `donate/<percent>/` prefix that is not a percentage from 0 to 100
+    /// with at most two decimal places.
+    ///
+    /// Refused rather than treated as zero. A miner who mistypes a donation
+    /// should be told, not quietly billed the wrong amount or quietly
+    /// charged nothing, and the amount is money either way.
+    BadDonation(String),
 }
 
 impl AddressError {
@@ -158,6 +165,7 @@ impl AddressError {
             }
             AddressError::UnsupportedWitnessVersion(_)
             | AddressError::UnsupportedProgramLength(_) => "unsupported-address-type",
+            AddressError::BadDonation(_) => "invalid-donation",
             _ => "invalid-payout-address",
         }
     }
@@ -192,6 +200,13 @@ impl fmt::Display for AddressError {
             }
             AddressError::UnsupportedProgramLength(n) => {
                 write!(f, "a {n}-byte witness program is not supported")
+            }
+            AddressError::BadDonation(text) => {
+                write!(
+                    f,
+                    "{text:?} is not a donation percentage; expected 0 to 100, \
+                     as in donate/2/<address> or donate/0.5/<address>"
+                )
             }
         }
     }
@@ -479,6 +494,10 @@ pub struct Identity {
     pub worker: String,
     /// The address exactly as the miner wrote it, for logging.
     pub address_text: String,
+    /// What the miner chose to leave to the pool, in hundredths of a percent.
+    /// Zero unless a `donate/<percent>/` prefix asked otherwise, which is the
+    /// case for every identity that does not mention it.
+    pub donation_basis_points: u32,
 }
 
 /// Splits `user_identity` and decodes the address half.
@@ -494,15 +513,82 @@ pub fn parse_identity(identity: &str, network: Network) -> Result<Identity, Addr
     if identity.len() > MAX_IDENTITY {
         return Err(AddressError::TooLong(identity.len()));
     }
-    let (address_text, worker) = match identity.find('.') {
-        Some(at) => (&identity[..at], &identity[at + 1..]),
-        None => (identity, ""),
+    let (donation_basis_points, rest) = strip_donation(identity)?;
+    let (address_text, worker) = match rest.find('.') {
+        Some(at) => (&rest[..at], &rest[at + 1..]),
+        None => (rest, ""),
     };
     Ok(Identity {
         address: Address::decode(address_text, network)?,
         worker: worker.to_string(),
         address_text: address_text.to_string(),
+        donation_basis_points,
     })
+}
+
+/// Takes an optional `donate/<percent>/` off the front.
+///
+/// Returns the donation in hundredths of a percent and the rest of the
+/// identity. An identity that does not begin with `donate/` is returned
+/// untouched with a donation of zero, which is what makes this additive: a
+/// miner connecting as it always has is unaffected.
+///
+/// A slash appears in neither base58 nor bech32, so `donate/` at the start
+/// cannot be the beginning of an address and the split is unambiguous.
+fn strip_donation(identity: &str) -> Result<(u32, &str), AddressError> {
+    const PREFIX: &str = "donate/";
+    let Some(after) = identity.strip_prefix(PREFIX) else {
+        return Ok((0, identity));
+    };
+    let Some(at) = after.find('/') else {
+        return Err(AddressError::BadDonation(after.to_string()));
+    };
+    let (percent, rest) = (&after[..at], &after[at + 1..]);
+    Ok((parse_percent(percent)?, rest))
+}
+
+/// `"2"` to 200, `"0.5"` to 50, `"12.34"` to 1234.
+///
+/// Parsed digit by digit rather than through f64. A percentage is money here,
+/// and 0.07 is not exactly representable in binary floating point, so going
+/// via f64 and multiplying by 100 can land a basis point either side of what
+/// the miner typed. Integer arithmetic cannot.
+fn parse_percent(text: &str) -> Result<u32, AddressError> {
+    let bad = || AddressError::BadDonation(text.to_string());
+    if text.is_empty() {
+        return Err(bad());
+    }
+    let (whole, frac) = match text.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (text, ""),
+    };
+    // Two decimal places, because a basis point is one hundredth of a
+    // percent and there is nothing finer to express. A third would have to
+    // be rounded, and silently rounding someone's money is how this module
+    // is specifically not written.
+    if whole.is_empty() || frac.len() > 2 {
+        return Err(bad());
+    }
+    if !whole.bytes().all(|b| b.is_ascii_digit())
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(bad());
+    }
+    let whole: u32 = whole.parse().map_err(|_| bad())?;
+    // "5" is 5.00, "5.1" is 5.10, not 5.01.
+    let hundredths: u32 = match frac.len() {
+        0 => 0,
+        1 => frac.parse::<u32>().map_err(|_| bad())? * 10,
+        _ => frac.parse::<u32>().map_err(|_| bad())?,
+    };
+    let bp = whole
+        .checked_mul(100)
+        .and_then(|w| w.checked_add(hundredths))
+        .ok_or_else(bad)?;
+    if bp > 10_000 {
+        return Err(bad());
+    }
+    Ok(bp)
 }
 
 /// The pool's authority public key in the form a miner's configuration takes.
@@ -725,6 +811,98 @@ mod tests {
         assert_eq!(base58_decode("112").unwrap(), vec![0, 0, 1]);
         assert_eq!(base58_encode(&[]), "");
     }
+    // --- the donation prefix ---------------------------------------------
+
+    #[test]
+    fn an_identity_without_the_prefix_donates_nothing() {
+        // The whole point of the feature being additive: every miner that
+        // connected before it existed must behave identically after.
+        for text in [REGTEST_P2PKH, REGTEST_BECH32] {
+            let id = parse_identity(text, Network::Regtest).expect("plain address");
+            assert_eq!(id.donation_basis_points, 0);
+            assert_eq!(id.address_text, text);
+            assert_eq!(id.worker, "");
+        }
+        let with_worker = format!("{REGTEST_P2PKH}.rig.1");
+        let id = parse_identity(&with_worker, Network::Regtest).expect("worker");
+        assert_eq!(id.donation_basis_points, 0);
+        assert_eq!(id.worker, "rig.1");
+    }
+
+    #[test]
+    fn a_percentage_becomes_basis_points() {
+        for (percent, expected) in [
+            ("0", 0u32),
+            ("1", 100),
+            ("2", 200),
+            ("100", 10_000),
+            ("0.5", 50),
+            ("0.05", 5),
+            ("12.34", 1234),
+            // "5.1" is five and a tenth, so 510, not 501. Getting this the
+            // wrong way round would charge a tenth of what was asked.
+            ("5.1", 510),
+        ] {
+            let text = format!("donate/{percent}/{REGTEST_P2PKH}.rig");
+            let id = parse_identity(&text, Network::Regtest)
+                .unwrap_or_else(|e| panic!("{percent} should parse: {e}"));
+            assert_eq!(id.donation_basis_points, expected, "for {percent}");
+            // The rest of the identity still parses as it would have alone.
+            assert_eq!(id.address_text, REGTEST_P2PKH);
+            assert_eq!(id.worker, "rig");
+        }
+    }
+
+    #[test]
+    fn a_donation_works_without_a_worker_label() {
+        let text = format!("donate/2/{REGTEST_P2PKH}");
+        let id = parse_identity(&text, Network::Regtest).expect("no worker");
+        assert_eq!(id.donation_basis_points, 200);
+        assert_eq!(id.worker, "");
+    }
+
+    #[test]
+    fn a_malformed_donation_is_refused_rather_than_ignored() {
+        // Every one of these would be a silent 0% under a lenient parser,
+        // which is a miner being told nothing while their intent is dropped.
+        for bad in [
+            "donate//addr",          // no percentage
+            "donate/abc/addr",       // not a number
+            "donate/-1/addr",        // negative
+            "donate/101/addr",       // over everything
+            "donate/1.234/addr",     // finer than a basis point
+            "donate/.5/addr",        // no whole part
+            "donate/1.2.3/addr",     // two points
+            "donate/ 2/addr",        // space
+            "donate/2",              // no second slash, so no address either
+        ] {
+            let err = parse_identity(bad, Network::Regtest).unwrap_err();
+            assert!(
+                matches!(err, AddressError::BadDonation(_)),
+                "{bad} gave {err:?}, wanted BadDonation"
+            );
+            assert_eq!(err.code(), "invalid-donation");
+        }
+    }
+
+    #[test]
+    fn a_donation_does_not_rescue_a_bad_address() {
+        // The donation parses first, so this checks the address is still
+        // decoded afterwards rather than skipped.
+        let err = parse_identity("donate/2/not-an-address", Network::Regtest).unwrap_err();
+        assert!(!matches!(err, AddressError::BadDonation(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn an_address_is_never_mistaken_for_the_prefix() {
+        // Neither base58 nor bech32 contains a slash, so no real address can
+        // begin with "donate/". A worker label could contain one, and must
+        // not be confused for it: the prefix is only read at the very front.
+        let text = format!("{REGTEST_P2PKH}.donate/2/rig");
+        let id = parse_identity(&text, Network::Regtest).expect("slash in worker");
+        assert_eq!(id.donation_basis_points, 0);
+        assert_eq!(id.worker, "donate/2/rig");
+    }
 }
 
 #[cfg(test)]
@@ -780,4 +958,6 @@ mod key_format_tests {
             encoded.len()
         );
     }
+
+
 }

@@ -65,6 +65,13 @@ as `address` or `address.workername`, and the coinbase pays it directly. An
 address that does not parse, or belongs to another network, refuses the
 channel. There is no fallback address, by design.
 
+A worker may also leave some of its own reward to the pool, by connecting as
+`donate/<percent>/address.workername`. The percentage takes up to two decimal
+places, so `donate/2/`, `donate/0.5/` and `donate/12.34/` all work, and it
+adds to any operator fee. Without the prefix a worker keeps everything, which
+is the default and the point: nobody is charged anything they did not type.
+A malformed percentage refuses the channel rather than being read as zero.
+
 Upstream, to the node:
   --datadir <path>       the node's datadir, to read sv2_authority_key from
   --chain <name>         regtest (default), main, test, testnet4, signet
@@ -81,8 +88,11 @@ Downstream, to miners:
                          run (default: ./avian-pool-authority-key)
   --coinbase-tag <text>  goes in the coinbase scriptSig
                          (default: /avian-sv2/, at most 87 bytes)
-  --operator-fee <addr>  take a fee to this address; omit for none
-  --operator-fee-bp <n>  the fee in hundredths of a percent (100 = 1%)
+  --operator-fee <addr>  take a fee to this address, and the address
+                         donations are paid to; omit for neither
+  --operator-fee-bp <n>  the fee in hundredths of a percent (100 = 1%).
+                         Leave at zero to charge nothing and still accept
+                         donations, which is the 100%-to-the-miner setup
   --share-target-shift   halvings below the network target for the share
                          target, so N means roughly 2^N shares per block
                          (default 4). 0 makes a share and a block the same
