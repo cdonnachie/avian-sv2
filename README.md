@@ -592,8 +592,8 @@ matters — SRI against the node — rather than this client against itself.
 
 `crates/avian-sv2/include/avian_sv2.h`, hand written, and kept honest by the C
 program being compiled against it with `-Werror` in CI-equivalent tests. The
-boundary is section 10 of the plan's neutral `AvianMiningJob`: the C side sees
-jobs and submits shares, and never sees Noise, framing or a Stratum v2 type.
+boundary is the neutral `AvianMiningJob`: the C side sees jobs and submits
+shares, and never sees Noise, framing or a Stratum v2 type.
 
 ```c
 AvianSv2Client *avian_sv2_client_connect(const AvianSv2ClientConfig *, int32_t *status);
@@ -640,8 +640,8 @@ Avian sources, found beside this repository or at `AVIAN_SRC`.
 **The cost of this ordering, stated plainly for whoever does Stage 5:** the
 miner build now needs a Rust toolchain. On Linux that is `rustup` and
 `cargo build --release -p avian-sv2`. Cross-compiling for Windows and macOS
-miner releases is harder than for Linux and is the real expense; the plan says
-so and it has not got cheaper. What it buys is that Noise is written once.
+miner releases is harder than for Linux and is the real expense. What it buys
+is that Noise is written once.
 
 ## Reconnection, and what does not survive it
 
@@ -912,7 +912,7 @@ new template and built a coinbase the node accepts.
 
 ### The milestone
 
-`crates/avian-mining/tests/end_to_end.rs` is section 12 of the plan with a test
+`crates/avian-mining/tests/end_to_end.rs` runs the whole path with a test
 worker in place of a real miner:
 
 ```
