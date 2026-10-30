@@ -121,7 +121,7 @@ pub struct Address {
 ///
 /// Each maps to a distinct error code so a miner is told what is wrong with
 /// its address rather than just that something is. There is a cost to that:
-/// see the README, the Stratum v2 specification defines no
+/// see `doc/design.md`, the Stratum v2 specification defines no
 /// `OpenMiningChannel.Error` code for any of this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressError {
