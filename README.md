@@ -16,8 +16,6 @@ as an ordinary Rust crate and adds the two halves a miner never needs: the
 Template Distribution client it is to the node, and the Mining Protocol server
 it is to workers.
 
-Stages 2 through 6 of `Avian-Native-Stratum-V2-Mining-Plan.md` section 25.
-
 ```
 crates/avian-sv2        libavian-sv2: Noise, framing, extension codecs,
                         the Mining Protocol client, and the C API
