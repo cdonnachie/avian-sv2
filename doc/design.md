@@ -1600,7 +1600,12 @@ than things it will never have:
 - **Persistence.** Everything is in memory: restart the pool and every channel,
   job and counter is gone. A miner reconnects and carries on, so the cost is a
   moment of lost hashrate rather than lost money, but an operator cannot answer
-  a question about yesterday.
+  a question about yesterday. The one count the pool itself cannot settle,
+  blocks submitted that never became the tip, it hands out as hashes under
+  `unconfirmed` in `/stats`. Anything beside the node resolves each one with
+  `getblock`: `confirmations` of -1 lost its race, one or more is on the
+  chain, error -5 was never seen. No new dependency, no write path, no state
+  the pool was not already holding.
 - **Vardiff.** The share target is fixed, the network target made
   `--share-target-shift` halvings harder. Deferred *with* rate limiting rather
   than separately, because the two are entangled: the honest answer to a worker

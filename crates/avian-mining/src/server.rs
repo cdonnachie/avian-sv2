@@ -276,6 +276,22 @@ impl AlgoContext {
         self.confirmed.load(Ordering::Relaxed)
     }
 
+    /// Blocks forwarded upstream whose hash has not been seen as the tip,
+    /// oldest first, in internal byte order.
+    ///
+    /// The pool cannot say what became of these: each either lost a race or
+    /// its tip announcement has not arrived yet, and from here the two look
+    /// the same. Something beside the node can tell them apart with
+    /// `getblock`, so the hashes are handed out rather than kept as a
+    /// number. Nothing is added to the pool to do this; the list is the one
+    /// `confirm_tip` already drains.
+    pub fn unconfirmed(&self) -> Vec<[u8; 32]> {
+        self.pending
+            .lock()
+            .map(|pending| pending.iter().map(|(_, _, hash)| *hash).collect())
+            .unwrap_or_default()
+    }
+
     /// Records a forwarded block so a later tip can confirm it.
     fn remember_block(&self, channel_id: u32, sequence_number: u32, hash: [u8; 32]) {
         if let Ok(mut pending) = self.pending.lock() {
@@ -1058,6 +1074,59 @@ pub fn select_algorithm(
         &payload,
     )?;
     Ok(pow)
+}
+
+#[cfg(test)]
+mod unconfirmed_tests {
+    use super::*;
+    use avian_tdp::SubmitterSlot;
+
+    fn context() -> AlgoContext {
+        // A submitter with nothing behind it: these tests never submit.
+        AlgoContext::new(PowType::X16rt, SubmitterSlot::new().submitter())
+    }
+
+    fn hash(n: u8) -> [u8; 32] {
+        [n; 32]
+    }
+
+    #[test]
+    fn a_block_stays_listed_until_its_hash_is_the_tip() {
+        let algo = context();
+        algo.remember_block(1, 1, hash(1));
+        algo.remember_block(1, 2, hash(2));
+        algo.remember_block(2, 1, hash(3));
+        assert_eq!(algo.unconfirmed(), vec![hash(1), hash(2), hash(3)]);
+
+        // No channels to tell: confirmation is the hash leaving the list.
+        algo.confirm_tip(&hash(2), &[]);
+        assert_eq!(algo.confirmed(), 1);
+        assert_eq!(
+            algo.unconfirmed(),
+            vec![hash(1), hash(3)],
+            "the ones that did not become the tip stay, in the order submitted"
+        );
+
+        algo.confirm_tip(&hash(9), &[]);
+        assert_eq!(
+            algo.confirmed(),
+            1,
+            "a tip the pool did not mine confirms nothing"
+        );
+        assert_eq!(algo.unconfirmed(), vec![hash(1), hash(3)]);
+    }
+
+    #[test]
+    fn the_list_drops_its_oldest_past_sixteen() {
+        let algo = context();
+        for n in 0..20u8 {
+            algo.remember_block(1, u32::from(n), hash(n));
+        }
+        let listed = algo.unconfirmed();
+        assert_eq!(listed.len(), 16);
+        assert_eq!(listed[0], hash(4), "the four oldest went first");
+        assert_eq!(listed[15], hash(19));
+    }
 }
 
 #[cfg(test)]

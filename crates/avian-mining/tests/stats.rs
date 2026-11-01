@@ -166,6 +166,9 @@ fn shares_move_the_counters_and_an_estimate_appears() {
     // pool cannot know what the node did with it.
     assert!(body.contains("\"blocks_submitted\""), "{body}");
     assert!(!body.contains("blocks_found"), "{body}");
+    // The gap between submitted and confirmed goes out as hashes, so a
+    // service with a node can resolve what the pool cannot.
+    assert!(body.contains("\"unconfirmed\": ["), "{body}");
 }
 
 #[test]
