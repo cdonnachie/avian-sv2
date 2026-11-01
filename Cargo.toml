@@ -5,7 +5,9 @@ members = [
     "crates/avian-regtest",
     "crates/avian-tdp",
     "crates/avian-mining",
-    "crates/avian-sv2-pool",
+    "crates/avian-sv1",
+    "crates/avian-sv2-solo",
+    "crates/avian-sv2-bridge",
 ]
 resolver = "2"
 

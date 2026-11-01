@@ -350,7 +350,7 @@ fn setup_connection(conn: &mut Connection) -> Result<u16> {
     // Template Distribution defines no feature flags, and aviand rejects any
     // non-zero value with unsupported-feature-flags.
     let host = b"127.0.0.1";
-    let vendor = b"avian-sv2-pool";
+    let vendor = b"avian-sv2";
     let empty: &[u8] = b"";
     conn.send(
         EXT_CORE,

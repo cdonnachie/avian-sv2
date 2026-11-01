@@ -1,0 +1,28 @@
+[package]
+name = "avian-sv2-bridge"
+description = "A Stratum v2 front for an existing Avian Stratum v1 pool: non-custodial, it forwards shares and holds nothing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "avian-sv2-bridge"
+path = "src/main.rs"
+
+[dependencies]
+avian-sv2 = { path = "../avian-sv2" }
+avian-sv1 = { path = "../avian-sv1" }
+avian-tdp = { path = "../avian-tdp" }
+# Without the hashers. The operator's pool validates every share it is sent,
+# so the bridge needs no Avian source tree and no C++ toolchain; `pow` turns
+# the hashers on for a bridge that wants to refuse bad shares before they
+# cost the pool a round trip.
+avian-mining = { path = "../avian-mining", default-features = false }
+binary_sv2.workspace = true
+mining_sv2.workspace = true
+secp256k1.workspace = true
+
+[features]
+default = []
+pow = ["avian-mining/pow"]

@@ -16,6 +16,9 @@
 //! and `invalid-job-id` counted toward the invalid-share limit so the pool
 //! disconnected the miner and the reconnect repaired the symptom.
 
+// These tests hash, so they need the hashers the `pow` feature links.
+#![cfg(feature = "pow")]
+
 mod common;
 
 use std::time::{Duration, Instant};

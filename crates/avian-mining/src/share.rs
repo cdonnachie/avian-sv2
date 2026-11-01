@@ -18,9 +18,13 @@ pub trait PowHasher: Send + Sync {
     fn describe(&self) -> &'static str;
 }
 
-/// Avian's own implementation, linked through `avian-pow`.
+/// Avian's own implementation, linked through `avian-pow`. Only with the
+/// `pow` feature; without it there is no hasher here at all, and a consumer
+/// brings its own [`PowHasher`] or does not validate.
+#[cfg(feature = "pow")]
 pub struct AvianHasher;
 
+#[cfg(feature = "pow")]
 impl PowHasher for AvianHasher {
     fn hash(&self, pow: PowType, header: &[u8; 80]) -> Option<[u8; 32]> {
         let pow = match pow {
@@ -267,6 +271,7 @@ mod tests {
         assert!(matches!(outcome, Outcome::Refused(Refusal::PowUnavailable)));
     }
 
+    #[cfg(feature = "pow")]
     #[test]
     fn the_real_hasher_accepts_a_share_under_an_easy_target_and_refuses_a_hard_one() {
         if !avian_pow::AVAILABLE {

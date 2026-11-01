@@ -51,6 +51,12 @@ fn a_miner_with_only_prefix_and_suffix_can_mine_a_block_the_node_accepts() {
         return;
     };
     node.mine(101);
+    if !node.has_wallet() {
+        eprintln!(
+            "skipping: this aviand has no wallet, so nothing can put a transaction in its mempool"
+        );
+        return;
+    }
 
     let address = node.rpc(&["getnewaddress"]).expect("getnewaddress");
 

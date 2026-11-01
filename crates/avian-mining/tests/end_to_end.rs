@@ -16,6 +16,9 @@
 //! numbers agreeing, because agreeing numbers pass whatever order the messages
 //! arrived in.
 
+// These tests hash, so they need the hashers the `pow` feature links.
+#![cfg(feature = "pow")]
+
 mod common;
 
 use std::time::{Duration, Instant};
@@ -47,6 +50,7 @@ fn a_miner_mines_a_regtest_block_through_the_pool() {
     let rig = rig!("milestone", 10, &[PowType::X16rt, PowType::MinotaurX], None);
 
     for pow in [PowType::X16rt, PowType::MinotaurX] {
+        rig.wait_for_tip(pow);
         let before = rig.node.height();
         let mut miner = rig.miner(pow);
 

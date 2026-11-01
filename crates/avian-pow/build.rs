@@ -80,7 +80,6 @@ fn main() {
     for file in YESPOWER_SOURCES {
         c.file(yespower.join(file));
     }
-    c.compile("avian_algo_c");
 
     let mut cxx = cc::Build::new();
     cxx.cpp(true)
@@ -100,7 +99,14 @@ fn main() {
     }
     cxx.file(src.join("uint256.cpp"));
     cxx.file("csrc/shim.cpp");
+
+    // The C++ archive calls into the C one and nothing calls back, so the C++
+    // library is emitted first. GNU ld takes static archives in the order
+    // given and never looks back, and a `cargo:rustc-link-lib` line lands on
+    // the link line in the order it is printed. A linker that rescans, as
+    // MSVC's and Apple's do, hides the order; a mingw link is where it shows.
     cxx.compile("avian_algo_cxx");
+    c.compile("avian_algo_c");
 }
 
 fn avian_src() -> Option<PathBuf> {
@@ -109,11 +115,27 @@ fn avian_src() -> Option<PathBuf> {
         return usable(&path).then_some(path);
     }
     // The sibling checkout, which is where it sits in this workspace.
-    let guess = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Avian-v5.0/src")
-        .canonicalize()
-        .ok()?;
+    let guess = plain(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../Avian-v5.0/src")
+            .canonicalize()
+            .ok()?,
+    );
     usable(&guess).then_some(guess)
+}
+
+/// Takes Windows' `\\?\` verbatim prefix back off a canonicalized path.
+///
+/// `canonicalize` always adds it, and MSVC's `cl.exe` cannot open a path that
+/// carries it: it reports the source file as `\\blake.c` and stops, which
+/// fails the build with no hint that the path is the problem. Nothing here
+/// needs the long-path escape the prefix buys, so it comes straight off. A
+/// no-op everywhere else, because no other platform produces one.
+fn plain(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(stripped) => PathBuf::from(stripped),
+        None => path,
+    }
 }
 
 fn usable(src: &Path) -> bool {

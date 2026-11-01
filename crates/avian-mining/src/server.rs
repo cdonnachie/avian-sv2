@@ -502,7 +502,8 @@ impl Server {
 
         setup_connection(&mut reader, &writer)?;
         request_extensions(&mut reader, &writer)?;
-        let pow = select_algorithm(&mut reader, &writer, &self.algos)?;
+        let offered: Vec<PowType> = self.algos.iter().map(|algo| algo.pow).collect();
+        let pow = select_algorithm(&mut reader, &writer, &offered)?;
         let algo = self
             .algo(pow)
             .ok_or_else(|| Error::Protocol(format!("no session for {pow}")))?;
@@ -863,7 +864,7 @@ impl ServerHandle {
     }
 }
 
-fn send<T: binary_sv2::Serialize + binary_sv2::GetSize>(
+pub fn send<T: binary_sv2::Serialize + binary_sv2::GetSize>(
     writer: &Arc<Mutex<ConnectionWriter>>,
     extension_type: u16,
     msg_type: u8,
@@ -876,7 +877,7 @@ fn send<T: binary_sv2::Serialize + binary_sv2::GetSize>(
         .send(extension_type, msg_type, channel_msg, message)
 }
 
-fn send_raw(
+pub fn send_raw(
     writer: &Arc<Mutex<ConnectionWriter>>,
     extension_type: u16,
     msg_type: u8,
@@ -890,7 +891,9 @@ fn send_raw(
 }
 
 /// `SetupConnection` with the v1 contract from doc/sv2.md.
-fn setup_connection(
+/// Public because the bridge serves the same handshake in front of a
+/// different pool: `SetupConnection` is the protocol, not solo policy.
+pub fn setup_connection(
     reader: &mut ConnectionReader,
     writer: &Arc<Mutex<ConnectionWriter>>,
 ) -> Result<()> {
@@ -961,7 +964,8 @@ fn setup_connection(
 /// requires it of the pool: every failure mode the extension prevents is
 /// silent, so a worker that has not negotiated it is refused rather than
 /// served work it cannot mine correctly.
-fn request_extensions(
+/// Public for the bridge, like [`setup_connection`].
+pub fn request_extensions(
     reader: &mut ConnectionReader,
     writer: &Arc<Mutex<ConnectionWriter>>,
 ) -> Result<()> {
@@ -1008,10 +1012,15 @@ fn request_extensions(
     )
 }
 
-fn select_algorithm(
+/// Answers `AvianSelectAlgorithm` with one of `offered`, or refuses.
+///
+/// Takes the algorithms rather than the solo pool's per-algorithm contexts,
+/// so the bridge, which has an upstream pool per algorithm instead, can
+/// serve the same step.
+pub fn select_algorithm(
     reader: &mut ConnectionReader,
     writer: &Arc<Mutex<ConnectionWriter>>,
-    algos: &[Arc<AlgoContext>],
+    offered: &[PowType],
 ) -> Result<PowType> {
     let frame = reader.recv_expect(EXT_AVIAN, MSG_SELECT_ALGORITHM)?;
     let mut r = Reader::new(&frame.payload);
@@ -1034,7 +1043,7 @@ fn select_algorithm(
     let Ok(pow) = PowType::from_u8(requested) else {
         return refuse("unsupported-pow-type");
     };
-    if !algos.iter().any(|algo| algo.pow == pow) {
+    if !offered.contains(&pow) {
         return refuse("unsupported-pow-type");
     }
 

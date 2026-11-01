@@ -11,6 +11,9 @@
 //! stops being true the moment somebody mines Avian with software we did not
 //! write.
 
+// These tests hash, so they need the hashers the `pow` feature links.
+#![cfg(feature = "pow")]
+
 mod common;
 
 use std::time::{Duration, Instant};
@@ -76,6 +79,7 @@ fn a_miner_mines_a_block_over_an_extended_channel() {
     let rig = rig!("ext-milestone", 60, &[PowType::X16rt, PowType::MinotaurX]);
 
     for pow in [PowType::X16rt, PowType::MinotaurX] {
+        rig.wait_for_tip(pow);
         let before = rig.node.height();
         let mut miner = extended_miner(&rig, pow, &format!("{WORKER_ADDRESS}.ext-{pow}"));
 
@@ -148,6 +152,12 @@ fn the_miner_can_see_what_it_is_committing_to() {
         return;
     };
     node.mine(101);
+    if !node.has_wallet() {
+        eprintln!(
+            "skipping: this aviand has no wallet, so nothing can put a transaction in its mempool"
+        );
+        return;
+    }
     let address = node.rpc(&["getnewaddress"]).expect("getnewaddress");
     let funded = node
         .rpc(&["sendtoaddress", &address, "1.0"])

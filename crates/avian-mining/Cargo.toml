@@ -9,11 +9,19 @@ license.workspace = true
 [dependencies]
 avian-sv2 = { path = "../avian-sv2" }
 avian-tdp = { path = "../avian-tdp" }
-avian-pow = { path = "../avian-pow" }
+# Optional, behind `pow`, so that a consumer that forwards shares to a pool
+# that validates them itself - the bridge - can build with no C++ toolchain
+# and no Avian source tree. The solo pool keeps the default, because it is
+# the only thing standing between a worker and the node.
+avian-pow = { path = "../avian-pow", optional = true }
 binary_sv2.workspace = true
 common_messages_sv2.workspace = true
 mining_sv2.workspace = true
 secp256k1.workspace = true
+
+[features]
+default = ["pow"]
+pow = ["dep:avian-pow"]
 
 [dev-dependencies]
 avian-regtest = { path = "../avian-regtest" }

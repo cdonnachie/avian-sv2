@@ -1,0 +1,12 @@
+[package]
+name = "avian-sv1"
+description = "A Stratum v1 client, upstream half of the Avian Stratum v2 bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# For Error and Result, so a bridge handles one error type rather than two.
+# Nothing else from the Stratum v2 side is used here: this crate speaks v1.
+avian-sv2 = { path = "../avian-sv2" }
