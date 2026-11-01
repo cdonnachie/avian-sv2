@@ -19,3 +19,4 @@
 
 pub mod difficulty;
 pub mod json;
+pub mod message;
