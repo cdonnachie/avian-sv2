@@ -22,7 +22,7 @@ use avian_sv2::avian::{PowType, EXT_AVIAN, EXT_CORE, EXT_NEGOTIATION, MSG_REQUES
 use avian_sv2::block;
 use avian_sv2::client::{ClientConfig, Event, MiningClient, MiningJob, Trace};
 use avian_sv2::transport::Connection;
-use avian_sv2::wire::{Reader, Writer};
+use avian_sv2::wire::{self, Reader, Writer};
 use avian_sv2::Backoff;
 use common_messages_sv2::{
     Protocol, SetupConnection, MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
@@ -149,6 +149,28 @@ impl Rig {
             max_attempts: Some(60),
         };
         config
+    }
+
+    /// Waits until the pool's work for `pow` builds on the node's tip.
+    ///
+    /// A block found on one algorithm moves the tip for every algorithm, and
+    /// the pool hears of it one Template Distribution session at a time. A
+    /// channel opened inside that window is handed the template that still
+    /// stands at the pool, which the node has already retired, and its share
+    /// comes back `unknown-template`. On regtest, where the next block is a
+    /// few nonces away, a test that mines one algorithm after another lives
+    /// entirely inside that window unless it waits here first.
+    pub fn wait_for_tip(&self, pow: PowType) {
+        let tip = self.node.tip();
+        let algo = self.pool.algo(pow).expect("the pool serves this algorithm");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if algo.prev_hash().map(|hash| wire::hex_rev(&hash)) == Some(tip.clone()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the pool's {pow} work never caught up with the tip {tip}");
     }
 
     /// A client with an active job, which is where most tests start.

@@ -12,6 +12,16 @@ use std::time::{Duration, Instant};
 
 use secp256k1::XOnlyPublicKey;
 
+/// Where blocks go on a node that has no wallet to ask for an address.
+///
+/// `generatetoaddress` wants an address and nothing else, and a node built
+/// without a wallet, which is what a deployment ships, has no `getnewaddress`
+/// to offer one. A regtest P2PKH address whose key nobody holds does the job:
+/// the tests spend nothing they mine this way. It is not the worker address
+/// the tests pay, so a test reading a coinbase cannot mistake one for the
+/// other.
+pub const MINING_ADDRESS: &str = "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn";
+
 /// Finds a binary from an environment variable, else `~/avian-build/bin`.
 pub fn binary(var: &str, name: &str) -> Option<PathBuf> {
     if let Ok(path) = std::env::var(var) {
@@ -139,18 +149,40 @@ impl Node {
     /// block download. Without this every template request is refused and
     /// nothing says so.
     pub fn mine(&self, blocks: u32) -> String {
-        if self.rpc(&["getwalletinfo"]).is_err() {
-            // A restarted node does not load its wallet on its own, and
-            // creating one that already exists is an error, so try in that
-            // order.
-            if self.rpc(&["loadwallet", "it"]).is_err() {
-                self.rpc(&["createwallet", "it"]).expect("createwallet");
-            }
-        }
-        let address = self.rpc(&["getnewaddress"]).expect("getnewaddress");
+        let address = self.mining_address();
         self.rpc(&["generatetoaddress", &blocks.to_string(), &address])
             .expect("generatetoaddress");
         address
+    }
+
+    /// Whether the node has a wallet, loading or creating one if it can.
+    ///
+    /// `false` means the node was built without one, so every wallet RPC is
+    /// missing and a test that needs to spend has nothing to spend with.
+    pub fn has_wallet(&self) -> bool {
+        if self.rpc(&["getwalletinfo"]).is_ok() {
+            return true;
+        }
+        // A restarted node does not load its wallet on its own, and creating
+        // one that already exists is an error, so try in that order.
+        if self.rpc(&["loadwallet", "it"]).is_ok() {
+            return true;
+        }
+        match self.rpc(&["createwallet", "it"]) {
+            Ok(_) => true,
+            Err(e) if e.contains("Method not found") => false,
+            Err(e) => panic!("createwallet: {e}"),
+        }
+    }
+
+    /// An address to mine to: the wallet's, when there is one, else
+    /// [`MINING_ADDRESS`].
+    pub fn mining_address(&self) -> String {
+        if self.has_wallet() {
+            self.rpc(&["getnewaddress"]).expect("getnewaddress")
+        } else {
+            MINING_ADDRESS.to_string()
+        }
     }
 
     pub fn tip(&self) -> String {

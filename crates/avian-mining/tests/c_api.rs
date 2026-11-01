@@ -214,6 +214,10 @@ fn a_c_program_mines_a_share_through_the_static_library() {
     // Both kinds of channel, because serving both is the point and a C miner
     // is the only thing that proves the extended path is usable from C.
     for (algorithm, extended) in [("x16rt", true), ("minotaurx", true), ("x16rt", false)] {
+        rig.wait_for_tip(match algorithm {
+            "x16rt" => PowType::X16rt,
+            _ => PowType::MinotaurX,
+        });
         let before = rig.node.height();
         let output = Command::new(&program)
             .arg(rig.pool.mining_addr().to_string())

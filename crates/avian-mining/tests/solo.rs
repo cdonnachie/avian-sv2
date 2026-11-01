@@ -88,6 +88,7 @@ fn a_mined_block_pays_the_address_the_worker_supplied() {
     let rig = rig!("solo-pays", 40, &[PowType::X16rt, PowType::MinotaurX]);
 
     for pow in [PowType::X16rt, PowType::MinotaurX] {
+        rig.wait_for_tip(pow);
         let before = rig.node.height();
         let identity = format!("{WORKER_ADDRESS}.rig-{pow}");
         let mut miner = connect_as(&rig, pow, &identity).expect("the channel should open");
