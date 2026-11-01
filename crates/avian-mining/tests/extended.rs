@@ -11,6 +11,9 @@
 //! stops being true the moment somebody mines Avian with software we did not
 //! write.
 
+// These tests hash, so they need the hashers the `pow` feature links.
+#![cfg(feature = "pow")]
+
 mod common;
 
 use std::time::{Duration, Instant};

@@ -5,6 +5,9 @@
 //! gets JSON describing real channels, that the endpoint is read-only, and
 //! that it does not leak a full payout address.
 
+// These tests hash, so they need the hashers the `pow` feature links.
+#![cfg(feature = "pow")]
+
 mod common;
 
 use std::io::{Read, Write};

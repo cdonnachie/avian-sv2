@@ -6,6 +6,9 @@
 //! that cannot be inferred from the protocol working: every protocol
 //! assertion would pass just as happily if the coinbase paid the operator.
 
+// These tests hash, so they need the hashers the `pow` feature links.
+#![cfg(feature = "pow")]
+
 mod common;
 
 use std::time::{Duration, Instant};

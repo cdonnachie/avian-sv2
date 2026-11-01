@@ -11,6 +11,9 @@
 //! the link line in the header's own comment going out of step with what
 //! actually links, which stops it linking.
 
+// These tests hash, so they need the hashers the `pow` feature links.
+#![cfg(feature = "pow")]
+
 mod common;
 
 use std::path::{Path, PathBuf};

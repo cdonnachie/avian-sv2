@@ -16,6 +16,9 @@
 //! numbers agreeing, because agreeing numbers pass whatever order the messages
 //! arrived in.
 
+// These tests hash, so they need the hashers the `pow` feature links.
+#![cfg(feature = "pow")]
+
 mod common;
 
 use std::time::{Duration, Instant};

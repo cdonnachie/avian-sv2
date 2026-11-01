@@ -11,6 +11,9 @@
 //! a block, which makes this cheap to test here and is the one way regtest
 //! helps rather than hides.
 
+// These tests hash, so they need the hashers the `pow` feature links.
+#![cfg(feature = "pow")]
+
 mod common;
 
 use std::time::{Duration, Instant};

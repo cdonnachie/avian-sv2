@@ -72,6 +72,14 @@ to start rather than accepting every share:
 AVIAN_SRC=/path/to/avian/src cargo build --release
 ```
 
+`avian-mining` links them through its `pow` feature, which is on by default.
+A consumer that never validates a share itself can turn it off and build
+with no C++ toolchain at all:
+
+```sh
+cargo build --release -p avian-mining --no-default-features
+```
+
 ## Running the solo pool
 
 Start a regtest node with Stratum v2 enabled, and **generate a block first**:
