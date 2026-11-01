@@ -7,6 +7,7 @@ members = [
     "crates/avian-mining",
     "crates/avian-sv1",
     "crates/avian-sv2-solo",
+    "crates/avian-sv2-bridge",
 ]
 resolver = "2"
 

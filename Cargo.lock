@@ -89,6 +89,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "avian-sv2-bridge"
+version = "0.1.0"
+dependencies = [
+ "avian-mining",
+ "avian-sv1",
+ "avian-sv2",
+ "avian-tdp",
+ "binary_sv2",
+ "mining_sv2",
+ "secp256k1",
+]
+
+[[package]]
 name = "avian-sv2-solo"
 version = "0.1.0"
 dependencies = [
