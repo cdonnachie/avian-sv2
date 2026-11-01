@@ -179,6 +179,36 @@ pub fn hashes_per_share_for(hash_rate: f64, shares_per_minute: f64) -> f64 {
     hash_rate * 60.0 / shares_per_minute
 }
 
+/// What a share at `target` costs, as the exact inverse of
+/// [`target_for_hashes_per_share`].
+///
+/// `(2^256 - t) / (t + 1)`, which is that function's derivation read the other
+/// way, so converting a target to work and back lands on the same target
+/// rather than drifting a round at a time. `f64` throughout: `2^256` is
+/// comfortably inside its range, and the result is a count nobody needs to the
+/// nearest hash.
+///
+/// Counts the draws that **fail**, because that is the quantity
+/// [`target_for_hashes_per_share`] solves for, and an inverse has to invert
+/// what is there rather than what would have been tidier. The expected number
+/// of draws in total is one more, which is
+/// `avian_mining::stats::hashes_per_share`'s simpler `2^256 / (t + 1)`. One
+/// hash apart: invisible at any target a pool hands out, and a factor of two
+/// at regtest's `7fff...`, where a share costs two draws.
+///
+/// Little-endian, like every other target here.
+pub fn hashes_per_share(target: &[u8; 32]) -> f64 {
+    let mut value = 0.0f64;
+    for byte in target.iter().rev() {
+        value = value * 256.0 + f64::from(*byte);
+    }
+    let span = 2.0f64.powi(256);
+    if value <= 0.0 {
+        return span;
+    }
+    ((span - value) / (value + 1.0)).max(0.0)
+}
+
 /// The target at which finding a share costs `hashes_per_share` hashes.
 ///
 /// A hash is a uniform draw from `2^256` values of which `t + 1` succeed, so

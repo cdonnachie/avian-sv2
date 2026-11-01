@@ -68,6 +68,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "avian-sv1"
+version = "0.1.0"
+dependencies = [
+ "avian-sv2",
+]
+
+[[package]]
 name = "avian-sv2"
 version = "0.1.0"
 dependencies = [
