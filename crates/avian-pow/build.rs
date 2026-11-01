@@ -109,11 +109,27 @@ fn avian_src() -> Option<PathBuf> {
         return usable(&path).then_some(path);
     }
     // The sibling checkout, which is where it sits in this workspace.
-    let guess = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../Avian-v5.0/src")
-        .canonicalize()
-        .ok()?;
+    let guess = plain(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../Avian-v5.0/src")
+            .canonicalize()
+            .ok()?,
+    );
     usable(&guess).then_some(guess)
+}
+
+/// Takes Windows' `\\?\` verbatim prefix back off a canonicalized path.
+///
+/// `canonicalize` always adds it, and MSVC's `cl.exe` cannot open a path that
+/// carries it: it reports the source file as `\\blake.c` and stops, which
+/// fails the build with no hint that the path is the problem. Nothing here
+/// needs the long-path escape the prefix buys, so it comes straight off. A
+/// no-op everywhere else, because no other platform produces one.
+fn plain(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(stripped) => PathBuf::from(stripped),
+        None => path,
+    }
 }
 
 fn usable(src: &Path) -> bool {
