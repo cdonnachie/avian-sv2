@@ -74,6 +74,17 @@ to start rather than accepting every share:
 AVIAN_SRC=/path/to/avian/src cargo build --release
 ```
 
+On Windows the hashers build with mingw and not with MSVC: Avian's
+`yespower.c` carries a `#warning`, which `cl.exe` rejects outright. With
+MSYS2's `mingw64/bin` on `PATH`:
+
+```sh
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+The MSVC target still builds everything that does not hash: the library, the
+bridge, and `avian-mining` without its `pow` feature.
+
 `avian-mining` links them through its `pow` feature, which is on by default.
 A consumer that never validates a share itself can turn it off and build
 with no C++ toolchain at all:
@@ -154,10 +165,11 @@ of that API.
 cargo test
 ```
 
-151 tests. Those that need one start a real regtest `aviand` and skip with a
+198 tests. Those that need one start a real regtest `aviand` and skip with a
 message when it is not found; `AVIAND` and `AVIAN_CLI` override the default of
 `~/avian-build/bin`. `crates/avian-mining/tests/c_api.rs` compiles and runs a C
-program against the header with `-Werror`, and `CC` overrides `cc`.
+program against the header with `-Werror`, and `CC` overrides `cc`. On Windows
+add `--target x86_64-pc-windows-gnu`, for the reason given under building.
 
 ## Documentation
 

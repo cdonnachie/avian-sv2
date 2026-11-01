@@ -18,6 +18,16 @@
  * AVIAN_SRC unset: this library needs no Avian source tree, because it does no
  * hashing.
  *
+ * On Windows with mingw, build with --target x86_64-pc-windows-gnu, take the
+ * library from target/x86_64-pc-windows-gnu/release, and in place of the
+ * three -l flags above link
+ *
+ *     -static -lpthread -lbcrypt -ladvapi32 -lkernel32 -lntdll -luserenv \
+ *        -lws2_32 -ldbghelp -lm
+ *
+ * With another toolchain, `cargo rustc -p avian-sv2 --crate-type staticlib --
+ * --print native-static-libs` prints the system libraries it needs.
+ *
  * Threading: a handle is not synchronised. Use it from one thread, or guard it
  * yourself. Polling and submitting from two threads at once is not supported.
  */

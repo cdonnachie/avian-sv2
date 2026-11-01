@@ -643,7 +643,10 @@ demonstration that the split is real.
 
 If you also link `libavian_pow.a`, as the test program does, add `-lstdc++`:
 Avian's lyra2, sponge, tiger and `uint256` are C++. That library does need the
-Avian sources, found beside this repository or at `AVIAN_SRC`.
+Avian sources, found beside this repository or at `AVIAN_SRC`. The header's own
+comment carries the mingw equivalent of that link line, which names the Windows
+system libraries the Rust standard library calls and links statically so the
+program needs no mingw runtime beside it.
 
 **The cost of this ordering, stated plainly for whoever does Stage 5:** the
 miner build now needs a Rust toolchain. On Linux that is `rustup` and
@@ -730,6 +733,17 @@ start rather than accepting every share:
 ```
 AVIAN_SRC=/path/to/Avian-v5.0/src cargo build --release
 ```
+
+On Windows the hashers build with mingw and not with MSVC: Avian's
+`yespower.c` carries a `#warning`, which `cl.exe` rejects outright. With
+MSYS2's `mingw64/bin` on `PATH`:
+
+```
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+The MSVC target still builds everything that does not hash: the library, the
+bridge, and `avian-mining` without its `pow` feature.
 
 ## Running it
 

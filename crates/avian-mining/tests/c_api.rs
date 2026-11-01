@@ -25,10 +25,51 @@ use common::Rig;
 
 fn workspace_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is crates/avian-mining.
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("workspace root")
+    plain(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root"),
+    )
+}
+
+/// Takes Windows' `\\?\` verbatim prefix back off a canonicalized path.
+///
+/// `canonicalize` always adds it and a mingw `cc` reads it as a share named
+/// `?`, so every path handed to the C compiler goes through here. A no-op
+/// everywhere else.
+fn plain(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(stripped) => PathBuf::from(stripped),
+        None => path,
+    }
+}
+
+/// The triple this test was compiled for, put together from the pieces the
+/// compiler does expose, because it does not expose the triple itself.
+fn own_triple() -> String {
+    let vendor = if cfg!(target_vendor = "apple") {
+        "apple"
+    } else if cfg!(target_vendor = "pc") {
+        "pc"
+    } else {
+        "unknown"
+    };
+    let os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        std::env::consts::OS
+    };
+    let env = if cfg!(target_env = "gnu") {
+        "-gnu"
+    } else if cfg!(target_env = "msvc") {
+        "-msvc"
+    } else if cfg!(target_env = "musl") {
+        "-musl"
+    } else {
+        ""
+    };
+    format!("{}-{vendor}-{os}{env}", std::env::consts::ARCH)
 }
 
 fn cc() -> String {
@@ -45,18 +86,43 @@ fn build_c_program(root: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    // The same cargo profile this test is running under, so the test does not
-    // build a second copy of the world.
-    let profile_dir = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
+    // The same cargo profile and target this test is running under, so the
+    // test does not build a second copy of the world. Both are read off this
+    // binary's own path, <target>/[<triple>/]<profile>/deps/<exe>, because a
+    // test built with `--target` is told nothing else about it: cargo names
+    // the directory for the triple and keeps the triple to itself.
+    let exe = std::env::current_exe().expect("the test binary's own path");
+    let profile_dir = plain(
+        exe.parent()
+            .and_then(Path::parent)
+            .expect("the profile directory")
+            .to_path_buf(),
+    );
+    let profile = profile_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the profile name")
+        .to_string();
+    let triple = own_triple();
+    let cross = profile_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some(triple.as_str());
     for package in ["avian-sv2", "avian-pow"] {
         let mut build = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
         build.current_dir(root).args(["build", "-p", package]);
-        if profile_dir == "release" {
-            build.arg("--release");
+        match profile.as_str() {
+            "debug" => {}
+            "release" => {
+                build.arg("--release");
+            }
+            custom => {
+                build.args(["--profile", custom]);
+            }
+        }
+        if cross {
+            build.args(["--target", &triple]);
         }
         let output = build.output().expect("cargo build");
         assert!(
@@ -66,13 +132,39 @@ fn build_c_program(root: &Path) -> Option<PathBuf> {
         );
     }
 
-    let target = root.join("target").join(profile_dir);
-    let sv2 = target.join("libavian_sv2.a");
-    let pow = target.join("libavian_pow.a");
+    let sv2 = profile_dir.join("libavian_sv2.a");
+    let pow = profile_dir.join("libavian_pow.a");
     assert!(sv2.exists(), "{} was not produced", sv2.display());
     assert!(pow.exists(), "{} was not produced", pow.display());
 
-    let out = std::env::temp_dir().join(format!("avian-c-session-{}", std::process::id()));
+    // libstdc++ because Avian's lyra2, sponge, tiger and uint256 are C++; the
+    // rest is what the Rust standard library needs, which is what
+    // `cargo rustc -- --print native-static-libs` lists for the target. On
+    // Windows that means mingw, and `-static` keeps mingw's own runtime DLLs
+    // from being needed beside the program.
+    let system: &[&str] = if cfg!(windows) {
+        &[
+            "-static",
+            "-lstdc++",
+            "-lpthread",
+            "-lbcrypt",
+            "-ladvapi32",
+            "-lkernel32",
+            "-lntdll",
+            "-luserenv",
+            "-lws2_32",
+            "-ldbghelp",
+            "-lm",
+        ]
+    } else {
+        &["-lstdc++", "-lpthread", "-ldl", "-lm"]
+    };
+
+    let out = std::env::temp_dir().join(format!(
+        "avian-c-session-{}{}",
+        std::process::id(),
+        std::env::consts::EXE_SUFFIX
+    ));
     let status = Command::new(cc())
         .current_dir(root)
         .args([
@@ -88,9 +180,8 @@ fn build_c_program(root: &Path) -> Option<PathBuf> {
         ])
         .arg(&sv2)
         .arg(&pow)
-        // libstdc++ because Avian's lyra2, sponge, tiger and uint256 are C++;
-        // the rest is what the Rust standard library needs.
-        .args(["-lstdc++", "-lpthread", "-ldl", "-lm", "-o"])
+        .args(system)
+        .arg("-o")
         .arg(&out)
         .status()
         .expect("cc");

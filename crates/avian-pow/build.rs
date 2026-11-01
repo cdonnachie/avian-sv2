@@ -80,7 +80,6 @@ fn main() {
     for file in YESPOWER_SOURCES {
         c.file(yespower.join(file));
     }
-    c.compile("avian_algo_c");
 
     let mut cxx = cc::Build::new();
     cxx.cpp(true)
@@ -100,7 +99,14 @@ fn main() {
     }
     cxx.file(src.join("uint256.cpp"));
     cxx.file("csrc/shim.cpp");
+
+    // The C++ archive calls into the C one and nothing calls back, so the C++
+    // library is emitted first. GNU ld takes static archives in the order
+    // given and never looks back, and a `cargo:rustc-link-lib` line lands on
+    // the link line in the order it is printed. A linker that rescans, as
+    // MSVC's and Apple's do, hides the order; a mingw link is where it shows.
     cxx.compile("avian_algo_cxx");
+    c.compile("avian_algo_c");
 }
 
 fn avian_src() -> Option<PathBuf> {
