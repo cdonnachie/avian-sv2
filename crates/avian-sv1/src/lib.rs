@@ -17,6 +17,8 @@
 //! submission goes upstream and the operator's own pool decides what it is
 //! worth.
 
+pub mod client;
 pub mod difficulty;
 pub mod json;
 pub mod message;
+pub mod mock;
