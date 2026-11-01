@@ -1,13 +1,13 @@
 [package]
-name = "avian-sv2-pool"
-description = "An Avian Stratum v2 pool: Template Distribution client and Mining Protocol server"
+name = "avian-sv2-solo"
+description = "An Avian Stratum v2 solo pool: non-custodial, the coinbase pays each worker directly"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "avian-sv2-pool"
+name = "avian-sv2-solo"
 path = "src/main.rs"
 
 [dependencies]

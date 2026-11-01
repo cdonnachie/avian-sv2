@@ -60,7 +60,7 @@ struct Options {
 const DEFAULT_TAG: &str = "/avian-sv2/";
 
 const USAGE: &str = "\
-avian-sv2-pool: an Avian Stratum v2 solo pool
+avian-sv2-solo: an Avian Stratum v2 solo pool
 
 A worker puts its own payout address in user_identity when it opens a channel,
 as `address` or `address.workername`, and the coinbase pays it directly. An

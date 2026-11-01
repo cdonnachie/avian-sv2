@@ -82,7 +82,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "avian-sv2-pool"
+name = "avian-sv2-solo"
 version = "0.1.0"
 dependencies = [
  "avian-mining",

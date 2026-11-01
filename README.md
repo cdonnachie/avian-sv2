@@ -1,18 +1,22 @@
 # avian-sv2
 
-A **Stratum v2 solo mining pool** for [Avian](https://avn.network), and
-**`libavian-sv2`**, the Stratum v2 library with a C API that the pool and the
-miners are built on.
+Stratum v2 for [Avian](https://avn.network), without ever holding anyone's
+coins: **`libavian-sv2`**, the protocol library with a C API that pools and
+miners are built on, and **`avian-sv2-solo`**, a Stratum v2 solo mining pool
+built on it.
 
-Solo means the miner puts its own payout address in `user_identity` when it
-opens a channel, the coinbase pays that address, and consensus pays the miner
-directly. The pool never holds anyone's earnings, which is the point: pooled
-mining means holding other people's money between a block and a payout, and
-solo means never touching it.
+Non-custodial is the line this project holds, and solo is how it holds it
+today. A solo pool has nothing to hold: the miner puts its own payout address
+in `user_identity` when it opens a channel, the coinbase pays that address,
+and consensus pays the miner directly. Pooled mining means holding other
+people's money between a block and a payout, which is the part that is not
+here and the reason there is no `avian-sv2-pool`. An operator who already runs
+a pool and wants Stratum v2 at the miner edge does not need one either: see
+[in front of a pool that already exists](#in-front-of-a-pool-that-already-exists).
 
 The library carries the protocol core and the Mining Protocol client, so a C
 or CUDA miner links a static library and a header instead of writing Stratum
-v2, Noise included, a second and third time. The pool consumes the same
+v2, Noise included, a second and third time. The solo pool consumes the same
 library as an ordinary Rust crate and adds the two halves a miner never needs:
 the Template Distribution client it is to the node, and the Mining Protocol
 server it is to workers.
@@ -23,7 +27,7 @@ crates/avian-sv2        libavian-sv2: Noise, framing, extension codecs,
 crates/avian-pow        Avian's X16RT and MinotaurX. NOT in the library
 crates/avian-tdp        the pool's Template Distribution client and coinbase
 crates/avian-mining     the pool's Mining Protocol server and wiring
-crates/avian-sv2-pool   the pool binary
+crates/avian-sv2-solo   the solo pool binary
 crates/avian-regtest    starts a regtest node for tests; test support only
 ```
 
@@ -68,7 +72,7 @@ to start rather than accepting every share:
 AVIAN_SRC=/path/to/avian/src cargo build --release
 ```
 
-## Running the pool
+## Running the solo pool
 
 Start a regtest node with Stratum v2 enabled, and **generate a block first**:
 the node refuses to build templates while it considers itself in initial block
@@ -81,7 +85,7 @@ avian-cli -regtest -datadir=/tmp/sv2 createwallet w
 ADDR=$(avian-cli -regtest -datadir=/tmp/sv2 getnewaddress)
 avian-cli -regtest -datadir=/tmp/sv2 generatetoaddress 101 $ADDR
 
-cargo run --release -p avian-sv2-pool -- --datadir /tmp/sv2
+cargo run --release -p avian-sv2-solo -- --datadir /tmp/sv2
 ```
 
 The node listens on `127.0.0.1:18447` by default; the pool opens one Template
@@ -89,6 +93,21 @@ Distribution connection per algorithm and serves the Mining Protocol on
 `127.0.0.1:34254`. `--coinbase-tag`, `--operator-fee` and `--operator-fee-bp`
 are the options an operator is likely to want. The pool generates an authority
 key on first run and prints where it put it; miners pin that key.
+
+## In front of a pool that already exists
+
+An operator running a Stratum v1 pool today needs none of the above to offer
+Stratum v2. What they are missing is the protocol edge, not accounting: a
+bridge that terminates Stratum v2 and Noise downstream and speaks Stratum v1
+upstream to the pool they already run gives their miners encryption, an
+authenticated pool identity, binary framing and a coinbase they can read,
+while their own stratum server goes on crediting shares and paying them. The
+bridge holds nothing and credits nothing, which is why it belongs here.
+
+It is not built yet. [`doc/design.md`](doc/design.md#in-front-of-a-pool-that-already-exists)
+carries the message mapping, the two seams in this tree it would need, and the
+one Stratum v2 benefit a bridge cannot deliver. `avian-sv2-bridge` is the name
+reserved for it.
 
 ## Using the library from C
 
@@ -124,8 +143,9 @@ program against the header with `-Werror`, and `CC` overrides `cc`.
 [`doc/design.md`](doc/design.md) is the long version: why solo mining shapes
 the identity format the way it does, what the Stratum v2 specification leaves
 undefined and what this does about it, the two interoperability defects found
-while building it and how they were fixed, the reconnection semantics, and
-what is deliberately not here.
+while building it and how they were fixed, the reconnection semantics, how a
+bridge in front of an existing pool would work, and what is deliberately not
+here.
 
 ## Licence
 
