@@ -27,7 +27,9 @@ crates/avian-sv2        libavian-sv2: Noise, framing, extension codecs,
 crates/avian-pow        Avian's X16RT and MinotaurX. NOT in the library
 crates/avian-tdp        the pool's Template Distribution client and coinbase
 crates/avian-mining     the pool's Mining Protocol server and wiring
+crates/avian-sv1        a Stratum v1 client, for the bridge's upstream
 crates/avian-sv2-solo   the solo pool binary
+crates/avian-sv2-bridge a Stratum v2 front for an existing Stratum v1 pool
 crates/avian-regtest    starts a regtest node for tests; test support only
 ```
 
@@ -1415,8 +1417,8 @@ A bridge forwards shares and holds nothing. Their own stratum server credits
 every share and pays out exactly as it does today, so none of the custodial
 machinery lands in this tree, and their existing frontend keeps working
 untouched, because the shares arrive through their own stratum rather than
-through a reimplementation of it. `avian-sv2-bridge` is the name reserved for
-it. It is not built.
+through a reimplementation of it. It is
+[`avian-sv2-bridge`](../crates/avian-sv2-bridge).
 
 ### What a bridge delivers, and the one thing it cannot
 
@@ -1463,8 +1465,8 @@ So `Job` and `JobWork` in [`job.rs`](../crates/avian-mining/src/job.rs) are
 already the right shape, and only what constructs them changes. A standard
 channel needs no more than the merkle fold `job.rs` already does. `avian-tdp`
 is not used at all, because the backend has already chosen the coinbase, and
-`avian-pow` becomes optional rather than required, which means a bridge can
-build with no Avian source tree and no C++ toolchain.
+`avian-pow` is optional, behind `avian-mining`'s `pow` feature, so the bridge
+builds with no Avian source tree and no C++ toolchain.
 
 `mining.set_difficulty` also hands the operator the vardiff this pool
 deliberately does not have: their backend drives the target, and the bridge
@@ -1496,27 +1498,62 @@ both algos", so `difficulty = powLimit / target` is the same arithmetic for
 X16RT and MinotaurX: `0x00000fffff...` on mainnet and testnet,
 `0x7fffffff...` on regtest.
 
-It still wants a test against a real pool's accepted-share count and not a
-unit test alone. A conversion wrong by a constant factor produces a bridge
+The conversion is
+[`avian-sv1/src/difficulty.rs`](../crates/avian-sv1/src/difficulty.rs), and
+its round trip lands within one hash of work at every difficulty tried. It
+still wants a test against a real pool's accepted-share count and not a unit
+test alone. A conversion wrong by a constant factor produces a bridge
 that looks perfect from the miner's side and miscredits every share in the
 operator's database, silently, which is the worst failure available here.
 
-### The two seams it needs
+### Where the cut landed
 
-Neither exists yet, and neither should be built before there is a second
-implementation to justify it. They are named here so that whoever writes the
-bridge knows where the cut goes:
+Two seams were named here before the bridge existed: a channel that accepts a
+built job instead of the ingredients for one, and a solution sink that could
+be the node or the pool. Writing the bridge with `Channel` open showed the cut
+one level lower. `Channel` is solo policy from end to end: a coinbase from a
+payout plan, a verdict the moment a share is hashed, a target fixed at open.
+The bridge differs in exactly those three places, so it has
+[its own channel](../crates/avian-sv2-bridge/src/channel.rs) and shares what
+sits beneath, which knows nothing about where a job came from or who pays:
+`Job` and `JobWork`, `share::validate`, the submission limiter and the
+message encoding. Nothing in `avian-mining` changed shape. Its three handshake
+functions became public, because `SetupConnection`, `RequestExtensions` and
+`AvianSelectAlgorithm` are the protocol and not the pool, and a miner built
+for the solo pool has to connect to a bridge without knowing the difference.
+The bridge's tests prove that with this project's own `MiningClient`.
 
-- **The job source.**
-  [`Channel::push_work`](../crates/avian-mining/src/channel.rs) takes a `Work`
-  and a `PrevHash`, both Template Distribution types. A bridge pushes a job it
-  translated from `mining.notify` instead, so a channel has to accept a built
-  job rather than the ingredients for one.
-- **The solution sink.** `SolutionSubmitter` in
-  [`session.rs`](../crates/avian-tdp/src/session.rs) is a concrete struct
-  holding the Template Distribution connection's writing half. A solo pool
-  sends a found block to the node; a bridge sends `mining.submit` upstream and
-  lets the pool relay it. Where a solution goes has to become substitutable.
+The solution sink turned out not to be a seam at all. A bridge never has a
+solution: every share goes up as `mining.submit`, block or not, and the pool
+is what submits blocks. With the `pow` feature the bridge can tell that a
+forwarded share was one, and says so to the miner with `AvianBlockFound`,
+never confirmed, because a Stratum v1 pool does not say which share became
+the tip.
+
+Three decisions the mapping table does not show:
+
+- **`ntime` is pinned** unless `--ntime-roll` says otherwise. A Stratum v1
+  pool checks `ntime` against a rule it does not publish, and a share refused
+  for rolling is a share wasted. On X16RT a roll never crosses the 128-second
+  epoch boundary, for the reason the solo pool gives.
+- **An upstream `mining.set_extranonce`** is taken quietly on a standard
+  channel, whose miner never saw the old extranonce as anything but a label,
+  and ends an extended channel, whose miner holds the prefix and the jobs
+  built on it. `SetExtranoncePrefix` exists for that case, but no miner built
+  for the solo pool has ever needed it, and the reconnect a miner already
+  knows how to do gets it the new prefix.
+- **`client.reconnect` is ignored**, and logged. A pool telling its clients to
+  go elsewhere is also the one thing a compromised pool would say, and the
+  operator configured the address on purpose.
+
+What is refused at the bridge, without a round trip, is what it can know on
+its own: the submission rate, a job it no longer holds, a duplicate, and the
+metadata `share::validate` checks before any hashing. Everything else is the
+pool's verdict, which comes back under the miner's own sequence number with
+the pool's numeric code folded to the specification's error string: 21 is
+`stale-share`, 22 `duplicate-share`, 23 `difficulty-too-low`, and a refusal
+the bridge does not recognise is `upstream-rejected`, which tells the miner
+the truth.
 
 ### Why this does not reopen the no-Stratum-v1 decision
 

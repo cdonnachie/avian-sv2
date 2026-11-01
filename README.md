@@ -27,7 +27,9 @@ crates/avian-sv2        libavian-sv2: Noise, framing, extension codecs,
 crates/avian-pow        Avian's X16RT and MinotaurX. NOT in the library
 crates/avian-tdp        the pool's Template Distribution client and coinbase
 crates/avian-mining     the pool's Mining Protocol server and wiring
+crates/avian-sv1        a Stratum v1 client, for the bridge's upstream
 crates/avian-sv2-solo   the solo pool binary
+crates/avian-sv2-bridge a Stratum v2 front for an existing Stratum v1 pool
 crates/avian-regtest    starts a regtest node for tests; test support only
 ```
 
@@ -105,17 +107,28 @@ key on first run and prints where it put it; miners pin that key.
 ## In front of a pool that already exists
 
 An operator running a Stratum v1 pool today needs none of the above to offer
-Stratum v2. What they are missing is the protocol edge, not accounting: a
-bridge that terminates Stratum v2 and Noise downstream and speaks Stratum v1
-upstream to the pool they already run gives their miners encryption, an
-authenticated pool identity, binary framing and a coinbase they can read,
-while their own stratum server goes on crediting shares and paying them. The
-bridge holds nothing and credits nothing, which is why it belongs here.
+Stratum v2. What they are missing is the protocol edge, not accounting, and
+`avian-sv2-bridge` is that edge: it terminates Stratum v2 and Noise downstream
+and speaks Stratum v1 upstream to the pool they already run, one upstream
+connection per miner, opened in the name the miner put in `user_identity`.
+Their miners get encryption, an authenticated pool identity, binary framing and
+a coinbase they can read; their own stratum server goes on crediting shares and
+paying them, untouched. The bridge holds nothing and credits nothing, which is
+why it belongs here.
 
-It is not built yet. [`doc/design.md`](doc/design.md#in-front-of-a-pool-that-already-exists)
-carries the message mapping, the two seams in this tree it would need, and the
-one Stratum v2 benefit a bridge cannot deliver. `avian-sv2-bridge` is the name
-reserved for it.
+```sh
+cargo run --release -p avian-sv2-bridge -- \
+    --upstream x16rt=pool.example:3333 --upstream minotaurx=pool.example:3334
+```
+
+Miners connect to it exactly as they would to the solo pool, pinning the
+authority key it prints. It builds with no Avian source tree and no C++
+toolchain, because the pool judges every share's hash; `--features pow` adds
+the hashers, so a share under the target is refused before it costs the pool a
+round trip. The one Stratum v2 benefit it cannot deliver is job declaration:
+the pool chooses the block.
+[`doc/design.md`](doc/design.md#in-front-of-a-pool-that-already-exists) has
+the message mapping, the difficulty conversion and the reasons.
 
 ## Using the library from C
 
@@ -151,9 +164,8 @@ program against the header with `-Werror`, and `CC` overrides `cc`.
 [`doc/design.md`](doc/design.md) is the long version: why solo mining shapes
 the identity format the way it does, what the Stratum v2 specification leaves
 undefined and what this does about it, the two interoperability defects found
-while building it and how they were fixed, the reconnection semantics, how a
-bridge in front of an existing pool would work, and what is deliberately not
-here.
+while building it and how they were fixed, the reconnection semantics, how the
+bridge in front of an existing pool works, and what is deliberately not here.
 
 ## Licence
 
