@@ -18,13 +18,19 @@
 //! they like, often between the subscribe reply and the authorize reply.
 //! Those are kept and delivered as the first events rather than lost to the
 //! handshake.
+//!
+//! A [`Client`] is `Sync`, so a bridge can hold one in an `Arc` between the
+//! thread that drains its events and the thread that submits on it. The
+//! events sit behind a mutex for that reason alone; nothing else contends
+//! for them, and the thread that reads them holds the guard for as long as
+//! it likes.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use avian_sv2::error::{Error, Result};
@@ -108,7 +114,8 @@ pub struct Client {
     /// Submissions awaiting a verdict, so the reader can tell a reply to one
     /// from a reply to something it never sent.
     pending: Arc<Mutex<HashSet<u64>>>,
-    events: Receiver<Event>,
+    /// Behind a mutex only so the client is `Sync`; see the module docs.
+    events: Mutex<Receiver<Event>>,
 }
 
 impl Client {
@@ -163,7 +170,7 @@ impl Client {
             subscription,
             next_id: AtomicU64::new(FIRST_SUBMIT_ID),
             pending,
-            events,
+            events: Mutex::new(events),
         })
     }
 
@@ -179,8 +186,17 @@ impl Client {
         &self.subscription
     }
 
-    pub fn events(&self) -> &Receiver<Event> {
-        &self.events
+    /// The pool's events, in order. Blocks the next caller for as long as
+    /// the guard is held, which is the point: one thread drains these.
+    pub fn events(&self) -> MutexGuard<'_, Receiver<Event>> {
+        lock(&self.events)
+    }
+
+    /// Closes the connection. The reader thread then reports a closure and
+    /// stops, which is how a bridge ends an upstream session whose miner has
+    /// gone when another thread still holds a reference to the client.
+    pub fn shutdown(&self) {
+        let _ = lock(&self.stream).shutdown(Shutdown::Both);
     }
 
     /// Sends a `mining.submit` and returns the id its verdict will carry in
@@ -221,7 +237,7 @@ impl Drop for Client {
     fn drop(&mut self) {
         // Unblocks the reader thread, which then reports a closure nobody is
         // listening for and exits.
-        let _ = lock(&self.stream).shutdown(Shutdown::Both);
+        self.shutdown();
     }
 }
 
