@@ -9,8 +9,8 @@
 //!
 //! The claim is that the two requirements never meet, because a merkle root is
 //! built from txids and a txid excludes witness data. `solution_check.cpp`
-//! supports that in source — it hashes the coinbase with `GetHash()`, the
-//! txid, and folds the merkle path onto it — but the node is the only thing
+//! supports that in source, it hashes the coinbase with `GetHash()`, the
+//! txid, and folds the merkle path onto it, but the node is the only thing
 //! that settles it.
 //!
 //! So this test mines a block the extended way and has the node accept it:

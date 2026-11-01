@@ -10,7 +10,7 @@ v2 library with a C API that it and the miners are built on.
 
 Solo: a miner puts its own payout address in `user_identity` when it opens a
 channel, the coinbase pays that address, and consensus pays the miner
-directly. The pool never holds anyone's earnings, which is the point — pooled
+directly. The pool never holds anyone's earnings, which is the point: pooled
 mining means holding other people's money between a block and a payout, and
 solo means never touching it.
 
@@ -46,7 +46,7 @@ And the money one, which still holds on both kinds of channel. `aviand` to pool 
 miner to pool to `aviand`, with a regtest block found by hashing, relayed by
 the pool, accepted by the node, reported by `getblock` under the algorithm
 that was negotiated, **and paying the address the miner supplied at channel
-open** — for both algorithms, once driven from Rust and once from a C program
+open**, for both algorithms, once driven from Rust and once from a C program
 that links the static library.
 
 ```
@@ -94,7 +94,7 @@ labels "User". The label is the operator's to read: it is logged and it never
 affects the payout.
 
 The split is on the **first** dot, not the last. No Avian address can contain
-one — neither the base58 alphabet nor the bech32 charset includes a dot — so
+one, since neither the base58 alphabet nor the bech32 charset includes a dot, so
 the first dot is the unambiguous end of the address, and splitting there also
 tolerates a dotted label like `address.rig.1`, which splitting on the last dot
 would mis-read as an address of `address.rig` and refuse. Noted because the
@@ -295,9 +295,9 @@ pool    on a share, reconstructs the whole coinbase including the
         BIP141 witness and submits that
 ```
 
-`src/sv2/solution_check.cpp` bears that out in source — it takes
+`src/sv2/solution_check.cpp` bears that out in source: it takes
 `result.coinbase->GetHash()`, which is the txid, and calls
-`FoldMerklePath(coinbase_txid, ctx.merkle_path)` — so the canonical check only
+`FoldMerklePath(coinbase_txid, ctx.merkle_path)`, so the canonical check only
 ever applies to what the **pool** submits, which the pool controls entirely.
 The witness commitment is unaffected by the extranonce because it commits to
 the witness root of the other transactions plus the coinbase's own fixed
@@ -306,7 +306,7 @@ all-zero witness, and the extranonce lives in the scriptSig.
 **Proved against a live node rather than argued.**
 `crates/avian-tdp/tests/extended_coinbase.rs` mines a block the extended way
 and has the node accept it, for both algorithms, with a **non-empty merkle
-path** — a block with only a coinbase would make the fold a no-op and prove
+path**, since a block with only a coinbase would make the fold a no-op and prove
 far less:
 
 ```
@@ -324,9 +324,9 @@ requirements that look adjacent and never touch.
 `ExtendedWork`, in the library, carries the two halves, the merkle path and the
 extranonce shape. Two questions it can answer that a standard channel cannot:
 
-- `commits_to_script` — is my payout script really in this coinbase? The claim
+- `commits_to_script`: is my payout script really in this coinbase? The claim
   a solo miner most needs, because it is the one a dishonest pool would break.
-- `path_contains` — is this transaction in my block? In a two-transaction block
+- `path_contains`: is this transaction in my block? In a two-transaction block
   the single merkle sibling *is* the other transaction's txid. In a larger
   block the siblings are interior nodes, so this answers only for those that
   happen to be leaves, which is why it is phrased as a question about the path
@@ -359,7 +359,7 @@ pub const MAX_COINBASE_TAG: usize =
 A miner asking for more extranonce than is left after the height push, the
 configured tag and the pool's prefix is refused with
 `min-extranonce-size-too-large`, rather than given a channel whose every
-coinbase the node would reject — which, with no `SubmitSolution.Error`, would
+coinbase the node would reject, which with no `SubmitSolution.Error` would
 be silent.
 
 ### `version_rolling_allowed` is false
@@ -435,7 +435,7 @@ share validation is a stub and nothing downstream can be verified.
 `crates/avian-pow` links Avian's own implementation. It was cheaper than
 feared, because the two entry points are header-only templates: `HashX16R` in
 `src/algo/x16r/x16r.h` and `Minotaurx` in `src/algo/minotaurx/minotaurx.h`.
-Neither needs any of the node's own machinery — only `uint256.h` and the
+Neither needs any of the node's own machinery, only `uint256.h` and the
 algorithm sources `src/CMakeLists.txt` already lists, 24 C and C++ files plus
 `uint256.cpp`. Nothing is copied into this repository and nothing in the Avian
 tree is written to; `build.rs` compiles them in place with the `cc` crate,
@@ -461,7 +461,7 @@ test tests::matches_real_regtest_blocks ... ok
 ```
 
 `PowHasher` is still a trait, with a `MetadataOnlyHasher` beside the real one.
-Not as a fallback — the pool refuses to start without the real hashers — but
+Not as a fallback, the pool refuses to start without the real hashers, but
 because it makes the ordering of the validation ladder testable: a check that
 runs *before* the hash can be proved to run before it by using a hasher that
 fails. Two of the share tests do exactly that. The stub refuses every share
@@ -594,7 +594,7 @@ behind a flag. Nothing was ever deployed against the old transcript, so there
 is nothing to be compatible with, and a flag whose wrong setting produces an
 unexplained MAC failure is a trap rather than a safety net. Part B of the
 spike is the regression guard instead, and it tests the thing that actually
-matters — SRI against the node — rather than this client against itself.
+matters, SRI against the node, rather than this client against itself.
 
 ## The C API
 
@@ -638,7 +638,7 @@ cc -I crates/avian-sv2/include my_miner.c    target/release/libavian_sv2.a -lpth
 
 The static library carries the whole Rust standard library, so nothing else is
 needed beyond libc, libm, libdl and libpthread. The library itself needs **no
-Avian source tree**, because it does no hashing — which is also the simplest
+Avian source tree**, because it does no hashing, which is also the simplest
 demonstration that the split is real.
 
 If you also link `libavian_pow.a`, as the test program does, add `-lstdc++`:
@@ -692,7 +692,7 @@ is on every `MiningJob` and in the C struct.
 **That counter is not decoration.** `submit` originally took a `job_id`, and a
 test caught the consequence: job ids restart at 1 on a new connection, so a
 nonce found for job 1 of the old connection was submitted against job 1 of the
-new one — and the pool accepted it, because it was a structurally valid share
+new one, and the pool accepted it, because it was a structurally valid share
 for a different job. It happened to be a block. `submit` now takes the whole
 `MiningJob` and refuses one from another generation, in Rust and in C alike.
 Hashrate in flight across a reconnect is lost, and there is nowhere for it to
@@ -777,9 +777,9 @@ avian-sv2-solo --datadir /tmp/sv2     --coinbase-tag '/blockminerz.com solo/'   
 [pool] proof of work: Avian's own X16RT and MinotaurX, linked from src/algo
 [pool] x16rt: session open, extension 0x4001 accepted, version_rolling_mask 0x00000000, node certificate verified
 [pool] minotaurx: session open, extension 0x4001 accepted, version_rolling_mask 0x00000000, node certificate verified
-[x16rt] template 1 — the tip moved
+[x16rt] template 1: the tip moved
 [x16rt]   tip 07966e15ab8bf8c1ff4e7b98abbdc3f5fa91f82c6b7fbe4c3ad2bea068f169b4 ntime 1792947890..1792947890
-[minotaurx] template 2 — the tip moved
+[minotaurx] template 2: the tip moved
 [minotaurx]   tip 07966e15ab8bf8c1ff4e7b98abbdc3f5fa91f82c6b7fbe4c3ad2bea068f169b4 ntime 1792947890..1792947890
 [pool] serving the Mining Protocol on 127.0.0.1:34254 for 2 algorithm(s)
 [pool] pool authority public key fd19c02f26ae6e3ba3e241e47633238acf0230feeed247d817f4d4b9b2bf8fb0
@@ -924,8 +924,8 @@ test work_from_before_a_reconnect_cannot_be_submitted ... ok
 test the_pool_reconnects_to_the_node_and_resumes_serving ... ok
 ```
 
-Not a retry counter. The first closes the socket for real — the pool logs
-`worker session ended` — and then asserts a **new channel id**, a bumped
+Not a retry counter. The first closes the socket for real, the pool logs
+`worker session ended`, and then asserts a **new channel id**, a bumped
 generation, a fresh job, and a share accepted on it. The third **stops the
 node and starts it again** on the same datadir, and asserts the pool
 re-established its session and that work resumed all the way back to the node:
@@ -962,8 +962,8 @@ refactor like this has: quietly stopping exercising what it moved.
 
 The client records every protocol message **in the order it arrived**, exposed
 as `MiningClient::trace()`. That is a diagnostic any protocol library should
-have — most of what doc/sv2.md requires of a pool is ordering, and a miner
-debugging a pool needs to see it — and it is also what these tests assert
+have (most of what doc/sv2.md requires of a pool is ordering, and a miner
+debugging a pool needs to see it), and it is also what these tests assert
 against. Asserting that `ntime_min` equals the activating
 `ntime_start` passes whatever order the two messages arrived in; the rule
 doc/sv2.md states is about order:
@@ -981,8 +981,8 @@ test setup_success_always_sets_fixed_version_and_never_extended_channels ... ok
 test the_algorithm_reply_reports_a_zero_version_rolling_mask ... ok
 ```
 
-The cases that have to send something the library refuses to send — the wrong
-`SetupConnection` flags, a `RequestExtensions` without `0x4001` — go straight
+The cases that have to send something the library refuses to send (the wrong
+`SetupConnection` flags, a `RequestExtensions` without `0x4001`) go straight
 at the transport instead, because a product client should not offer a way to
 misbehave:
 
@@ -1057,9 +1057,9 @@ and builds an argument on it:
 Observed against a node with `-sv2interval=2`:
 
 ```
-[x16rt] round 1 — the tip moved
+[x16rt] round 1: the tip moved
 [x16rt]     prev_hash      3a89a2e4eb1882d2558ddccc95c1e6ec4823021ae77a740b77d40cf8f121ee7f
-[x16rt] round 2 — in-place refresh on the same tip
+[x16rt] round 2: in-place refresh on the same tip
 [x16rt]     prev_hash      3a89a2e4eb1882d2558ddccc95c1e6ec4823021ae77a740b77d40cf8f121ee7f
 ```
 
@@ -1123,7 +1123,7 @@ client=6 sent a malformed AvianSelectAlgorithm: sv2: trailing bytes after messag
 ```
 
 and drops the connection. Sending a second, well-formed `AvianSelectAlgorithm`
-does get `AvianSelectAlgorithm.Error "algo-already-selected"` — and then the
+does get `AvianSelectAlgorithm.Error "algo-already-selected"`, and then the
 node drops the connection anyway. That the error reply is immediately followed
 by a disconnect is worth stating, because a client that reads the error and
 tries to carry on will get an unexplained EOF.
@@ -1164,8 +1164,8 @@ This is the mirror image of finding 4 and the same class of defect.
 
 **8. Nothing says what a pool does when a worker clears
 `REQUIRES_STANDARD_JOBS`. Fixed in the document: refuse the connection with
-`missing-standard-jobs-flag`.** The flag table says Avian v1 wants it — "**1**,
-the worker needs `NewMiningJob`" — and explains why, but not what happens if a
+`missing-standard-jobs-flag`.** The flag table says Avian v1 wants it, "**1**,
+the worker needs `NewMiningJob`", and explains why, but not what happens if a
 worker does not set it. There is no "missing required flag" code:
 `unsupported-feature-flags` names flags that *are* unsupported, and the
 specification describes the accompanying `flags` field as indicating "which
@@ -1182,7 +1182,7 @@ The document gives two cases, "active job, `ntime_start` present" and "future
 job, `ntime_start` absent". Neither is what a pool faces most of the time: a
 channel that already has an active job, on a tip that has just moved. Two
 readings are defensible. Issue a new *future* job, then its constraints, then
-the `SetNewPrevHash` that activates it — which preserves the stated invariant
+the `SetNewPrevHash` that activates it, which preserves the stated invariant
 that constraints precede activation. Or issue an *active* job and a
 `SetNewPrevHash`, which arguably breaks it. This pool does the first. One
 sentence would settle it, and it is the steady-state case, so it is the one an
@@ -1203,7 +1203,7 @@ client must reproduce" requires every output in `coinbase_tx_outputs` present
 verbatim, "with the witness commitment the highest-indexed output bearing the
 `aa21a9ed` magic". The pool adds its own payout output and the document does
 not say whether that goes before or after the required ones. The natural
-implementation — append yours at the end — is the one that looks unsafe, since
+implementation, append yours at the end, is the one that looks unsafe, since
 it moves the commitment away from the highest index overall. This pool puts the
 payout first and the required outputs after it, which works. **I did not test
 the other order**, so I cannot say whether it is refused or merely
@@ -1217,8 +1217,8 @@ extension specifies the Mining Protocol half carefully, down to the ordering of
 `AvianJobTimeConstraints` against `SetNewPrevHash`, but neither it nor the
 Stratum v2 specification says anything about identifier reuse across a
 reconnect. Both `channel_id` and `job_id` come from a pool's own counters, and
-a pool that restarts them — as this one does, and as a reasonable
-implementation would — lets a miner holding a nonce for job 1 submit it after
+a pool that restarts them, as this one does and as a reasonable
+implementation would, lets a miner holding a nonce for job 1 submit it after
 a reconnect against a *different* job 1.
 
 This is not hypothetical: it is a bug this project shipped and a test caught,
@@ -1231,8 +1231,8 @@ from reading the document.
 One sentence in the extension would do it: that a share is only valid on the
 connection whose channel issued the job, and that a miner must discard work in
 flight when a connection drops. It is the same class of silent failure the
-extension was created for — a miner hits none of these as an error, it just
-earns nothing or earns someone else's share — which is the argument for it
+extension was created for: a miner hits none of these as an error, it just
+earns nothing or earns someone else's share, which is the argument for it
 being in scope rather than left to the Stratum v2 specification.
 
 ### From building a solo pool

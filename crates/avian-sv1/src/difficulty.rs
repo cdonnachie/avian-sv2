@@ -17,8 +17,8 @@
 //!
 //! Difficulty is defined against a reference target, and Avian's is its
 //! `powLimit`. The one piece of luck here is that there is a single
-//! `powLimit` for both algorithms rather than one each — `src/pow.cpp` in
-//! Avian Core annotates it "Minimum diff, 00000ffff... for both algos" — so
+//! `powLimit` for both algorithms rather than one each, `src/pow.cpp` in
+//! Avian Core annotates it "Minimum diff, 00000ffff... for both algos", so
 //! X16RT and MinotaurX share this arithmetic and a bridge needs no per
 //! algorithm table.
 

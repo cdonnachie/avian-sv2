@@ -10,8 +10,8 @@
 //! is the initiator a pool is to a node, [`Connection::accept`] the responder
 //! it is to a worker.
 //!
-//! A [`Connection`] splits into halves. The two directions share no state —
-//! each has its own cipher, nonce counter and buffer — so one thread can block
+//! A [`Connection`] splits into halves. The two directions share no state,
+//! each has its own cipher, nonce counter and buffer, so one thread can block
 //! on reads while another sends. That is what lets a Mining Protocol server
 //! push a job onto a worker's socket from the thread that received the
 //! template, and what lets a worker thread submit a solution over the Template

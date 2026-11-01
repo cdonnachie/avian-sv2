@@ -141,8 +141,8 @@ fn a_miner_mines_a_block_over_an_extended_channel() {
 
 /// What extended channels exist for: the miner can see what it commits to.
 ///
-/// A known transaction is put in the mempool, and the miner — from nothing but
-/// what it was sent — determines that transaction is in its block, and that
+/// A known transaction is put in the mempool, and the miner, from nothing but
+/// what it was sent, determines that transaction is in its block, and that
 /// its own payout output is in the coinbase. Neither is possible on a standard
 /// channel.
 #[test]

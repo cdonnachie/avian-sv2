@@ -251,7 +251,7 @@ fn run(options: Options) -> Result<(), String> {
 
 fn print_round(pow: PowType, work: &Work, verbose: bool) {
     println!(
-        "[{pow}] template {} — {}",
+        "[{pow}] template {}: {}",
         work.template.template_id,
         if work.tip_changed {
             "the tip moved"

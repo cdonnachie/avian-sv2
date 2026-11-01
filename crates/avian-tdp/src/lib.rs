@@ -1,8 +1,8 @@
 //! The Template Distribution half of the pool: its business with the node.
 //!
 //! No miner speaks this protocol, which is why it is not in the library. What
-//! is in the library is everything underneath it — Noise, framing, the Avian
-//! extension codecs — so this crate is the Template Distribution messages, a
+//! is in the library is everything underneath it (Noise, framing, the Avian
+//! extension codecs), so this crate is the Template Distribution messages, a
 //! session that carries one algorithm, and the coinbase the pool owes the
 //! node.
 //!

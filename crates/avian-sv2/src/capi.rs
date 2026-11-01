@@ -827,7 +827,7 @@ const _: Option<*const c_void> = None;
 /// The header is written by hand. A field added here in the wrong place would
 /// make every member after it read the wrong bytes on the C side, and a job
 /// whose `ntime` or `share_target` silently shifted would mine garbage rather
-/// than fail — which is the failure shape this project keeps running into. So
+/// than fail, which is the failure shape this project keeps running into. So
 /// a C caller passes `sizeof` and `offsetof` once at startup and finds out
 /// immediately.
 ///
