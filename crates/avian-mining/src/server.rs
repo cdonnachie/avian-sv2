@@ -145,11 +145,10 @@ impl ServerConfig {
                 "an operator fee was configured with no address to pay it to".into(),
             ));
         }
-        if !self.fee_script.is_empty() && self.fee_basis_points == 0 {
-            return Err(Error::Protocol(
-                "an operator fee address was configured with a fee of zero".into(),
-            ));
-        }
+        // A fee script with zero basis points is not checked: it is the
+        // donations-only setup, where nothing is taken and a donate/ prefix
+        // has somewhere to go. PayoutPlan emits no fee output for it on a
+        // plain channel.
         if !self.shares_per_minute.is_finite() || self.shares_per_minute <= 0.0 {
             return Err(Error::Protocol(format!(
                 "shares per minute must be above zero, not {}",
@@ -1283,5 +1282,24 @@ mod share_target_tests {
         let mut inverted = config(4.5);
         inverted.max_hash_rate = 1.0;
         assert!(inverted.validate().is_err());
+    }
+
+    #[test]
+    fn a_fee_address_with_a_zero_fee_is_the_donations_only_setup() {
+        let mut donations_only = config(4.5);
+        donations_only.fee_script = vec![0x51];
+        donations_only.fee_basis_points = 0;
+        assert!(
+            donations_only.validate().is_ok(),
+            "charging nothing and still accepting donations is a valid setup"
+        );
+        // The two refusals that remain are still refusals.
+        let mut no_address = config(4.5);
+        no_address.fee_basis_points = 25;
+        assert!(no_address.validate().is_err());
+        let mut whole_coinbase = config(4.5);
+        whole_coinbase.fee_script = vec![0x51];
+        whole_coinbase.fee_basis_points = 10_001;
+        assert!(whole_coinbase.validate().is_err());
     }
 }
