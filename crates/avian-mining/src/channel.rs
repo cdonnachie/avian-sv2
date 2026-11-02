@@ -443,8 +443,10 @@ impl Channel {
             self.send_error(sequence_number, Refusal::InvalidJobId)?;
             if desync == 1 {
                 logln!(
-                    "[pool] channel {} asked for job {}, which it does not have:                      reissuing work rather than counting this against it",
-                    self.id, submission.job_id
+                    "[pool] channel {} asked for job {}, which it does not have: \
+                     reissuing work rather than counting this against it",
+                    self.id,
+                    submission.job_id
                 );
             }
             return Ok(None);

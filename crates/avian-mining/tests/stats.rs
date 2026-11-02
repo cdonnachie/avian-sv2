@@ -88,6 +88,9 @@ fn a_connected_miner_appears_on_the_endpoint() {
     assert!(body.contains("\"worker\": \"test-rig\""), "{body}");
     assert!(body.contains("\"upstream_connected\": true"), "{body}");
     assert!(body.contains("\"current_job_id\": 1"), "{body}");
+    // A refusal for a job the channel no longer holds is not a rejection,
+    // and it is reported under its own name so the page can say so.
+    assert!(body.contains("\"desync\": 0"), "{body}");
     // Stated rather than left to be assumed by whoever reads the page.
     assert!(body.contains("\"vardiff\": false"), "{body}");
     assert!(body.contains("there is no persistence"), "{body}");

@@ -86,7 +86,14 @@ pub struct ChannelSnapshot {
     pub worker: String,
     pub payout_prefix: String,
     pub accepted: u32,
+    /// Submissions the pool counted against the channel: wrong, or too many.
     pub rejected: u32,
+    /// Submissions against a job the channel did not hold. Refused, but not
+    /// counted against the channel: a miner submitting against the only job
+    /// it has done nothing wrong, and the pool reissues work instead. Shown
+    /// separately so a miner that was a job behind can see that, rather than
+    /// a rejected count of zero beside a refusal it watched happen.
+    pub desync: u32,
     pub blocks_submitted: u32,
     pub current_job_id: Option<u32>,
     pub connected_for: Duration,
@@ -169,6 +176,7 @@ impl Snapshot {
                             payout_prefix,
                             accepted,
                             rejected,
+                            desync: channel.desync(),
                             blocks_submitted: channel.blocks(),
                             current_job_id: channel.current_job_id(),
                             connected_for,
@@ -271,6 +279,7 @@ impl Snapshot {
                 ));
                 out.push_str(&format!("          \"accepted\": {},\n", channel.accepted));
                 out.push_str(&format!("          \"rejected\": {},\n", channel.rejected));
+                out.push_str(&format!("          \"desync\": {},\n", channel.desync));
                 out.push_str(&format!(
                     "          \"blocks_submitted\": {},\n",
                     channel.blocks_submitted

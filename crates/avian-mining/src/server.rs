@@ -834,7 +834,8 @@ impl Server {
                         // the node's -debug=sv2 log.
                         logln!(
                             "[pool] channel {} found a block for template {}, submitting",
-                            channel.id, candidate.template_id
+                            channel.id,
+                            candidate.template_id
                         );
                         channel.record_block();
                         algo.blocks.fetch_add(1, Ordering::Relaxed);
