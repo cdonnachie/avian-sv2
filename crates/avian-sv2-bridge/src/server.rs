@@ -27,6 +27,7 @@ use avian_sv1::client::{self, Client, Event};
 use avian_sv1::message::Notify;
 use avian_sv2::avian::PowType;
 use avian_sv2::error::{Error, Result};
+use avian_sv2::logln;
 use avian_sv2::transport::{Connection, ConnectionReader, ConnectionWriter};
 use mining_sv2::{
     OpenMiningChannelError, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
@@ -164,7 +165,7 @@ impl Bridge {
                 let bridge = self.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = bridge.serve(stream) {
-                        eprintln!("[bridge] miner session ended: {e}");
+                        logln!("[bridge] miner session ended: {e}");
                     }
                 });
             }
@@ -179,7 +180,7 @@ impl Bridge {
         let peer = stream.peer_addr()?;
         let conn = Connection::accept(stream, &self.config.authority, self.config.cert_validity)?;
         let (mut reader, writer) = conn.split();
-        eprintln!("[bridge] {peer} completed the Noise handshake");
+        logln!("[bridge] {peer} completed the Noise handshake");
 
         // The handshake is the solo pool's, verbatim: a miner built for one
         // connects to the other without knowing the difference.
@@ -195,7 +196,7 @@ impl Bridge {
             .ok_or_else(|| Error::Protocol(format!("no upstream for {pow}")))?;
 
         let (channel, upstream) = self.open_channel(&mut reader, &writer, pow, upstream_addr)?;
-        eprintln!(
+        logln!(
             "[bridge] {peer} opened channel {} on {pow} as {:?}, difficulty {} upstream at {}",
             channel.id,
             channel.identity,
@@ -209,7 +210,7 @@ impl Bridge {
             let writer = writer.clone();
             std::thread::spawn(move || {
                 let why = pump_upstream(&channel, &upstream);
-                eprintln!(
+                logln!(
                     "[bridge] channel {}: upstream session over: {why}",
                     channel.id
                 );
@@ -229,7 +230,7 @@ impl Bridge {
         upstream.shutdown();
         let _ = pump.join();
         let (invalid, refused) = channel.refusals();
-        eprintln!(
+        logln!(
             "[bridge] channel {} closed: {} accepted, {invalid} invalid, {refused} refused for \
              rate, {} unanswered",
             channel.id,
@@ -359,7 +360,7 @@ impl Bridge {
                 }
             };
         let difficulty = difficulty.unwrap_or_else(|| {
-            eprintln!(
+            logln!(
                 "[bridge] {upstream_addr} sent a job before any difficulty; assuming Stratum's \
                  default of 1"
             );
@@ -388,7 +389,7 @@ impl Bridge {
                 return Err(e);
             }
         };
-        eprintln!(
+        logln!(
             "[bridge] {} channel {id} for {identity:?} on {pow}, up to {:.2} submissions/s",
             if kind.is_extended() {
                 "extended"
@@ -487,7 +488,7 @@ fn pump_upstream(channel: &BridgeChannel, upstream: &Client) -> String {
                 // also the one thing a compromised pool would say, and the
                 // operator configured this address on purpose. Logged, so
                 // the operator can reconfigure if it was meant.
-                eprintln!(
+                logln!(
                     "[bridge] channel {}: the pool asked for a reconnect to {host}:{port}, \
                      which is ignored; change --upstream if that was intended",
                     channel.id

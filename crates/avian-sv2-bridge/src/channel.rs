@@ -30,6 +30,7 @@ use avian_sv1::message::{Notify, Subscription};
 use avian_sv2::avian::{self, PowType, EXT_AVIAN, MSG_JOB_TIME_CONSTRAINTS, TIME_MASK};
 use avian_sv2::block;
 use avian_sv2::error::{Error, Result};
+use avian_sv2::logln;
 use avian_sv2::transport::ConnectionWriter;
 use avian_tdp::coinbase::CoinbaseSplit;
 use binary_sv2::{Seq0255, Sv2Option, U256};
@@ -588,7 +589,7 @@ impl BridgeChannel {
             // Only with the hashers. The pool submits the block, not the
             // bridge, so this is forwarded and never confirmed: a Stratum v1
             // pool does not say which share became the tip.
-            eprintln!(
+            logln!(
                 "[bridge] channel {} forwarded a share at or under the network target",
                 self.id
             );

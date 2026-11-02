@@ -788,6 +788,13 @@ avian-sv2-solo --datadir /tmp/sv2     --coinbase-tag '/blockminerz.com solo/'   
 [pool] pool authority public key fd19c02f26ae6e3ba3e241e47633238acf0230feeed247d817f4d4b9b2bf8fb0
 ```
 
+Every line is prefixed `[2026-11-02 12:17:56Z]` from the system clock, which
+the transcripts here leave out to stay inside a page. UTC with the Z spelled
+out, because the pool usually runs in a container on UTC while a miner on the
+host logs local time, and two logs that are five hours apart with nothing
+saying why read as a contradiction. All of it goes to stderr, so one stream
+carries the whole log in order.
+
 The listener does not open until a template has arrived for every algorithm,
 because a worker that connected before one had no target to be given and no
 job to mine.

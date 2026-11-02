@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use avian_sv2::avian::{self, PowType, EXT_AVIAN, MSG_JOB_TIME_CONSTRAINTS};
 use avian_sv2::error::{Error, Result};
+use avian_sv2::logln;
 use avian_sv2::transport::ConnectionWriter;
 use avian_tdp::coinbase::PayoutPlan;
 use avian_tdp::tdp::PrevHash;
@@ -441,7 +442,7 @@ impl Channel {
             drop(state);
             self.send_error(sequence_number, Refusal::InvalidJobId)?;
             if desync == 1 {
-                eprintln!(
+                logln!(
                     "[pool] channel {} asked for job {}, which it does not have:                      reissuing work rather than counting this against it",
                     self.id, submission.job_id
                 );

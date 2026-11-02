@@ -13,6 +13,7 @@ use avian_sv2::avian::{
 };
 use avian_sv2::block;
 use avian_sv2::error::{Error, Result};
+use avian_sv2::logln;
 use avian_sv2::transport::{Connection, ConnectionReader, ConnectionWriter};
 use avian_sv2::wire::{Reader, Writer};
 use avian_tdp::coinbase::{
@@ -331,9 +332,9 @@ impl AlgoContext {
             self.confirmed.fetch_add(1, Ordering::Relaxed);
             if let Some(channel) = channels.iter().find(|c| c.id == channel_id) {
                 if let Err(e) = channel.send_block_found(sequence, tip, true) {
-                    eprintln!("[pool] channel {channel_id}: could not confirm its block: {e}");
+                    logln!("[pool] channel {channel_id}: could not confirm its block: {e}");
                 } else {
-                    eprintln!("[pool] channel {channel_id}'s block is the tip now, told it so");
+                    logln!("[pool] channel {channel_id}'s block is the tip now, told it so");
                 }
             }
         }
@@ -498,7 +499,7 @@ impl Server {
                 let server = self.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = server.serve(stream) {
-                        eprintln!("[pool] worker session ended: {e}");
+                        logln!("[pool] worker session ended: {e}");
                     }
                 });
             }
@@ -513,7 +514,7 @@ impl Server {
         let peer = stream.peer_addr()?;
         let conn = Connection::accept(stream, &self.config.authority, self.config.cert_validity)?;
         let (mut reader, writer) = conn.split();
-        eprintln!("[pool] {peer} completed the Noise handshake");
+        logln!("[pool] {peer} completed the Noise handshake");
 
         setup_connection(&mut reader, &writer)?;
         request_extensions(&mut reader, &writer)?;
@@ -524,7 +525,7 @@ impl Server {
             .ok_or_else(|| Error::Protocol(format!("no session for {pow}")))?;
 
         let channel = self.open_channel(&mut reader, &writer, algo)?;
-        eprintln!("[pool] {peer} opened channel {} on {pow}", channel.id);
+        logln!("[pool] {peer} opened channel {} on {pow}", channel.id);
 
         let result = self.pump_submissions(&mut reader, algo, &channel);
         algo.unregister(channel.id);
@@ -679,7 +680,7 @@ impl Server {
         let mut fee_basis_points = self.config.fee_basis_points;
         if parsed.donation_basis_points > 0 {
             if self.config.fee_script.is_empty() {
-                eprintln!(
+                logln!(
                     "[pool] {} offered {}.{:02}% but no donation address is set, \
                      so it keeps the lot",
                     parsed.address_text,
@@ -717,7 +718,7 @@ impl Server {
             self.config.rate_limit,
             writer.clone(),
         ));
-        eprintln!(
+        logln!(
             "[pool] {} channel {id} pays {} ({:?}){}, worker {:?}, up to {:.2} submissions/s",
             if kind.is_extended() {
                 "extended"
@@ -815,11 +816,11 @@ impl Server {
                     if channel.wants_work() {
                         if let Some((work, prev)) = algo.current() {
                             match channel.push_work(&work, &prev) {
-                                Ok(()) => eprintln!(
+                                Ok(()) => logln!(
                                     "[pool] channel {} reissued work after a desync",
                                     channel.id
                                 ),
-                                Err(e) => eprintln!(
+                                Err(e) => logln!(
                                     "[pool] channel {} could not be reissued work: {e}",
                                     channel.id
                                 ),
@@ -831,7 +832,7 @@ impl Server {
                         // so it goes up to the node. There is no reply to a
                         // SubmitSolution: the only way to see it refused is
                         // the node's -debug=sv2 log.
-                        eprintln!(
+                        logln!(
                             "[pool] channel {} found a block for template {}, submitting",
                             channel.id, candidate.template_id
                         );
@@ -843,7 +844,7 @@ impl Server {
                         if let Err(e) =
                             channel.send_block_found(submit.sequence_number, &candidate.hash, false)
                         {
-                            eprintln!(
+                            logln!(
                                 "[pool] channel {}: could not tell it about its block: {e}",
                                 channel.id
                             );

@@ -15,6 +15,7 @@ use avian_mining::ratelimit::RateLimitConfig;
 use avian_mining::share::PowHasher;
 use avian_sv1::difficulty;
 use avian_sv2::address;
+use avian_sv2::logln;
 use avian_sv2::wire::hex;
 use avian_sv2_bridge::server::{Bridge, BridgeConfig};
 use avian_tdp::PowType;
@@ -108,9 +109,9 @@ fn run(options: Options) -> Result<(), String> {
     let (pubkey, _) = authority.x_only_public_key();
 
     let hasher: Arc<dyn PowHasher> = hasher();
-    println!("[bridge] proof of work: {}", hasher.describe());
+    logln!("[bridge] proof of work: {}", hasher.describe());
     if hasher.hash(PowType::X16rt, &[0u8; 80]).is_none() {
-        println!(
+        logln!(
             "[bridge] shares are checked for everything but the hash here; the pool judges the \
              hash"
         );
@@ -121,7 +122,7 @@ fn run(options: Options) -> Result<(), String> {
         .iter()
         .map(|(pow, addr)| format!("{pow} at {addr}"))
         .collect();
-    println!(
+    logln!(
         "[bridge] in front of {} on {}: {}",
         if algorithms.len() == 1 {
             "one pool"
@@ -154,15 +155,15 @@ fn run(options: Options) -> Result<(), String> {
         .map_err(|e| e.to_string())?,
     );
     let handle = bridge.listen().map_err(|e| e.to_string())?;
-    println!("[bridge] serving the Mining Protocol on {}", handle.addr());
+    logln!("[bridge] serving the Mining Protocol on {}", handle.addr());
     // Both forms, for the solo pool's reason: the two miner stacks present
     // x-only keys differently, and an operator who publishes the wrong one
     // has a bridge nobody can connect to.
-    println!(
+    logln!(
         "[bridge] authority public key, base58 (Stratum v2 miner configuration):\n    {}",
         address::encode_authority_key(&pubkey)
     );
-    println!(
+    logln!(
         "[bridge] authority public key, hex (32-byte x-only):\n    {}",
         hex(&pubkey.serialize())
     );
@@ -214,7 +215,7 @@ fn load_or_create_pool_key(path: &Path) -> Result<Keypair, String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
-    println!(
+    logln!(
         "[bridge] generated a new authority key in {}",
         path.display()
     );
@@ -316,7 +317,7 @@ fn parse_args() -> Result<Option<Options>, String> {
         ));
     }
     if allow_public_bind {
-        eprintln!(
+        logln!(
             "[bridge] --allow-public-bind: the mining port may be on a non-loopback address. \
              Publish that port and nothing else."
         );

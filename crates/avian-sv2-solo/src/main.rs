@@ -24,6 +24,7 @@ use avian_mining::share::{AvianHasher, PowHasher};
 use avian_mining::stats::{self, Snapshot};
 use avian_sv2::address::{self, Address, Network};
 use avian_sv2::avian::TimeConstraints;
+use avian_sv2::logln;
 use avian_sv2::wire::{hex, hex_rev};
 use avian_sv2::Backoff;
 use avian_tdp::coinbase::MAX_COINBASE_TAG;
@@ -148,7 +149,7 @@ fn run(options: Options) -> Result<(), String> {
     let (pool_pubkey, _) = authority.x_only_public_key();
 
     let hasher: Arc<dyn PowHasher> = Arc::new(AvianHasher);
-    println!("[pool] proof of work: {}", hasher.describe());
+    logln!("[pool] proof of work: {}", hasher.describe());
     if hasher.hash(PowType::X16rt, &[0u8; 80]).is_none() {
         return Err(
             "the proof-of-work hashers are not available, so no share could be validated. \
@@ -157,21 +158,21 @@ fn run(options: Options) -> Result<(), String> {
         );
     }
 
-    println!(
+    logln!(
         "[pool] solo on {}: a worker's own address is paid, from user_identity at channel open",
         options.network
     );
     // Three setups, said out loud, because the one in the middle used to be
     // refused and an operator who expects that should see it start.
     match (options.fee_script.is_empty(), options.fee_basis_points) {
-        (true, _) => println!(
+        (true, _) => logln!(
             "[pool] no operator fee and no donation address: a donate/ prefix is \
              logged and the miner keeps everything"
         ),
         (false, 0) => {
-            println!("[pool] no operator fee; a donate/ prefix pays the --operator-fee address")
+            logln!("[pool] no operator fee; a donate/ prefix pays the --operator-fee address")
         }
-        (false, bp) => println!(
+        (false, bp) => logln!(
             "[pool] operator fee {}.{:02}%; a donate/ prefix adds to it",
             bp / 100,
             bp % 100
@@ -214,7 +215,7 @@ fn run(options: Options) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    println!(
+    logln!(
         "[pool] serving the Mining Protocol on {} for {} algorithm(s)",
         handle.mining_addr(),
         options.algorithms.len()
@@ -230,7 +231,7 @@ fn run(options: Options) -> Result<(), String> {
                 Snapshot::gather(started_at, &algos, published_key.clone())
             })
             .map_err(|e| format!("--stats-bind {bind}: {e}"))?;
-            println!(
+            logln!(
                 "[pool] read-only stats JSON on {} at /stats. Do not publish this port.",
                 handle.addr()
             );
@@ -245,11 +246,11 @@ fn run(options: Options) -> Result<(), String> {
     // who publishes the wrong one has a pool nobody can connect to, and the
     // symptom is a handshake that never completes, so print both rather than
     // guess.
-    println!(
+    logln!(
         "[pool] authority public key, base58 (Stratum v2 miner configuration):\n    {}",
         address::encode_authority_key(&pool_pubkey)
     );
-    println!(
+    logln!(
         "[pool] authority public key, hex (32-byte x-only):\n    {}",
         hex(&pool_pubkey.serialize())
     );
@@ -259,7 +260,7 @@ fn run(options: Options) -> Result<(), String> {
 }
 
 fn print_round(pow: PowType, work: &Work, verbose: bool) {
-    println!(
+    logln!(
         "[{pow}] template {}: {}",
         work.template.template_id,
         if work.tip_changed {
@@ -269,13 +270,13 @@ fn print_round(pow: PowType, work: &Work, verbose: bool) {
         }
     );
     if verbose {
-        println!("{}", work.template);
+        eprintln!("{}", work.template);
         if let Some(prev) = &work.prev_hash {
-            println!("{prev}");
+            eprintln!("{prev}");
         }
-        println!("{}", work.constraints);
+        eprintln!("{}", work.constraints);
     } else if let Some(prev) = &work.prev_hash {
-        println!(
+        logln!(
             "[{pow}]   tip {} ntime {}..{}{}",
             hex_rev(&prev.prev_hash),
             work.constraints.ntime_min,
@@ -322,7 +323,7 @@ fn load_or_create_pool_key(path: &Path) -> Result<Keypair, String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
-    println!("[pool] generated a new authority key in {}", path.display());
+    logln!("[pool] generated a new authority key in {}", path.display());
     Ok(Keypair::from_secret_key(&secp, &secret))
 }
 
@@ -523,7 +524,7 @@ fn parse_args() -> Result<Option<Options>, String> {
         // Worth a line in the log. Inside a container this is correct and
         // necessary; on a host it means the mining port is reachable from the
         // network, which is a decision rather than an accident.
-        eprintln!(
+        logln!(
             "[pool] --allow-public-bind: listeners may be on non-loopback \
              addresses. Publish the mining port only, never the node's \
              Stratum v2 port or this pool's stats port."

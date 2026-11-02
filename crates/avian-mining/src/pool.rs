@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use avian_sv2::avian::PowType;
 use avian_sv2::error::{Error, Result};
+use avian_sv2::logln;
 use avian_sv2::Backoff;
 use avian_tdp::session::Round;
 use avian_tdp::{ReconnectingSession, SessionConfig, Work};
@@ -158,7 +159,7 @@ fn pump(
                     observer(algo.pow, &work);
                 }
                 for (id, e) in algo.publish(work) {
-                    eprintln!("[pool] {} channel {id}: {e}", algo.pow);
+                    logln!("[pool] {} channel {id}: {e}", algo.pow);
                 }
             }
             Ok(Round::Reconnected {
@@ -170,7 +171,7 @@ fn pump(
                 // to be withdrawn. The next round pushes fresh jobs, and each
                 // channel's first one will be a future job again.
                 let withdrawn = algo.withdraw();
-                eprintln!(
+                logln!(
                     "[pool] {}: reconnected to the node after {attempts} attempt(s), session \
                      {generation}; withdrew the jobs on {withdrawn} channel(s) because template \
                      ids do not survive a reconnect",
@@ -181,7 +182,7 @@ fn pump(
                 // Past the deadline any failure is the deadline, since the
                 // read timeout is what fired.
                 if !deadline.is_some_and(|d| Instant::now() >= d) {
-                    eprintln!("[pool] {}: {e}", algo.pow);
+                    logln!("[pool] {}: {e}", algo.pow);
                 }
                 return;
             }

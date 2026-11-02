@@ -40,6 +40,7 @@ pub mod block;
 pub mod capi;
 pub mod client;
 pub mod error;
+pub mod log;
 pub mod reconnect;
 pub mod transport;
 pub mod wire;
