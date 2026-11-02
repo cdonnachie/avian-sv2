@@ -94,6 +94,13 @@ pub struct ChannelSnapshot {
     /// separately so a miner that was a job behind can see that, rather than
     /// a rejected count of zero beside a refusal it watched happen.
     pub desync: u32,
+    /// What the worker offered with a `donate/` prefix, in basis points;
+    /// zero when it offered nothing.
+    pub donation_bp: u32,
+    /// Whether that offer goes anywhere. False when there is no fee script
+    /// to pay it to, which the pool logs at open and the page should show:
+    /// "offered 2.00%, nowhere to put it" is not "donating 2.00%".
+    pub donation_paid: bool,
     pub blocks_submitted: u32,
     pub current_job_id: Option<u32>,
     pub connected_for: Duration,
@@ -177,6 +184,8 @@ impl Snapshot {
                             accepted,
                             rejected,
                             desync: channel.desync(),
+                            donation_bp: channel.donation_basis_points,
+                            donation_paid: channel.donation_paid(),
                             blocks_submitted: channel.blocks(),
                             current_job_id: channel.current_job_id(),
                             connected_for,
@@ -280,6 +289,14 @@ impl Snapshot {
                 out.push_str(&format!("          \"accepted\": {},\n", channel.accepted));
                 out.push_str(&format!("          \"rejected\": {},\n", channel.rejected));
                 out.push_str(&format!("          \"desync\": {},\n", channel.desync));
+                out.push_str(&format!(
+                    "          \"donation_bp\": {},\n",
+                    channel.donation_bp
+                ));
+                out.push_str(&format!(
+                    "          \"donation_paid\": {},\n",
+                    channel.donation_paid
+                ));
                 out.push_str(&format!(
                     "          \"blocks_submitted\": {},\n",
                     channel.blocks_submitted

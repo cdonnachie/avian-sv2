@@ -14,10 +14,12 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+use avian_mining::ratelimit::RateLimitConfig;
 use avian_mining::stats::{self, Snapshot};
+use avian_regtest::Node;
 use avian_sv2::avian::PowType;
 use avian_sv2::client::MiningClient;
-use common::{Rig, WORKER_ADDRESS};
+use common::{script_for, Rig, FEE_ADDRESS, WORKER_ADDRESS};
 
 macro_rules! rig {
     ($tag:expr, $slot:expr, $algos:expr) => {
@@ -91,6 +93,9 @@ fn a_connected_miner_appears_on_the_endpoint() {
     // A refusal for a job the channel no longer holds is not a rejection,
     // and it is reported under its own name so the page can say so.
     assert!(body.contains("\"desync\": 0"), "{body}");
+    // No donate/ prefix: nothing offered, and so nothing to pay.
+    assert!(body.contains("\"donation_bp\": 0"), "{body}");
+    assert!(body.contains("\"donation_paid\": false"), "{body}");
     // Stated rather than left to be assumed by whoever reads the page.
     assert!(body.contains("\"vardiff\": false"), "{body}");
     assert!(body.contains("there is no persistence"), "{body}");
@@ -112,6 +117,51 @@ fn the_endpoint_shows_a_prefix_and_not_a_payout_address() {
         body.contains(&format!("\"payout_prefix\": \"{prefix}\"")),
         "a recognisable prefix should still be there: {body}"
     );
+}
+
+/// A worker that offers a donation to a pool with nowhere to send it keeps
+/// the lot, and the endpoint has to say that is what happened: the offer is
+/// reported, and so is the fact that it went nowhere.
+#[test]
+fn an_offer_with_nowhere_to_go_is_reported_as_unpaid() {
+    let rig = rig!("stats-donation-offered", 75, &[PowType::MinotaurX]);
+    let handle = serve(&rig);
+    let mut config = rig.client_config(PowType::MinotaurX);
+    config.user_identity = format!("donate/2/{WORKER_ADDRESS}.test-rig");
+    let _miner = MiningClient::connect(config).expect("the client should connect");
+
+    let (_head, body) = request(handle.addr(), "GET /stats HTTP/1.1");
+    assert!(body.contains("\"donation_bp\": 200"), "{body}");
+    assert!(body.contains("\"donation_paid\": false"), "{body}");
+}
+
+/// The same offer to a pool with a fee address is paid, and the offer is
+/// reported as what the worker asked for, not folded into the fee.
+#[test]
+fn an_offer_with_a_fee_address_is_reported_as_paid() {
+    let Some(node) = Node::start("stats-donation-paid", 76, &[]) else {
+        eprintln!("skipping: aviand or avian-cli not found");
+        return;
+    };
+    node.mine(101);
+    let Some(rig) = Rig::attach_with(
+        node,
+        &[PowType::MinotaurX],
+        None,
+        (script_for(FEE_ADDRESS), 250),
+        RateLimitConfig::default(),
+    ) else {
+        return;
+    };
+    let handle = serve(&rig);
+    let mut config = rig.client_config(PowType::MinotaurX);
+    config.user_identity = format!("donate/0.5/{WORKER_ADDRESS}.test-rig");
+    let _miner = MiningClient::connect(config).expect("the client should connect");
+
+    let (_head, body) = request(handle.addr(), "GET /stats HTTP/1.1");
+    // 0.5%, as offered: the 2.5% fee is not added into it.
+    assert!(body.contains("\"donation_bp\": 50"), "{body}");
+    assert!(body.contains("\"donation_paid\": true"), "{body}");
 }
 
 #[test]

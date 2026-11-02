@@ -711,6 +711,7 @@ impl Server {
             algo.pow,
             share_target,
             payout,
+            parsed.donation_basis_points,
             parsed.worker.clone(),
             parsed.address_text.clone(),
             self.config.coinbase_tag.clone(),

@@ -84,6 +84,12 @@ pub struct Channel {
     /// Who the coinbase pays. From the worker's `user_identity`, not from
     /// configuration.
     pub payout: PayoutPlan,
+    /// What the worker offered to leave with a `donate/` prefix, in basis
+    /// points, before any operator fee; zero when it offered nothing. Kept
+    /// apart from `payout`, which only knows the combined number and, with
+    /// no fee script, knows nothing: an offer with nowhere to go is the case
+    /// an operator most needs to see.
+    pub donation_basis_points: u32,
     /// The worker label after the address, for logging only.
     pub worker: String,
     /// The payout address as the worker wrote it. Kept so the stats endpoint
@@ -132,6 +138,7 @@ impl Channel {
         pow: PowType,
         share_target: [u8; 32],
         payout: PayoutPlan,
+        donation_basis_points: u32,
         worker: String,
         payout_address: String,
         coinbase_tag: Vec<u8>,
@@ -152,6 +159,7 @@ impl Channel {
                 ChannelKind::Extended { .. } => job::extranonce_prefix(id),
             },
             payout,
+            donation_basis_points,
             worker,
             payout_address,
             opened_at: Instant::now(),
@@ -571,6 +579,13 @@ impl Channel {
     /// Shares from this channel that were at or under the network target.
     pub fn blocks(&self) -> u32 {
         self.state.lock().map(|s| s.blocks).unwrap_or(0)
+    }
+
+    /// Whether what the worker offered goes anywhere, which is whether there
+    /// is a fee script to pay it to. False with an offer and no script: the
+    /// pool logged that at open and the worker keeps the lot.
+    pub fn donation_paid(&self) -> bool {
+        self.donation_basis_points > 0 && !self.payout.fee_script.is_empty()
     }
 
     /// Shares this channel sent against a job it did not have.
