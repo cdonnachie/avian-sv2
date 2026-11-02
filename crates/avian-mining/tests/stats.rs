@@ -64,8 +64,9 @@ fn serve(rig: &Rig) -> stats::StatsHandle {
     let algos: Vec<_> = rig.pool.algos().to_vec();
     let started_at = rig.pool.started_at();
     let authority = PUBLISHED_KEY.to_string();
+    let operator_fee = rig.pool.operator_fee();
     stats::serve("127.0.0.1:0".parse().unwrap(), move || {
-        Snapshot::gather(started_at, &algos, authority.clone())
+        Snapshot::gather(started_at, &algos, authority.clone(), operator_fee)
     })
     .expect("the stats listener should bind")
 }
@@ -96,6 +97,10 @@ fn a_connected_miner_appears_on_the_endpoint() {
     // No donate/ prefix: nothing offered, and so nothing to pay.
     assert!(body.contains("\"donation_bp\": 0"), "{body}");
     assert!(body.contains("\"donation_paid\": false"), "{body}");
+    // No fee and no address: the page can say the pool charges nothing, and
+    // must not show a miner how to donate, since an offer would go nowhere.
+    assert!(body.contains("\"operator_fee_bp\": 0"), "{body}");
+    assert!(body.contains("\"donations_accepted\": false"), "{body}");
     // Stated rather than left to be assumed by whoever reads the page.
     assert!(body.contains("\"vardiff\": false"), "{body}");
     assert!(body.contains("there is no persistence"), "{body}");
@@ -161,6 +166,40 @@ fn an_offer_with_a_fee_address_is_reported_as_paid() {
     let (_head, body) = request(handle.addr(), "GET /stats HTTP/1.1");
     // 0.5%, as offered: the 2.5% fee is not added into it.
     assert!(body.contains("\"donation_bp\": 50"), "{body}");
+    assert!(body.contains("\"donation_paid\": true"), "{body}");
+    // And the fee itself, from the configuration the coinbase uses.
+    assert!(body.contains("\"operator_fee_bp\": 250"), "{body}");
+    assert!(body.contains("\"donations_accepted\": true"), "{body}");
+}
+
+/// The donations-only setup: an address and no fee. The endpoint says both,
+/// because that is what lets a page print "this pool charges nothing" and,
+/// beside it, how to leave something anyway.
+#[test]
+fn a_pool_that_charges_nothing_can_still_accept_a_donation() {
+    let Some(node) = Node::start("stats-donations-only", 77, &[]) else {
+        eprintln!("skipping: aviand or avian-cli not found");
+        return;
+    };
+    node.mine(101);
+    let Some(rig) = Rig::attach_with(
+        node,
+        &[PowType::MinotaurX],
+        None,
+        (script_for(FEE_ADDRESS), 0),
+        RateLimitConfig::default(),
+    ) else {
+        return;
+    };
+    let handle = serve(&rig);
+    let mut config = rig.client_config(PowType::MinotaurX);
+    config.user_identity = format!("donate/1/{WORKER_ADDRESS}.test-rig");
+    let _miner = MiningClient::connect(config).expect("the client should connect");
+
+    let (_head, body) = request(handle.addr(), "GET /stats HTTP/1.1");
+    assert!(body.contains("\"operator_fee_bp\": 0"), "{body}");
+    assert!(body.contains("\"donations_accepted\": true"), "{body}");
+    assert!(body.contains("\"donation_bp\": 100"), "{body}");
     assert!(body.contains("\"donation_paid\": true"), "{body}");
 }
 

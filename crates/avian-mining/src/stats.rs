@@ -46,6 +46,25 @@ use crate::server::AlgoContext;
 /// How much of a payout address the endpoint will show.
 const ADDRESS_PREFIX: usize = 8;
 
+/// The operator's side of the coinbase, as configured.
+///
+/// Published so the page that renders the endpoint can say what the pool
+/// charges, and can show a miner how to donate only when an offer would be
+/// paid rather than logged. Both numbers come from the configuration the
+/// coinbase is built from, which is the point: a second copy in the
+/// renderer's own environment would be free to disagree with the one in use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OperatorFee {
+    /// Hundredths of a percent taken from every block; zero when nothing is.
+    pub basis_points: u32,
+    /// Whether there is an address to pay to. With a zero fee this is the
+    /// donations-only setup, where nothing is taken and an offer is paid.
+    /// Without one an offer is logged and the miner keeps the lot, so a page
+    /// that invites offers when this is false invites something the pool
+    /// cannot honour.
+    pub has_address: bool,
+}
+
 /// Everything the endpoint reports, gathered in one pass.
 pub struct Snapshot {
     pub uptime: Duration,
@@ -58,6 +77,8 @@ pub struct Snapshot {
     /// than publishing none, since a miner would pin to something that either
     /// fails or belongs to whoever holds it now.
     pub authority_public_key: String,
+    /// What the operator takes, and whether a donation goes anywhere.
+    pub operator_fee: OperatorFee,
     /// There is no persistence, so every count below starts at this process's
     /// start. The endpoint says so rather than leaving it to be assumed.
     pub algorithms: Vec<AlgoSnapshot>,
@@ -153,6 +174,7 @@ impl Snapshot {
         started_at: Instant,
         algos: &[Arc<AlgoContext>],
         authority_public_key: String,
+        operator_fee: OperatorFee,
     ) -> Self {
         let now = Instant::now();
         let algorithms = algos
@@ -208,6 +230,7 @@ impl Snapshot {
         Snapshot {
             uptime: now.saturating_duration_since(started_at),
             authority_public_key,
+            operator_fee,
             algorithms,
         }
     }
@@ -232,6 +255,17 @@ impl Snapshot {
         out.push_str(&format!(
             "  \"authority_public_key\": \"{}\",\n",
             self.authority_public_key
+        ));
+        // From the configuration the coinbase is built from, so a renderer
+        // can state the fee, and can show how to donate only when an offer
+        // has somewhere to go.
+        out.push_str(&format!(
+            "  \"operator_fee_bp\": {},\n",
+            self.operator_fee.basis_points
+        ));
+        out.push_str(&format!(
+            "  \"donations_accepted\": {},\n",
+            self.operator_fee.has_address
         ));
         out.push_str("  \"miners\": ");
         let miners: usize = self.algorithms.iter().map(|algo| algo.channels.len()).sum();
@@ -515,6 +549,7 @@ mod tests {
         let snapshot = Snapshot {
             uptime: Duration::from_secs(1),
             authority_public_key: String::new(),
+            operator_fee: OperatorFee::default(),
             algorithms: vec![AlgoSnapshot {
                 pow: PowType::X16rt,
                 upstream_connected: true,
@@ -539,6 +574,7 @@ mod tests {
         let snapshot = Snapshot {
             uptime: Duration::from_secs(1),
             authority_public_key: String::new(),
+            operator_fee: OperatorFee::default(),
             algorithms: vec![AlgoSnapshot {
                 pow: PowType::MinotaurX,
                 upstream_connected: false,
@@ -571,6 +607,7 @@ mod tests {
         let snapshot = Snapshot {
             uptime: Duration::from_secs(42),
             authority_public_key: "9cZsf3kvbayTC4M2bamzCoHkmcSneX68fb7Yc3JEfwtEsk2cXDA".into(),
+            operator_fee: OperatorFee::default(),
             algorithms: vec![],
         };
         let json = snapshot.to_json();
@@ -578,5 +615,33 @@ mod tests {
         assert!(json.contains("\"miners\": 0"));
         assert!(json.contains("\"algorithms\": [\n  ]"), "{json}");
         assert!(json.contains("\"vardiff\": false"));
+    }
+
+    #[test]
+    fn the_fee_and_whether_a_donation_is_paid_are_stated() {
+        let mut snapshot = Snapshot {
+            uptime: Duration::from_secs(1),
+            authority_public_key: String::new(),
+            operator_fee: OperatorFee {
+                basis_points: 25,
+                has_address: true,
+            },
+            algorithms: vec![],
+        };
+        let json = snapshot.to_json();
+        assert!(json.contains("\"operator_fee_bp\": 25,"), "{json}");
+        assert!(json.contains("\"donations_accepted\": true,"), "{json}");
+
+        // The donations-only setup: nothing taken, and an offer still paid.
+        snapshot.operator_fee.basis_points = 0;
+        let json = snapshot.to_json();
+        assert!(json.contains("\"operator_fee_bp\": 0,"), "{json}");
+        assert!(json.contains("\"donations_accepted\": true,"), "{json}");
+
+        // No address at all: an offer goes nowhere, and the page must not
+        // invite one.
+        snapshot.operator_fee = OperatorFee::default();
+        let json = snapshot.to_json();
+        assert!(json.contains("\"donations_accepted\": false,"), "{json}");
     }
 }

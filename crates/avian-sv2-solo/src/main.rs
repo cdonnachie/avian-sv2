@@ -227,8 +227,9 @@ fn run(options: Options) -> Result<(), String> {
             let algos: Vec<_> = handle.algos().to_vec();
             let started_at = handle.started_at();
             let published_key = address::encode_authority_key(&pool_pubkey);
+            let operator_fee = handle.operator_fee();
             let handle = stats::serve(bind, move || {
-                Snapshot::gather(started_at, &algos, published_key.clone())
+                Snapshot::gather(started_at, &algos, published_key.clone(), operator_fee)
             })
             .map_err(|e| format!("--stats-bind {bind}: {e}"))?;
             logln!(

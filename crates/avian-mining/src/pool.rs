@@ -19,6 +19,7 @@ use secp256k1::XOnlyPublicKey;
 
 use crate::server::{AlgoContext, Server, ServerConfig, ServerHandle};
 use crate::share::PowHasher;
+use crate::stats::OperatorFee;
 
 /// Called with every round of work, for logging. Runs on the algorithm's own
 /// thread, so it must not block.
@@ -42,6 +43,7 @@ pub struct PoolHandle {
     mining_addr: SocketAddr,
     started_at: Instant,
     algos: Vec<Arc<AlgoContext>>,
+    operator_fee: OperatorFee,
     _server: ServerHandle,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -64,6 +66,13 @@ impl PoolHandle {
     /// how far back every counter on the stats endpoint reaches.
     pub fn started_at(&self) -> Instant {
         self.started_at
+    }
+
+    /// The operator fee as configured, for the stats endpoint: the numbers
+    /// the coinbase is built from, rather than a copy of them kept wherever
+    /// the page is rendered.
+    pub fn operator_fee(&self) -> OperatorFee {
+        self.operator_fee
     }
 
     pub fn join(self) {
@@ -100,6 +109,10 @@ pub fn spawn(
         sessions.push((session, algo));
     }
 
+    let operator_fee = OperatorFee {
+        basis_points: config.server.fee_basis_points,
+        has_address: !config.server.fee_script.is_empty(),
+    };
     let server = Arc::new(Server::new(config.server, algos.clone(), hasher)?);
 
     for (session, algo) in &mut sessions {
@@ -135,6 +148,7 @@ pub fn spawn(
         mining_addr,
         started_at: Instant::now(),
         algos,
+        operator_fee,
         _server: handle,
         threads,
     })

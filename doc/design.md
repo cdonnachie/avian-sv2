@@ -175,6 +175,14 @@ charging nothing, which the help text calls the 100%-to-the-miner setup. It
 was refused as an unused address until donations gave the address a second
 job; the check was older than the feature.
 
+Both halves are published on `/stats`, as `operator_fee_bp` and
+`donations_accepted`, from the configuration the coinbase is built from. A
+page that renders the endpoint can then say what the pool charges without a
+second copy of the number that could drift from the one in use, and can show
+a miner how to donate only when the offer would be paid. With no address an
+offer is logged and the miner keeps everything, and a page that invited one
+would be inviting something the pool cannot honour.
+
 ### The coinbase tag
 
 `--coinbase-tag`, default `/avian-sv2/`. It goes in the scriptSig after
