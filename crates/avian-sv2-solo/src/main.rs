@@ -161,12 +161,21 @@ fn run(options: Options) -> Result<(), String> {
         "[pool] solo on {}: a worker's own address is paid, from user_identity at channel open",
         options.network
     );
-    if options.fee_basis_points > 0 {
-        println!(
-            "[pool] operator fee {}.{:02}%",
-            options.fee_basis_points / 100,
-            options.fee_basis_points % 100
-        );
+    // Three setups, said out loud, because the one in the middle used to be
+    // refused and an operator who expects that should see it start.
+    match (options.fee_script.is_empty(), options.fee_basis_points) {
+        (true, _) => println!(
+            "[pool] no operator fee and no donation address: a donate/ prefix is \
+             logged and the miner keeps everything"
+        ),
+        (false, 0) => {
+            println!("[pool] no operator fee; a donate/ prefix pays the --operator-fee address")
+        }
+        (false, bp) => println!(
+            "[pool] operator fee {}.{:02}%; a donate/ prefix adds to it",
+            bp / 100,
+            bp % 100
+        ),
     }
 
     let verbose = options.verbose;
@@ -220,7 +229,7 @@ fn run(options: Options) -> Result<(), String> {
             let handle = stats::serve(bind, move || {
                 Snapshot::gather(started_at, &algos, published_key.clone())
             })
-                .map_err(|e| format!("--stats-bind {bind}: {e}"))?;
+            .map_err(|e| format!("--stats-bind {bind}: {e}"))?;
             println!(
                 "[pool] read-only stats JSON on {} at /stats. Do not publish this port.",
                 handle.addr()
@@ -315,6 +324,34 @@ fn load_or_create_pool_key(path: &Path) -> Result<Keypair, String> {
     }
     println!("[pool] generated a new authority key in {}", path.display());
     Ok(Keypair::from_secret_key(&secp, &secret))
+}
+
+/// The script the operator fee and any donation are paid to, from the two
+/// flags that describe it.
+///
+/// An address with a zero fee is allowed, and is the setup the help text
+/// calls 100% to the miner: nothing is taken from anyone, and a worker that
+/// connects with a `donate/` prefix has somewhere to leave what it offered.
+/// It used to be refused as an unused address, from before donations gave
+/// the address a second job. A fee with no address is still refused, since
+/// there is nowhere to pay it.
+fn fee_script(
+    address: Option<&str>,
+    basis_points: u32,
+    network: Network,
+) -> Result<Vec<u8>, String> {
+    if basis_points > 10_000 {
+        return Err("--operator-fee-bp cannot exceed 10000, which is the whole coinbase".into());
+    }
+    match address {
+        Some(text) => Address::decode(text, network)
+            .map(|address| address.script_pubkey())
+            .map_err(|e| format!("--operator-fee {text:?}: {e}")),
+        None if basis_points > 0 => {
+            Err("--operator-fee-bp was given with no --operator-fee address to pay it to".into())
+        }
+        None => Ok(Vec::new()),
+    }
 }
 
 fn parse_args() -> Result<Option<Options>, String> {
@@ -451,32 +488,7 @@ fn parse_args() -> Result<Option<Options>, String> {
         ));
     }
 
-    let fee_script = match &fee_address {
-        Some(text) => {
-            let address = Address::decode(text, network)
-                .map_err(|e| format!("--operator-fee {text:?}: {e}"))?;
-            if fee_basis_points == 0 {
-                return Err(
-                    "--operator-fee was given with no --operator-fee-bp, so the fee would be \
-                     zero and the address unused"
-                        .into(),
-                );
-            }
-            address.script_pubkey()
-        }
-        None => {
-            if fee_basis_points > 0 {
-                return Err(
-                    "--operator-fee-bp was given with no --operator-fee address to pay it to"
-                        .into(),
-                );
-            }
-            Vec::new()
-        }
-    };
-    if fee_basis_points > 10_000 {
-        return Err("--operator-fee-bp cannot exceed 10000, which is the whole coinbase".into());
-    }
+    let fee_script = fee_script(fee_address.as_deref(), fee_basis_points, network)?;
 
     let target = connect.unwrap_or_else(|| format!("127.0.0.1:{}", default_port(&chain)));
     let node = resolve(&target)?;
@@ -571,4 +583,44 @@ fn resolve(target: &str) -> Result<SocketAddr, String> {
         .map_err(|e| format!("cannot resolve {target}: {e}"))?
         .next()
         .ok_or_else(|| format!("{target} resolved to nothing"))
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::*;
+
+    const ADDRESS: &str = "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn";
+
+    #[test]
+    fn an_address_with_no_fee_is_the_donations_only_setup() {
+        let script = fee_script(Some(ADDRESS), 0, Network::Regtest)
+            .expect("charging nothing and still accepting donations is allowed");
+        assert!(
+            !script.is_empty(),
+            "the donation address still has a script to pay"
+        );
+    }
+
+    #[test]
+    fn a_fee_with_no_address_is_refused() {
+        let err = fee_script(None, 25, Network::Regtest).unwrap_err();
+        assert!(err.contains("no --operator-fee address"), "{err}");
+    }
+
+    #[test]
+    fn neither_is_neither() {
+        assert!(fee_script(None, 0, Network::Regtest).unwrap().is_empty());
+    }
+
+    #[test]
+    fn more_than_the_whole_coinbase_is_refused() {
+        let err = fee_script(Some(ADDRESS), 10_001, Network::Regtest).unwrap_err();
+        assert!(err.contains("10000"), "{err}");
+    }
+
+    #[test]
+    fn a_bad_address_is_refused_with_the_flag_named() {
+        let err = fee_script(Some("not-an-address"), 0, Network::Regtest).unwrap_err();
+        assert!(err.starts_with("--operator-fee"), "{err}");
+    }
 }

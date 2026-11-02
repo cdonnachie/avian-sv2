@@ -169,8 +169,11 @@ Checked end to end at 2.5%, against the node's own view of the block:
 ```
 
 Misconfiguration is refused at startup rather than silently ignored: a fee with
-no address, an address with no fee, and more than 10000 basis points are all
-errors.
+no address, and more than 10000 basis points, are errors. An address with no
+fee is not one. It is the address a `donate/` prefix pays, with the operator
+charging nothing, which the help text calls the 100%-to-the-miner setup. It
+was refused as an unused address until donations gave the address a second
+job; the check was older than the feature.
 
 ### The coinbase tag
 
