@@ -22,14 +22,17 @@ use binary_sv2::{Seq0255, Sv2Option, U256};
 use mining_sv2::{
     NewExtendedMiningJob, NewMiningJob, OpenExtendedMiningChannelSuccess,
     OpenStandardMiningChannelSuccess, SetNewPrevHash, SetTarget, SubmitSharesError,
-    SubmitSharesSuccess, CHANNEL_BIT_MINING_SET_NEW_PREV_HASH, CHANNEL_BIT_NEW_EXTENDED_MINING_JOB,
-    CHANNEL_BIT_NEW_MINING_JOB, CHANNEL_BIT_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+    SubmitSharesSuccess, UpdateChannelError, CHANNEL_BIT_MINING_SET_NEW_PREV_HASH,
+    CHANNEL_BIT_NEW_EXTENDED_MINING_JOB, CHANNEL_BIT_NEW_MINING_JOB,
+    CHANNEL_BIT_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
     CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, CHANNEL_BIT_SET_TARGET,
     CHANNEL_BIT_SUBMIT_SHARES_ERROR, CHANNEL_BIT_SUBMIT_SHARES_SUCCESS,
-    MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
-    MESSAGE_TYPE_NEW_MINING_JOB, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+    CHANNEL_BIT_UPDATE_CHANNEL_ERROR, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+    MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, MESSAGE_TYPE_NEW_MINING_JOB,
+    MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
     MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MESSAGE_TYPE_SET_TARGET,
     MESSAGE_TYPE_SUBMIT_SHARES_ERROR, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+    MESSAGE_TYPE_UPDATE_CHANNEL_ERROR,
 };
 
 use crate::job::{self, Job, JobWork};
@@ -79,7 +82,6 @@ pub struct Channel {
     pub id: u32,
     pub kind: ChannelKind,
     pub pow: PowType,
-    pub share_target: [u8; 32],
     pub extranonce_prefix: Vec<u8>,
     /// Who the coinbase pays. From the worker's `user_identity`, not from
     /// configuration.
@@ -127,6 +129,12 @@ struct ChannelState {
     wants_work: bool,
     last_sequence: u32,
     seen: HashSet<(u32, u32, u32)>,
+    /// What this channel's shares are judged against.
+    ///
+    /// In state rather than on the channel because `UpdateChannel` moves it,
+    /// and under the same lock as the jobs so that a share cannot be judged
+    /// against one round's job and the next round's target.
+    share_target: [u8; 32],
     limiter: Limiter,
 }
 
@@ -150,7 +158,6 @@ impl Channel {
             id,
             kind,
             pow,
-            share_target,
             // On an extended channel this is the pool's half of the
             // extranonce, which the miner prepends to its own. On a standard
             // one it is informational: the pool chose the whole coinbase.
@@ -176,6 +183,7 @@ impl Channel {
                 wants_work: false,
                 last_sequence: 0,
                 seen: HashSet::new(),
+                share_target,
                 limiter: Limiter::new(shares_per_minute, rate_limit),
             }),
         }
@@ -198,15 +206,73 @@ impl Channel {
         self.state.lock().map(|s| s.limiter.rate()).unwrap_or(0.0)
     }
 
+    /// What this channel's shares are judged against.
+    ///
+    /// A poisoned lock answers with the hardest target rather than the
+    /// easiest, as the bridge's accessor does. This feeds the stats page, so a
+    /// number that is wrong is better than one reading as "anything passes".
+    pub fn share_target(&self) -> [u8; 32] {
+        self.lock_state().map(|s| s.share_target).unwrap_or([0; 32])
+    }
+
+    /// Moves this channel's target and tells the worker, if it moved at all.
+    ///
+    /// Returns whether anything changed, so an update that lands on the target
+    /// already in force writes nothing and a worker repeating itself cannot
+    /// make the pool send.
+    ///
+    /// A share already in flight is judged against the new target, so one
+    /// found under an older easier target arrives too late and is refused.
+    /// The window is a single round trip and the worker is the one that asked
+    /// for it, which is why this is left as it is rather than carrying both
+    /// targets for a while.
+    pub fn retarget(&self, target: [u8; 32]) -> Result<bool> {
+        {
+            // Dropped before the writer is taken, as in send_open_success.
+            let mut state = self.lock_state()?;
+            if state.share_target == target {
+                return Ok(false);
+            }
+            state.share_target = target;
+        }
+        self.lock_writer()?.send(
+            EXT_CORE_MINING,
+            MESSAGE_TYPE_SET_TARGET,
+            CHANNEL_BIT_SET_TARGET,
+            SetTarget {
+                channel_id: self.id,
+                maximum_target: U256::try_from(target.as_slice())?,
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// Refuses an `UpdateChannel`. `code` is one of the three the
+    /// specification names for this message.
+    pub fn send_update_error(&self, channel_id: u32, code: &str) -> Result<()> {
+        self.lock_writer()?.send(
+            EXT_CORE_MINING,
+            MESSAGE_TYPE_UPDATE_CHANNEL_ERROR,
+            CHANNEL_BIT_UPDATE_CHANNEL_ERROR,
+            UpdateChannelError {
+                channel_id,
+                error_code: code.as_bytes().try_into()?,
+            },
+        )
+    }
+
     /// Answers `OpenStandardMiningChannel` and states the target.
     ///
     /// The target travels twice, in the success reply and then in `SetTarget`,
-    /// which is the order doc/sv2.md's diagram shows. `SetTarget` is what a
-    /// pool with vardiff would resend later; there is none here, so this is
-    /// the only one.
+    /// which is the order doc/sv2.md's diagram shows. There is no vardiff, so
+    /// the only thing that sends another `SetTarget` is [`Self::retarget`],
+    /// answering a worker that asked.
     pub fn send_open_success(&self, request_id: u32) -> Result<()> {
+        // Before the writer and not after: `push_work` takes state and then
+        // the writer while still holding it, so the other order is the one
+        // that can deadlock against it.
+        let target = self.lock_state()?.share_target;
         let mut writer = self.lock_writer()?;
-        let target = self.share_target;
         match self.kind {
             ChannelKind::Standard => writer.send(
                 EXT_CORE_MINING,
@@ -475,7 +541,8 @@ impl Channel {
             return Ok(None);
         }
 
-        match share::validate(&job, self.pow, &submission, &self.share_target, hasher) {
+        let share_target = state.share_target;
+        match share::validate(&job, self.pow, &submission, &share_target, hasher) {
             Outcome::Refused(refusal) => {
                 state.limiter.record_invalid();
                 drop(state);

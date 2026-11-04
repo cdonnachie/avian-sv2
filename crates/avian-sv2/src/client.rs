@@ -21,15 +21,16 @@ use common_messages_sv2::{
 };
 use mining_sv2::{
     OpenExtendedMiningChannel, OpenStandardMiningChannel, SubmitSharesExtended,
-    SubmitSharesStandard, CHANNEL_BIT_OPEN_EXTENDED_MINING_CHANNEL,
+    SubmitSharesStandard, CHANNEL_BIT_CLOSE_CHANNEL, CHANNEL_BIT_OPEN_EXTENDED_MINING_CHANNEL,
     CHANNEL_BIT_OPEN_STANDARD_MINING_CHANNEL, CHANNEL_BIT_SUBMIT_SHARES_EXTENDED,
-    CHANNEL_BIT_SUBMIT_SHARES_STANDARD, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
-    MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, MESSAGE_TYPE_NEW_MINING_JOB,
-    MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
-    MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
-    MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MESSAGE_TYPE_SET_TARGET,
-    MESSAGE_TYPE_SUBMIT_SHARES_ERROR, MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+    CHANNEL_BIT_SUBMIT_SHARES_STANDARD, CHANNEL_BIT_UPDATE_CHANNEL, MESSAGE_TYPE_CLOSE_CHANNEL,
+    MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+    MESSAGE_TYPE_NEW_MINING_JOB, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+    MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS, MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
+    MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+    MESSAGE_TYPE_SET_TARGET, MESSAGE_TYPE_SUBMIT_SHARES_ERROR, MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
     MESSAGE_TYPE_SUBMIT_SHARES_STANDARD, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+    MESSAGE_TYPE_UPDATE_CHANNEL, MESSAGE_TYPE_UPDATE_CHANNEL_ERROR,
 };
 use secp256k1::XOnlyPublicKey;
 
@@ -330,6 +331,7 @@ pub enum Trace {
     },
     OpenError(String),
     SetTarget,
+    UpdateChannelError(String),
     NewMiningJob {
         job_id: u32,
         future: bool,
@@ -628,6 +630,69 @@ impl MiningClient {
         Ok(sequence_number)
     }
 
+    /// Revises the hash rate this channel declared when it opened.
+    ///
+    /// What makes this worth having is that the pool sets a channel's target
+    /// from that declaration once, at open, and never moves it on its own
+    /// judgement. A rig whose real rate has fallen, because a card dropped
+    /// out or throttled, is then aiming at a cadence meant for hardware it no
+    /// longer has, and this is the only way to say so short of reconnecting.
+    ///
+    /// Nothing is returned, because both answers arrive as frames like any
+    /// other reply: a `SetTarget` that [`Self::poll`] applies, or an
+    /// `UpdateChannel.Error` that lands in the trace. A pool is also free to
+    /// decide the target it already set is still the right one and send
+    /// neither.
+    ///
+    /// `maximum_target` is this miner's own ceiling, the same promise the
+    /// channel made when it opened: the pool may hand back something harder
+    /// but never easier.
+    pub fn update_channel(&self, nominal_hash_rate: f32, maximum_target: &[u8; 32]) -> Result<()> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("not connected".into()))?;
+        let mut writer = session
+            .writer
+            .lock()
+            .map_err(|_| Error::Protocol("the client's writer is poisoned".into()))?;
+        writer.send(
+            EXT_CORE,
+            MESSAGE_TYPE_UPDATE_CHANNEL,
+            CHANNEL_BIT_UPDATE_CHANNEL,
+            mining_sv2::UpdateChannel {
+                channel_id: session.channel_id,
+                nominal_hash_rate,
+                maximum_target: maximum_target.as_slice().try_into()?,
+            },
+        )
+    }
+
+    /// Closes this channel, which is how a miner stops mining on purpose
+    /// rather than by dropping its socket and leaving the pool to infer it.
+    ///
+    /// The pool has no reply to give: there is no `CloseChannel.Success` and
+    /// no `CloseChannel.Error`, so this is the last thing a channel says.
+    pub fn close_channel(&self, reason: &str) -> Result<()> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("not connected".into()))?;
+        let mut writer = session
+            .writer
+            .lock()
+            .map_err(|_| Error::Protocol("the client's writer is poisoned".into()))?;
+        writer.send(
+            EXT_CORE,
+            MESSAGE_TYPE_CLOSE_CHANNEL,
+            CHANNEL_BIT_CLOSE_CHANNEL,
+            mining_sv2::CloseChannel {
+                channel_id: session.channel_id,
+                reason_code: reason.as_bytes().try_into()?,
+            },
+        )
+    }
+
     // Everything below is the session machinery.
 
     fn fail(&mut self, error: Error) -> Event {
@@ -692,8 +757,7 @@ impl MiningClient {
     }
 
     fn open_session(config: &ClientConfig, trace: &mut Vec<Trace>) -> Result<Session> {
-        let conn =
-            Connection::connect_any(&config.pool, config.pool_authority, config.timeout)?;
+        let conn = Connection::connect_any(&config.pool, config.pool_authority, config.timeout)?;
         let (reader, writer) = conn.split();
         let mut session = Session {
             reader,
@@ -958,6 +1022,16 @@ impl MiningClient {
                     job.share_target = self.share_target;
                 }
                 self.record(Trace::SetTarget);
+                Ok(Event::Idle)
+            }
+            (EXT_CORE, MESSAGE_TYPE_UPDATE_CHANNEL_ERROR) => {
+                let error: mining_sv2::UpdateChannelError = from_bytes(&mut frame.payload)?;
+                let code = String::from_utf8_lossy(error.error_code.as_ref()).into_owned();
+                // Not a disconnect: the channel carries on against the target
+                // it already had, which is the one the refusal leaves in
+                // force. Falling through to the catch-all would have killed a
+                // working session over a message this client asked for.
+                self.record(Trace::UpdateChannelError(code));
                 Ok(Event::Idle)
             }
             (EXT_CORE, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB) => {

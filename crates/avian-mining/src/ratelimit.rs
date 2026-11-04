@@ -30,9 +30,14 @@
 //!
 //! It also decides what happens to a worker that understates itself. It is
 //! handed a target that is too easy, finds shares far faster than the pool
-//! asked for, and is refused here rather than served. Raising its target
-//! instead would be vardiff, which stays out: the target is set once, when
-//! the channel opens, and never moves.
+//! asked for, and is refused here rather than served. The pool raising that
+//! target on its own judgement would be vardiff, which stays out.
+//!
+//! What the worker can do is say so, with `UpdateChannel`, and the pool
+//! rederives from the new figure. That is not vardiff and it does not loosen
+//! anything here: the budget is still sized from the configured cadence, and
+//! an update is the worker restoring the assumption behind it rather than
+//! negotiating its way out of it.
 
 use std::time::Instant;
 

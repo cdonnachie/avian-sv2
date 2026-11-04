@@ -28,9 +28,10 @@ use common_messages_sv2::{
     SV2_MINING_PROTOCOL_DISCRIMINANT,
 };
 use mining_sv2::{
-    OpenMiningChannelError, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+    OpenMiningChannelError, MESSAGE_TYPE_CLOSE_CHANNEL, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
     MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
     MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED, MESSAGE_TYPE_SUBMIT_SHARES_STANDARD,
+    MESSAGE_TYPE_UPDATE_CHANNEL,
 };
 
 /// The bits of a submission that are the same in both forms.
@@ -82,9 +83,9 @@ pub struct ServerConfig {
     /// Each channel's target is derived from this and the hash rate the worker
     /// declared when it opened, so a 1 kH/s CPU and a 25 MH/s card aim at the
     /// same cadence instead of differing by the ratio of their hardware. There
-    /// is still no vardiff: the target is set once and never moves, so a
-    /// worker whose declaration was wrong keeps a cadence that is wrong by the
-    /// same factor for the life of the channel.
+    /// is still no vardiff, in that the pool never moves a target on its own
+    /// judgement, so a worker whose declaration was wrong keeps a cadence
+    /// wrong by the same factor until it says otherwise with `UpdateChannel`.
     ///
     /// Nothing is paid by share weight here, so that costs a dashboard some
     /// liveliness and costs nobody any money. On a pool that shared a reward
@@ -753,6 +754,63 @@ impl Server {
         Ok(channel)
     }
 
+    /// Answers `UpdateChannel`: a worker revising the hash rate it declared
+    /// when the channel opened.
+    ///
+    /// Honoured rather than refused, and the distinction is not vardiff.
+    /// Vardiff is the pool moving a target on its own judgement, which it
+    /// still never does. This is the worker asking, and the pool has a reason
+    /// to listen: `ratelimit` sizes every channel's budget from the configured
+    /// shares a minute, on the assumption that each channel's target makes it
+    /// average that cadence. A declaration that has gone stale, because a card
+    /// dropped out or throttled, is exactly what breaks that assumption, and
+    /// this is the only message that repairs it without a reconnect.
+    ///
+    /// Refusing was the other option and it would have had to be dishonest:
+    /// `UpdateChannel.Error` carries only `invalid-channel-id`,
+    /// `invalid-nominal-hashrate` and `max-target-out-of-range`, and none of
+    /// them means "I would rather not".
+    fn update_channel(
+        &self,
+        algo: &Arc<AlgoContext>,
+        channel: &Arc<Channel>,
+        update: &mining_sv2::UpdateChannel,
+    ) -> Result<()> {
+        if update.channel_id != channel.id {
+            return channel.send_update_error(update.channel_id, "invalid-channel-id");
+        }
+        // Worker-supplied and unverifiable, as at channel open, so it goes
+        // through the same clamp. A non-finite or negative one is not
+        // something share_target can floor into sense, and it is the one shape
+        // the specification has an error code for.
+        if !update.nominal_hash_rate.is_finite() || update.nominal_hash_rate < 0.0 {
+            return channel.send_update_error(channel.id, "invalid-nominal-hashrate");
+        }
+        let Some((_, prev)) = algo.current() else {
+            // No template, so no network target to clamp against and nothing
+            // to derive. The target in force stands, which is the honest
+            // answer rather than an error the worker cannot act on.
+            return Ok(());
+        };
+        let mut target = self
+            .config
+            .share_target(update.nominal_hash_rate, &prev.target);
+        let mut worker_max = [0u8; 32];
+        worker_max.copy_from_slice(update.maximum_target.as_ref());
+        // The worker's own ceiling wins, as it does at open.
+        if !block::meets_target(&target, &worker_max) {
+            target = worker_max;
+        }
+        if channel.retarget(target)? {
+            logln!(
+                "[pool] channel {} retargeted at its own request, now declaring {} H/s",
+                channel.id,
+                update.nominal_hash_rate
+            );
+        }
+        Ok(())
+    }
+
     fn pump_submissions(
         &self,
         reader: &mut ConnectionReader,
@@ -862,6 +920,34 @@ impl Server {
                             &candidate.coinbase,
                         )?;
                     }
+                }
+                (EXT_CORE_MINING, MESSAGE_TYPE_UPDATE_CHANNEL) => {
+                    let update: mining_sv2::UpdateChannel =
+                        binary_sv2::from_bytes(&mut frame.payload)?;
+                    self.update_channel(algo, channel, &update)?;
+                }
+                (EXT_CORE_MINING, MESSAGE_TYPE_CLOSE_CHANNEL) => {
+                    let close: mining_sv2::CloseChannel =
+                        binary_sv2::from_bytes(&mut frame.payload)?;
+                    if close.channel_id != channel.id {
+                        // There is no CloseChannel.Error to answer with, and
+                        // one channel per connection means the id can only be
+                        // this one. Logged and dropped rather than guessed at.
+                        logln!(
+                            "[pool] channel {} asked to close {}, which is not its own",
+                            channel.id,
+                            close.channel_id
+                        );
+                        continue;
+                    }
+                    logln!(
+                        "[pool] channel {} closed by the worker: {}",
+                        channel.id,
+                        String::from_utf8_lossy(close.reason_code.as_ref())
+                    );
+                    // Ok, not an error: the worker did the correct thing, and
+                    // the caller unregisters the channel either way.
+                    return Ok(());
                 }
                 _ => {
                     return Err(Error::Protocol(format!(

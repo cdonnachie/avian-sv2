@@ -186,10 +186,11 @@ impl Snapshot {
                     .map(|channel| {
                         let (rejected, _) = channel.refusals();
                         let accepted = channel.accepted();
+                        let share_target = channel.share_target();
                         let connected_for = now.saturating_duration_since(channel.opened_at);
                         let seconds = connected_for.as_secs_f64();
                         let estimated_hashrate = if seconds > 0.0 {
-                            f64::from(accepted) * hashes_per_share(&channel.share_target) / seconds
+                            f64::from(accepted) * hashes_per_share(&share_target) / seconds
                         } else {
                             0.0
                         };
@@ -212,7 +213,7 @@ impl Snapshot {
                             current_job_id: channel.current_job_id(),
                             connected_for,
                             estimated_hashrate,
-                            share_target_hex: hex(&channel.share_target),
+                            share_target_hex: hex(&share_target),
                         }
                     })
                     .collect();

@@ -245,7 +245,8 @@ not deny service to another on its own channel.
 **Vardiff stays deferred**, and it is deferred *with* this rather than
 separately: the honest answer to a worker flooding cheap shares is usually to
 raise its target, which is vardiff, and building either alone invites getting
-the other wrong.
+the other wrong. A worker asking for its own target to be rederived, with
+`UpdateChannel`, is a different thing and is served.
 
 ### The authority key an operator publishes
 
@@ -1624,10 +1625,12 @@ than things it will never have:
   `getblock`: `confirmations` of -1 lost its race, one or more is on the
   chain, error -5 was never seen. No new dependency, no write path, no state
   the pool was not already holding.
-- **Vardiff.** The share target is fixed, the network target made
-  `--share-target-shift` halvings harder. Deferred *with* rate limiting rather
-  than separately, because the two are entangled: the honest answer to a worker
-  flooding cheap shares is usually to raise its target.
+- **Vardiff.** The pool never moves a target on its own judgement. Each
+  channel's is derived once, from the hash rate the worker declared, and
+  changes after that only when the worker asks with `UpdateChannel`, which is
+  answered. Deferred *with* rate limiting rather than separately, because the
+  two are entangled: the honest answer to a worker flooding cheap shares is
+  usually to raise its target.
 - **An operator view.** Everything is stderr.
 
 **Share rate limiting was on this list and is not any more**: it is in, because
