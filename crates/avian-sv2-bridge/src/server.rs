@@ -566,3 +566,93 @@ impl BridgeHandle {
         self.addr
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A configuration that passes, so each test can break one thing.
+    fn config() -> BridgeConfig {
+        BridgeConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            authority: Keypair::from_seckey_slice(&secp256k1::Secp256k1::new(), &[1u8; 32])
+                .unwrap(),
+            cert_validity: 3600,
+            allow_public_bind: false,
+            upstreams: vec![(PowType::X16rt, "127.0.0.1:3333".parse().unwrap())],
+            pow_limit: [0xff; 32],
+            password: String::new(),
+            upstream_idle_timeout: None,
+            first_work_timeout: Duration::from_secs(5),
+            ntime_roll: 0,
+            min_hash_rate: 1000.0,
+            max_hash_rate: 1e12,
+            rate_limit: RateLimitConfig::default(),
+        }
+    }
+
+    #[test]
+    fn a_bridge_with_nowhere_to_send_a_share_is_refused() {
+        assert!(config().validate().is_ok());
+
+        let mut nowhere = config();
+        nowhere.upstreams.clear();
+        assert!(nowhere.validate().is_err());
+
+        // Two pools for one algorithm is ambiguous rather than redundant:
+        // which one a miner's shares went to would be decided by the order of
+        // a vector, which is not something an operator chose.
+        let mut twice = config();
+        twice
+            .upstreams
+            .push((PowType::X16rt, "127.0.0.1:4444".parse().unwrap()));
+        assert!(twice.validate().is_err());
+
+        // One pool per algorithm is the setup this exists for.
+        let mut both = config();
+        both.upstreams
+            .push((PowType::MinotaurX, "127.0.0.1:4444".parse().unwrap()));
+        assert!(both.validate().is_ok());
+    }
+
+    #[test]
+    fn an_unusable_hash_rate_bound_is_refused_at_startup() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut floor = config();
+            floor.min_hash_rate = bad;
+            assert!(
+                floor.validate().is_err(),
+                "a slowest believed rate of {bad} should be refused"
+            );
+        }
+
+        let mut inverted = config();
+        inverted.max_hash_rate = 1.0;
+        assert!(inverted.validate().is_err());
+
+        // The case the is_nan in validate is there for. A NaN compares false
+        // against everything, so a bare `max < min` would accept it and the
+        // ceiling would then silently do nothing, which is also why
+        // believed_hash_rate does its own bounding rather than using clamp.
+        let mut not_a_number = config();
+        not_a_number.max_hash_rate = f64::NAN;
+        assert!(not_a_number.validate().is_err());
+
+        // An infinite ceiling is accepted, and the asymmetry with the floor
+        // above is deliberate: it defeats the point of the bound but it is
+        // not ambiguous, and believed_hash_rate's min() against it is a
+        // no-op rather than a wrong answer.
+        let mut unbounded = config();
+        unbounded.max_hash_rate = f64::INFINITY;
+        assert!(unbounded.validate().is_ok());
+    }
+
+    #[test]
+    fn a_first_work_timeout_of_zero_is_refused() {
+        // It would refuse every channel the instant it opened, the pool's
+        // first job being unable to arrive in no time at all.
+        let mut instant = config();
+        instant.first_work_timeout = Duration::ZERO;
+        assert!(instant.validate().is_err());
+    }
+}
