@@ -162,7 +162,10 @@ impl ServerConfig {
                 self.min_hash_rate
             )));
         }
-        if !(self.max_hash_rate >= self.min_hash_rate) {
+        // is_nan, not a bare `max < min`: a NaN compares false against
+        // everything, so `<` would accept it and the bound would then
+        // silently do nothing. The slowest rate is known finite by here.
+        if self.max_hash_rate.is_nan() || self.max_hash_rate < self.min_hash_rate {
             return Err(Error::Protocol(format!(
                 "the fastest believed hash rate ({}) is below the slowest ({})",
                 self.max_hash_rate, self.min_hash_rate
@@ -1285,6 +1288,13 @@ mod share_target_tests {
         let mut inverted = config(4.5);
         inverted.max_hash_rate = 1.0;
         assert!(inverted.validate().is_err());
+        // A NaN ceiling is refused too, and is the reason the check is
+        // written as a NaN test rather than as `max < min`: a NaN compares
+        // false against everything, so `max < min` would let it through and
+        // the bound would then quietly do nothing.
+        let mut not_a_number = config(4.5);
+        not_a_number.max_hash_rate = f64::NAN;
+        assert!(not_a_number.validate().is_err());
     }
 
     #[test]

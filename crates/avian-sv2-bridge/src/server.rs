@@ -99,7 +99,10 @@ impl BridgeConfig {
                 self.min_hash_rate
             )));
         }
-        if !(self.max_hash_rate >= self.min_hash_rate) {
+        // is_nan, not a bare `max < min`: a NaN compares false against
+        // everything, so `<` would accept it and the bound would then
+        // silently do nothing. The slowest rate is known finite by here.
+        if self.max_hash_rate.is_nan() || self.max_hash_rate < self.min_hash_rate {
             return Err(Error::Protocol(format!(
                 "the fastest believed hash rate ({}) is below the slowest ({})",
                 self.max_hash_rate, self.min_hash_rate

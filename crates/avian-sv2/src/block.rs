@@ -117,8 +117,8 @@ pub fn target_from_nbits(nbits: u32) -> [u8; 32] {
     let mut out = [0u8; 32];
     if exponent <= 3 {
         let shifted = mantissa >> (8 * (3 - exponent));
-        for i in 0..3 {
-            out[i] = ((shifted >> (8 * i)) & 0xff) as u8;
+        for (i, byte) in out.iter_mut().take(3).enumerate() {
+            *byte = ((shifted >> (8 * i)) & 0xff) as u8;
         }
     } else {
         let offset = exponent - 3;
@@ -173,7 +173,7 @@ pub fn easier_by(target: &[u8; 32], shift: u32) -> [u8; 32] {
 /// Returns zero for an unusable rate, which yields the easiest target there
 /// is, so callers clamp the hash rate before asking rather than after.
 pub fn hashes_per_share_for(hash_rate: f64, shares_per_minute: f64) -> f64 {
-    if !hash_rate.is_finite() || !(shares_per_minute > 0.0) {
+    if !hash_rate.is_finite() || !shares_per_minute.is_finite() || shares_per_minute <= 0.0 {
         return 0.0;
     }
     hash_rate * 60.0 / shares_per_minute
@@ -481,5 +481,11 @@ mod tests {
         assert_eq!(hashes_per_share_for(f64::INFINITY, 4.5), 0.0);
         assert_eq!(hashes_per_share_for(1_000.0, 0.0), 0.0);
         assert_eq!(hashes_per_share_for(1_000.0, -1.0), 0.0);
+        // Both are unusable in the same way, and neither can be caught by a
+        // comparison: a NaN compares false against every bound, and an
+        // infinite cadence passes `> 0` and then divides to zero anyway.
+        // Hence the is_finite above, which names both.
+        assert_eq!(hashes_per_share_for(1_000.0, f64::NAN), 0.0);
+        assert_eq!(hashes_per_share_for(1_000.0, f64::INFINITY), 0.0);
     }
 }
