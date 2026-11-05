@@ -198,7 +198,9 @@ fn a_pruned_job_does_not_count_as_an_invalid_share() {
     assert_eq!(
         channel.refusals().0,
         invalid_before,
-        "an unknown job id must not count toward too-many-invalid-shares: counting it          disconnects a miner for the pool losing track of it, and the reconnect then          hides the real fault"
+        "an unknown job id must not count toward too-many-invalid-shares: counting it \
+         disconnects a miner for the pool losing track of it, and the reconnect then \
+         hides the real fault"
     );
     assert!(
         !channel.wants_work(),

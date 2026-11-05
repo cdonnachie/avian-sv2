@@ -390,7 +390,10 @@ pub fn explain_submit_solution_error(code: &str) -> &'static str {
         "too-many-sigops" => "the coinbase exceeded the advertised sigop budget",
         "block-too-large" => "template plus coinbase exceeded the block limit",
         "pow-insufficient" => "the hash did not meet this algorithm's network target",
-        "consensus-rejected" => "the node's own checks and its consensus rules disagree,                                  which is a node bug rather than anything this side did",
+        "consensus-rejected" => {
+            "the node's own checks and its consensus rules disagree, \
+             which is a node bug rather than anything this side did"
+        }
         _ => "an error code this build does not know",
     }
 }

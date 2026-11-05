@@ -540,7 +540,10 @@ fn block_notifications_are_optional_and_separately_negotiated() {
     );
     assert!(
         unsupported.is_empty(),
-        "0x4002 must not be listed as unsupported, because the pool does          support it: what it will not do is serve a connection without          0x4001. Saying otherwise would send a miner off to implement          something it had already got right, got {unsupported:04x?}"
+        "0x4002 must not be listed as unsupported, because the pool does \
+         support it: what it will not do is serve a connection without \
+         0x4001. Saying otherwise would send a miner off to implement \
+         something it had already got right, got {unsupported:04x?}"
     );
 }
 

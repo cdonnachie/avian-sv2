@@ -748,7 +748,8 @@ impl Server {
                             },
                         )?;
                         return Err(Error::Refused(format!(
-                            "a channel asked for pow_type {declared} and this pool serves                              {:?} ({code})",
+                            "a channel asked for pow_type {declared} and this pool serves \
+                             {:?} ({code})",
                             self.algos.iter().map(|a| a.pow).collect::<Vec<_>>()
                         )));
                     }

@@ -290,7 +290,8 @@ impl TdpSession {
                     // Deliberately not "the block was accepted": validation
                     // took it, which is not the same as it becoming the tip.
                     Ok(ok) => logln!(
-                        "[tdp] the node took the block for template {}, {}; whether it                          becomes the tip is what the next SetNewPrevHash says",
+                        "[tdp] the node took the block for template {}, {}; whether it \
+                         becomes the tip is what the next SetNewPrevHash says",
                         ok.template_id,
                         avian_sv2::wire::hex_rev(&ok.block_hash)
                     ),
