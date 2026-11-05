@@ -139,9 +139,9 @@ impl ServerConfig {
     /// Checks the parts that would otherwise fail later and less clearly.
     ///
     /// An over-long coinbase tag is the sharp one: it would build a coinbase
-    /// the node refuses with nothing on the wire to say why, because the
-    /// Template Distribution Protocol has no `SubmitSolution.Error`. So it is
-    /// refused here, where an operator is reading the message.
+    /// the node refuses, and the node says so only when a block is found,
+    /// which for a solo pool can be weeks. So it is refused here, where an
+    /// operator is reading the message.
     pub fn validate(&self) -> Result<()> {
         if self.coinbase_tag.len() > MAX_COINBASE_TAG {
             return Err(Error::Protocol(format!(
@@ -238,9 +238,9 @@ pub struct AlgoContext {
     /// Blocks this algorithm has forwarded to the node.
     blocks: AtomicU32,
     /// Blocks whose hash later became the tip, which is the only honest way to
-    /// count accepted ones: SubmitSolution has no reply, so the node cannot
-    /// say, but the next SetNewPrevHash carries the new tip and a match is
-    /// proof the block connected.
+    /// count accepted ones: the node's reply to a SubmitSolution says
+    /// validation took the block and not that it won, so the next
+    /// SetNewPrevHash is what settles it and a match is proof it connected.
     confirmed: AtomicU32,
     /// Hashes forwarded and not yet seen as a tip, with the channel and
     /// sequence number they came from so the miner can be told which share it
@@ -298,10 +298,12 @@ impl AlgoContext {
     /// Blocks forwarded upstream whose hash has not been seen as the tip,
     /// oldest first, in internal byte order.
     ///
-    /// The pool cannot say what became of these: each either lost a race or
-    /// its tip announcement has not arrived yet, and from here the two look
-    /// the same. Something beside the node can tell them apart with
-    /// `getblock`, so the hashes are handed out rather than kept as a
+    /// The pool does not say what became of these, and three unrelated fates
+    /// look the same from here: a block that lost a race, one whose tip
+    /// announcement has not arrived yet, and one the node refused outright,
+    /// since the refusal it sends is logged by the upstream reader rather
+    /// than recorded here. Something beside the node can tell all three apart
+    /// with `getblock`, so the hashes are handed out rather than kept as a
     /// number. Nothing is added to the pool to do this; the list is the one
     /// `confirm_tip` already drains.
     pub fn unconfirmed(&self) -> Vec<[u8; 32]> {
@@ -392,9 +394,10 @@ impl AlgoContext {
             (work, prev, state.channels.clone())
         };
 
-        // A moved tip is the only evidence the pool can have that a block it
-        // forwarded was accepted, so it is checked here, before the new work
-        // goes out. SubmitSolution has no reply; the node cannot say yes.
+        // A moved tip is the only evidence that a block the pool forwarded
+        // won, so it is checked here, before the new work goes out. The
+        // node's reply to a SubmitSolution says validation took the block,
+        // which is a weaker claim than this one.
         if work.tip_changed {
             self.confirm_tip(&prev.prev_hash, &channels);
         }
@@ -1045,9 +1048,9 @@ impl Server {
                     }
                     if let Some(candidate) = outcome {
                         // A share at or under the network target is a block,
-                        // so it goes up to the node. There is no reply to a
-                        // SubmitSolution: the only way to see it refused is
-                        // the node's -debug=sv2 log.
+                        // so it goes up to the node. A refusal comes back as
+                        // AvianSubmitSolution.Error, which the upstream
+                        // reader logs; nothing here waits for it.
                         logln!(
                             "[pool] channel {} found a block for template {}, submitting",
                             channel.id,
@@ -1056,8 +1059,10 @@ impl Server {
                         channel.record_block();
                         algo.blocks.fetch_add(1, Ordering::Relaxed);
                         algo.remember_block(channel.id, submit.sequence_number, candidate.hash);
-                        // Told before the node is, because the node has no
-                        // reply to give and the miner is the one that cares.
+                        // Told before the node is asked, because this
+                        // notification means the share was a block and not
+                        // that the node took it, and the miner is the one
+                        // that cares.
                         if let Err(e) =
                             channel.send_block_found(submit.sequence_number, &candidate.hash, false)
                         {

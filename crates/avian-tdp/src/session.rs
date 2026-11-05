@@ -144,9 +144,10 @@ pub struct SolutionSubmitter {
 impl SolutionSubmitter {
     /// `coinbase` is the coinbase transaction serialized with its witness.
     ///
-    /// There is no reply. doc/sv2.md: the Template Distribution Protocol has
-    /// no `SubmitSolution.Error`, so a refused solution leaves no trace on the
-    /// wire and only a `-debug=sv2` log line on the node.
+    /// Returns once the frame is written, not once the node has judged it.
+    /// The Template Distribution Protocol defines no reply and Avian's
+    /// extension supplies one, so the verdict lands on whichever thread is
+    /// reading the session rather than here. See `handled_out_of_band`.
     ///
     /// Fails if the session is between connections, which is the honest
     /// answer: a solution for a template from the previous connection has

@@ -480,8 +480,8 @@ fn parse_args() -> Result<Option<Options>, String> {
     }
     let network = Network::parse(&chain).ok_or_else(|| format!("unknown chain {chain}"))?;
 
-    // Refused here rather than when the node silently rejects the block: the
-    // Template Distribution Protocol has no SubmitSolution.Error.
+    // Refused here rather than when the node rejects a block, which is the
+    // first time it can say anything about a tag it cannot fit.
     let coinbase_tag = coinbase_tag.into_bytes();
     if coinbase_tag.len() > MAX_COINBASE_TAG {
         return Err(format!(

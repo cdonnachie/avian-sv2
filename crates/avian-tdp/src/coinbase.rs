@@ -6,9 +6,10 @@
 //! obligation to the node rather than a worker's to the pool. The node
 //! rebuilds the header from the template and the submitted coinbase and
 //! re-serializes it for a byte comparison, so a coinbase that differs
-//! anywhere is refused before any proof of work is computed, and the Template
-//! Distribution Protocol has no `SubmitSolution.Error`, so the only trace is a
-//! `-debug=sv2` log line.
+//! anywhere is refused before any proof of work is computed. The refusal is
+//! named on the wire, by `AvianSubmitSolution.Error`, but only once a block
+//! has been found to carry it, so getting this right is not something a pool
+//! can leave to be reported.
 //!
 //! None of this is in the library: a miner never builds a coinbase.
 

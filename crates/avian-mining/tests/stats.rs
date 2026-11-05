@@ -254,8 +254,8 @@ fn shares_move_the_counters_and_an_estimate_appears() {
         body.contains(&format!("\"authority_public_key\": \"{PUBLISHED_KEY}\"")),
         "{body}"
     );
-    // blocks_submitted, not blocks_found: SubmitSolution has no reply, so the
-    // pool cannot know what the node did with it.
+    // blocks_submitted, not blocks_found: this counts what went up to the
+    // node, and what became of it is blocks_confirmed.
     assert!(body.contains("\"blocks_submitted\""), "{body}");
     assert!(!body.contains("blocks_found"), "{body}");
     // The gap between submitted and confirmed goes out as hashes, so a

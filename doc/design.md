@@ -193,8 +193,9 @@ At most **87 bytes**, and refused at configuration time rather than when the
 node rejects the block: the scriptSig limit is 2 to 100 bytes, the height push
 is up to 5, and this pool adds 8 bytes of extranonce. Taking the worst-case
 height means a tag accepted today cannot start failing years later. Getting
-this wrong is otherwise invisible, because the Template Distribution Protocol
-has no `SubmitSolution.Error`.
+this wrong is otherwise invisible until a block is found, which for a solo
+pool can be weeks: only then does the node refuse the submission and name a
+reason, and only through Avian's extension at that.
 
 ```
 --coinbase-tag is 100 bytes and the most that always fits is 87
@@ -371,8 +372,8 @@ pub const MAX_COINBASE_TAG: usize =
 A miner asking for more extranonce than is left after the height push, the
 configured tag and the pool's prefix is refused with
 `min-extranonce-size-too-large`, rather than given a channel whose every
-coinbase the node would reject, which with no `SubmitSolution.Error` would
-be silent.
+coinbase the node would reject, which is silent until the channel finds a
+block and the node names the reason it refused it.
 
 ### `version_rolling_allowed` is false
 
@@ -1306,8 +1307,8 @@ What *is* worth documenting in its place, and is not anywhere now:
 - **A pool must reserve the whole extranonce in the scriptSig length that goes
   inside `coinbase_tx_prefix`.** The length byte is in the prefix, before the
   bytes it counts exist. Getting it wrong produces a coinbase that is malformed
-  for every extranonce, and with no `SubmitSolution.Error` the pool would see
-  nothing but shares that never become blocks.
+  for every extranonce, and until one of them is a block the pool sees nothing
+  but shares that never become blocks.
 - **The scriptSig's 2-to-100-byte bound is shared three ways** on an extended
   channel: the BIP34 height push, the operator tag and the extranonce. A pool
   has to refuse a `min_extranonce_size` it cannot fit rather than grant it, and

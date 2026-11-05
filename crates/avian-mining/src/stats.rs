@@ -17,16 +17,19 @@
 //!
 //! - **Full payout addresses.** A prefix is enough for someone to recognise
 //!   their own channel and not enough to publish where everyone is paid.
-//! - **Blocks the node accepted, at the moment it accepts them.**
-//!   `SubmitSolution` has no reply, so the pool is never told. It can still
-//!   prove acceptance after the fact, because the next `SetNewPrevHash`
+//! - **What the node made of a submitted block, as it decides.** The node
+//!   does answer a `SubmitSolution`, through Avian's extension, but it
+//!   answers the thread holding the upstream session and says only that
+//!   validation took the block. Becoming the tip is the later and stronger
+//!   fact, and is proved after it happens, because the next `SetNewPrevHash`
 //!   carries the new tip and the pool knows the hash it submitted: that is
 //!   `blocks_confirmed`. `blocks_submitted` is the weaker number, and both
 //!   are reported because the gap between them is real.
 //! - **Which of the gap lost a race.** The hashes in the gap are listed as
-//!   `unconfirmed`, and the pool stops there: a block that lost a race and
-//!   one whose tip announcement is still on its way look the same from
-//!   here. A service beside the node can finish the job with `getblock` on
+//!   `unconfirmed`, and the pool stops there: a block that lost a race, one
+//!   whose tip announcement is still on its way, and one the node refused
+//!   all look the same from here, the refusal being logged and not kept.
+//!   A service beside the node can finish the job with `getblock` on
 //!   each hash: `confirmations` of -1 is a block that lost its race, one or
 //!   more is a block on the chain, and error -5 is a hash the node never
 //!   saw. That turns submitted minus confirmed into a resolved number
@@ -89,9 +92,9 @@ pub struct AlgoSnapshot {
     pub upstream_connected: bool,
     pub blocks_submitted: u32,
     /// Blocks whose hash was later seen as the chain tip. The only count the
-    /// pool can prove, and now it can: SubmitSolution has no reply, but the
-    /// next SetNewPrevHash carries the new tip and a match is proof the block
-    /// connected.
+    /// pool can prove: the node's reply to a SubmitSolution says validation
+    /// took the block, while the next SetNewPrevHash carries the new tip, and
+    /// a match with it is proof the block connected.
     pub blocks_confirmed: u32,
     /// Submitted and not yet seen as the tip, oldest first. Bounded by the
     /// pool to the last sixteen, so this is a worklist for whatever resolves
@@ -279,8 +282,8 @@ impl Snapshot {
                 "      \"upstream_connected\": {},\n",
                 algo.upstream_connected
             ));
-            // Not "blocks found": SubmitSolution has no reply, so the pool
-            // cannot know what the node did with it.
+            // Not "blocks found": this counts what went up to the node, and
+            // what became of it is blocks_confirmed below.
             out.push_str(&format!(
                 "      \"blocks_submitted\": {},\n",
                 algo.blocks_submitted

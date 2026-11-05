@@ -183,8 +183,9 @@ fn a_miner_with_only_prefix_and_suffix_can_mine_a_block_the_node_accepts() {
             )
             .expect("submit");
 
-        // Only the node settles it. There is no SubmitSolution.Error, so a
-        // refused solution shows up as a tip that did not move.
+        // Only the node settles it, and a refusal is a log line rather than
+        // anything this asserts on, so a tip that did not move is the
+        // failure this watches for.
         let deadline = Instant::now() + Duration::from_secs(30);
         while node.height() == before && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));

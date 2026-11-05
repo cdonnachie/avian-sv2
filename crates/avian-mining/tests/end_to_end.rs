@@ -77,8 +77,8 @@ fn a_miner_mines_a_regtest_block_through_the_pool() {
         }
 
         // The pool forwards a share that also meets the network target as a
-        // SubmitSolution. There is no reply to one, so the tip is the only
-        // evidence.
+        // SubmitSolution. Its reply would say only that validation took the
+        // block, so the tip is the evidence that it connected.
         let deadline = Instant::now() + Duration::from_secs(30);
         while rig.node.height() == before && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
