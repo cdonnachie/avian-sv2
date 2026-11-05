@@ -32,7 +32,8 @@ use crate::tdp::{
 use avian_sv2::avian::{
     self, PowType, EXT_AVIAN, EXT_CORE, EXT_NEGOTIATION, MSG_REQUEST_EXTENSIONS,
     MSG_REQUEST_EXTENSIONS_ERROR, MSG_REQUEST_EXTENSIONS_SUCCESS, MSG_SELECT_ALGORITHM,
-    MSG_SELECT_ALGORITHM_ERROR, MSG_SELECT_ALGORITHM_SUCCESS, MSG_TIME_CONSTRAINTS,
+    MSG_SELECT_ALGORITHM_ERROR, MSG_SELECT_ALGORITHM_SUCCESS, MSG_SUBMIT_SOLUTION_ERROR,
+    MSG_SUBMIT_SOLUTION_SUCCESS, MSG_TIME_CONSTRAINTS,
 };
 use avian_sv2::error::{Error, Result};
 use avian_sv2::logln;
@@ -266,6 +267,53 @@ impl TdpSession {
         true
     }
 
+    /// Frames that answer something this side sent, rather than belonging to
+    /// the round being read.
+    ///
+    /// A solution is submitted from whichever thread found it while this one
+    /// is reading, so the node's verdict on it lands wherever the reader
+    /// happens to be: mid-round, between rounds, or in the middle of a
+    /// transaction-data exchange. Handled in one place for that reason, and
+    /// handled ahead of `skippable`, which would otherwise log them as
+    /// messages this build does not know.
+    ///
+    /// Returns true when the frame was consumed, so the caller reads the next
+    /// one. A verdict that does not decode is logged and still consumed: the
+    /// Template Distribution Protocol defines no reply here at all, so losing
+    /// one costs what every client had before these messages existed, and
+    /// taking a pool's template feed down over an informational frame costs
+    /// considerably more.
+    fn handled_out_of_band(&self, frame: &Frame) -> bool {
+        match (frame.extension_type, frame.msg_type) {
+            (EXT_AVIAN, MSG_SUBMIT_SOLUTION_SUCCESS) => {
+                match avian::decode_submit_solution_success(&frame.payload) {
+                    // Deliberately not "the block was accepted": validation
+                    // took it, which is not the same as it becoming the tip.
+                    Ok(ok) => logln!(
+                        "[tdp] the node took the block for template {}, {}; whether it                          becomes the tip is what the next SetNewPrevHash says",
+                        ok.template_id,
+                        avian_sv2::wire::hex_rev(&ok.block_hash)
+                    ),
+                    Err(e) => logln!("[tdp] a malformed solution acceptance: {e}"),
+                }
+                true
+            }
+            (EXT_AVIAN, MSG_SUBMIT_SOLUTION_ERROR) => {
+                match avian::decode_submit_solution_error(&frame.payload) {
+                    Ok(err) => logln!(
+                        "[tdp] the node refused the block for template {}: {} ({})",
+                        err.template_id,
+                        err.error_code,
+                        avian::explain_submit_solution_error(&err.error_code)
+                    ),
+                    Err(e) => logln!("[tdp] a malformed solution refusal: {e}"),
+                }
+                true
+            }
+            _ => self.skippable(frame),
+        }
+    }
+
     pub fn pow(&self) -> PowType {
         self.pow
     }
@@ -303,7 +351,7 @@ impl TdpSession {
             if frame.is(EXT_CORE, MESSAGE_TYPE_NEW_TEMPLATE) {
                 break frame;
             }
-            if !self.skippable(&frame) {
+            if !self.handled_out_of_band(&frame) {
                 return Err(Error::Protocol(format!(
                     "expected a template, got {}",
                     frame.describe()
@@ -342,7 +390,7 @@ impl TdpSession {
                     });
                 }
                 _ => {
-                    if self.skippable(&frame) {
+                    if self.handled_out_of_band(&frame) {
                         continue;
                     }
                     return Err(Error::Protocol(format!(
@@ -379,7 +427,7 @@ impl TdpSession {
                     )));
                 }
                 _ => {
-                    if self.skippable(&frame) {
+                    if self.handled_out_of_band(&frame) {
                         continue;
                     }
                     return Err(Error::Protocol(format!(

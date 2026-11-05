@@ -36,6 +36,22 @@ pub const MSG_TIME_CONSTRAINTS: u8 = 0x03;
 /// client never sees one; it is here because Stage 3 is the side that does.
 pub const MSG_JOB_TIME_CONSTRAINTS: u8 = 0x04;
 
+/// The reply the Template Distribution Protocol does not define.
+///
+/// Its own message table ends at `SubmitSolution` with no `.Success` and no
+/// `.Error`, so a client that submits a block learns nothing from the
+/// protocol: not that the node took it, not why it did not, not even that it
+/// was heard. These two are Avian's, inside an extension both ends have
+/// negotiated, so no stock dispatch of the spec's numbers is touched and a
+/// peer built before them reads past them.
+///
+/// Neither can be relied on by its absence. There is no way to ask which
+/// message numbers inside a negotiated extension a peer implements, so
+/// silence from a node that never sends them looks exactly like silence from
+/// one that refused without saying so. Positive information only.
+pub const MSG_SUBMIT_SOLUTION_SUCCESS: u8 = 0x05;
+pub const MSG_SUBMIT_SOLUTION_ERROR: u8 = 0x06;
+
 /// Block notifications, their own extension and optional.
 ///
 /// [`EXT_AVIAN`] is required, and a required extension cannot carry an
@@ -286,6 +302,99 @@ pub fn decode_block_found(payload: &[u8]) -> Result<BlockFound> {
     Ok(out)
 }
 
+/// `AvianSubmitSolution.Success`: validation took the block.
+///
+/// Not that it won. A block that loses a race is accepted here too and then
+/// orphaned; what settles that is whether the next `SetNewPrevHash` carries
+/// this hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitSolutionSuccess {
+    pub template_id: u64,
+    /// In uint256's internal order, which is the reverse of how a block hash
+    /// is printed. It also says which submission is being answered, because
+    /// `template_id` cannot: several nonces may be in flight against one
+    /// template.
+    pub block_hash: [u8; 32],
+}
+
+pub fn encode_submit_solution_success(s: &SubmitSolutionSuccess) -> Vec<u8> {
+    Writer::new()
+        .u64(s.template_id)
+        .u256(&s.block_hash)
+        .finish()
+}
+
+pub fn decode_submit_solution_success(payload: &[u8]) -> Result<SubmitSolutionSuccess> {
+    let mut r = Reader::new(payload);
+    let out = SubmitSolutionSuccess {
+        template_id: r.u64()?,
+        block_hash: r.u256()?,
+    };
+    r.done()?;
+    Ok(out)
+}
+
+/// `AvianSubmitSolution.Error`: the node refused the solution, and why.
+///
+/// No block hash, and that is deliberate rather than an omission: most
+/// refusals happen before the proof-of-work hash is computed, because that
+/// hash costs more than every check before it put together. So there is
+/// nothing to name the submission with, and a submitter with several nonces
+/// in flight learns the reason but not which nonce. The reason is the part it
+/// can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitSolutionError {
+    pub template_id: u64,
+    /// One of the codes in doc/sv2.md, which are the same strings the node
+    /// writes to its own log.
+    pub error_code: String,
+}
+
+pub fn encode_submit_solution_error(e: &SubmitSolutionError) -> Vec<u8> {
+    Writer::new()
+        .u64(e.template_id)
+        .bytes_u8(e.error_code.as_bytes())
+        .finish()
+}
+
+pub fn decode_submit_solution_error(payload: &[u8]) -> Result<SubmitSolutionError> {
+    let mut r = Reader::new(payload);
+    let out = SubmitSolutionError {
+        template_id: r.u64()?,
+        error_code: r.text()?,
+    };
+    r.done()?;
+    Ok(out)
+}
+
+/// What a refusal code means, for a log line an operator has to act on.
+///
+/// `consensus-rejected` is the one that is not the submitter's fault: it means
+/// the node's own Stratum v2 checks and its consensus rules disagree.
+pub fn explain_submit_solution_error(code: &str) -> &'static str {
+    match code {
+        "unknown-template" => "the node has dropped that template",
+        "version-mismatch" => "nVersion was not the template's, and rolling is not allowed",
+        "bad-algo-id" => "nVersion bits 16-23 name no algorithm this chain defines",
+        "ntime-out-of-range" => "ntime was outside the window AvianTimeConstraints gave",
+        "ntime-wrong-epoch" => "ntime crossed the end of the template's X16RT epoch",
+        "coinbase-too-large" => "the coinbase exceeded the advertised size or weight",
+        "coinbase-malformed" => "the coinbase did not deserialize",
+        "coinbase-non-canonical" => "the coinbase re-serialized to different bytes",
+        "coinbase-bad-scriptsig" => "the scriptSig did not start with the BIP34 height push",
+        "coinbase-bad-fields" => "version, locktime or input sequence differed from the template",
+        "coinbase-bad-witness" => "vin[0] carried no BIP141 reserved witness value",
+        "missing-required-output" => "an output the template required was absent",
+        "bad-commitment" => "the witness commitment was wrong or not the highest-indexed output",
+        "value-too-high" => "the coinbase paid more than the template allowed",
+        "too-many-sigops" => "the coinbase exceeded the advertised sigop budget",
+        "block-too-large" => "template plus coinbase exceeded the block limit",
+        "pow-insufficient" => "the hash did not meet this algorithm's network target",
+        "consensus-rejected" => "the node's own checks and its consensus rules disagree,                                  which is a node bug rather than anything this side did",
+        _ => "an error code this build does not know",
+    }
+}
+
 pub fn encode_job_time_constraints(c: &JobTimeConstraints) -> Vec<u8> {
     Writer::new()
         .u32(c.channel_id)
@@ -336,6 +445,66 @@ mod tests {
         assert_eq!(
             decode_job_time_constraints(&encode_job_time_constraints(&c)).unwrap(),
             c
+        );
+    }
+
+    #[test]
+    fn submit_solution_replies_round_trip() {
+        let ok = SubmitSolutionSuccess {
+            template_id: 7,
+            block_hash: [0xab; 32],
+        };
+        let wire = encode_submit_solution_success(&ok);
+        // U64 then U256, which is 40 bytes and nothing else: the node's
+        // AvianSubmitSolutionSuccess has to agree byte for byte.
+        assert_eq!(wire.len(), 40);
+        assert_eq!(&wire[..8], &7u64.to_le_bytes());
+        assert_eq!(decode_submit_solution_success(&wire).unwrap(), ok);
+
+        let err = SubmitSolutionError {
+            template_id: 9,
+            error_code: "pow-insufficient".into(),
+        };
+        let wire = encode_submit_solution_error(&err);
+        // STR0_255, so one length byte then the text.
+        assert_eq!(wire[8], 16);
+        assert_eq!(decode_submit_solution_error(&wire).unwrap(), err);
+    }
+
+    #[test]
+    fn every_refusal_code_the_node_sends_is_explained() {
+        // doc/sv2.md calls these normative, so an unknown one here means the
+        // two sides have drifted. The fallback exists for a newer node, not
+        // for a code this build was shipped alongside.
+        for code in [
+            "unknown-template",
+            "version-mismatch",
+            "bad-algo-id",
+            "ntime-out-of-range",
+            "ntime-wrong-epoch",
+            "coinbase-too-large",
+            "coinbase-malformed",
+            "coinbase-non-canonical",
+            "coinbase-bad-scriptsig",
+            "coinbase-bad-fields",
+            "coinbase-bad-witness",
+            "missing-required-output",
+            "bad-commitment",
+            "value-too-high",
+            "too-many-sigops",
+            "block-too-large",
+            "pow-insufficient",
+            "consensus-rejected",
+        ] {
+            assert_ne!(
+                explain_submit_solution_error(code),
+                "an error code this build does not know",
+                "{code} has no explanation"
+            );
+        }
+        assert_eq!(
+            explain_submit_solution_error("invented-later"),
+            "an error code this build does not know"
         );
     }
 
