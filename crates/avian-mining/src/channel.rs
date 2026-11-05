@@ -7,11 +7,12 @@
 //! cannot land between a `NewMiningJob` and the `SetNewPrevHash` that
 //! activates it.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use avian_sv2::avian::{self, PowType, EXT_AVIAN, MSG_JOB_TIME_CONSTRAINTS};
+use avian_sv2::block;
 use avian_sv2::error::{Error, Result};
 use avian_sv2::logln;
 use avian_sv2::transport::ConnectionWriter;
@@ -100,6 +101,14 @@ pub struct Channel {
     pub payout_address: String,
     /// When the channel opened, which is what turns a share count into a rate.
     pub opened_at: Instant,
+    /// The cadence the pool sized this channel's share target for.
+    ///
+    /// Kept as well as handed to the limiter so the stats endpoint can say
+    /// what the target was aiming at. A miner comparing that with the rate it
+    /// is actually getting is checking the one number it cannot see from its
+    /// own side, since the target it was given does not say what cadence the
+    /// pool had in mind when it chose it.
+    shares_per_minute: f64,
     coinbase_tag: Vec<u8>,
     /// Whether this peer negotiated `EXT_AVIAN_BLOCKS`. False means it is
     /// never sent a block notification, which is what makes the message safe
@@ -139,7 +148,51 @@ struct ChannelState {
     /// and under the same lock as the jobs so that a share cannot be judged
     /// against one round's job and the next round's target.
     share_target: [u8; 32],
+    /// Every refusal this channel has been sent, by `Refusal::code()`.
+    ///
+    /// Beside the two counters above rather than in place of them. Those are
+    /// the numbers a page leads with; this is the breakdown for whoever is
+    /// working out why, and it is the difference between "three rejected" and
+    /// "three stale shares", which point at different things. A `BTreeMap` so
+    /// a snapshot of the same state is the same JSON twice.
+    ///
+    /// The codes here sum to more than `rejected`, because `invalid-job-id`
+    /// is refused without being counted against the channel. That is the
+    /// point of counting it: it is visible without being punitive.
+    refusals: BTreeMap<&'static str, u32>,
+    /// The lowest hash this channel has produced, which is how close it has
+    /// come to a block.
+    ///
+    /// Accepted shares only, blocks included. A refused submission either had
+    /// no hash computed or was not work this channel can claim, and a best
+    /// share that failed validation would be a boast about nothing.
+    best_share: Option<[u8; 32]>,
     limiter: Limiter,
+}
+
+impl ChannelState {
+    /// Counts a refusal under its own code.
+    ///
+    /// Called wherever one is sent, so the breakdown cannot drift from what
+    /// the worker was actually told.
+    fn record_refusal(&mut self, refusal: Refusal) {
+        let count = self.refusals.entry(refusal.code()).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    /// Keeps a hash if it is the lowest this channel has produced.
+    fn record_share_hash(&mut self, hash: [u8; 32]) {
+        let better = match self.best_share {
+            // Reusing the target comparison rather than writing a second
+            // one: "is this hash at or under that one" is the same question
+            // as whether a hash meets a target, and that one is tested.
+            Some(best) => block::meets_target(&hash, &best),
+            None => true,
+        };
+        if better {
+            self.best_share = Some(hash);
+        }
+    }
 }
 
 impl Channel {
@@ -175,6 +228,7 @@ impl Channel {
             worker,
             payout_address,
             opened_at: Instant::now(),
+            shares_per_minute,
             coinbase_tag,
             blocks_negotiated,
             writer,
@@ -190,6 +244,8 @@ impl Channel {
                 last_sequence: 0,
                 seen: HashSet::new(),
                 share_target,
+                refusals: BTreeMap::new(),
+                best_share: None,
                 limiter: Limiter::new(shares_per_minute, rate_limit),
             }),
         }
@@ -490,11 +546,13 @@ impl Channel {
         match state.limiter.admit() {
             Decision::Allow => {}
             Decision::TooFast => {
+                state.record_refusal(Refusal::TooManyShares);
                 drop(state);
                 self.send_error(sequence_number, Refusal::TooManyShares)?;
                 return Ok(None);
             }
             Decision::TooManyInvalid => {
+                state.record_refusal(Refusal::TooManyInvalidShares);
                 drop(state);
                 self.send_error(sequence_number, Refusal::TooManyInvalidShares)?;
                 // Dropped, in the spirit of the node's -sv2maxrejects: a
@@ -517,6 +575,7 @@ impl Channel {
             // it holds has done nothing wrong, and dropping it for that
             // punishes the wrong party.
             state.desync = state.desync.saturating_add(1);
+            state.record_refusal(Refusal::InvalidJobId);
             state.wants_work = true;
             let desync = state.desync;
             drop(state);
@@ -534,6 +593,7 @@ impl Channel {
 
         if !self.kind.is_extended() && !submission.extranonce.is_empty() {
             state.limiter.record_invalid();
+            state.record_refusal(Refusal::InvalidExtranonce);
             drop(state);
             self.send_error(sequence_number, Refusal::InvalidExtranonce)?;
             return Ok(None);
@@ -542,6 +602,7 @@ impl Channel {
         let fingerprint = (submission.job_id, submission.nonce, submission.ntime);
         if !state.seen.insert(fingerprint) {
             state.limiter.record_invalid();
+            state.record_refusal(Refusal::DuplicateShare);
             drop(state);
             self.send_error(sequence_number, Refusal::DuplicateShare)?;
             return Ok(None);
@@ -551,6 +612,7 @@ impl Channel {
         match share::validate(&job, self.pow, &submission, &share_target, hasher) {
             Outcome::Refused(refusal) => {
                 state.limiter.record_invalid();
+                state.record_refusal(refusal);
                 drop(state);
                 self.send_error(sequence_number, refusal)?;
                 Ok(None)
@@ -558,6 +620,7 @@ impl Channel {
             Outcome::Accepted { hash, is_block, .. } => {
                 state.accepted += 1;
                 state.shares += 1;
+                state.record_share_hash(hash);
                 let accepted = state.accepted;
                 let shares = state.shares;
                 drop(state);
@@ -703,6 +766,29 @@ impl Channel {
             .lock()
             .map(|s| (s.limiter.invalid(), s.limiter.refused_for_rate()))
             .unwrap_or((0, 0))
+    }
+
+    /// Every refusal this channel has been sent, by code.
+    ///
+    /// Cloned rather than handed out behind the lock: a caller gathering a
+    /// snapshot of every channel should not hold one channel's state while it
+    /// walks the rest, and the map has an entry per refusal code at most.
+    pub fn refusals_by_code(&self) -> BTreeMap<&'static str, u32> {
+        self.state
+            .lock()
+            .map(|s| s.refusals.clone())
+            .unwrap_or_default()
+    }
+
+    /// The lowest hash this channel has produced, or None before its first
+    /// accepted share.
+    pub fn best_share(&self) -> Option<[u8; 32]> {
+        self.state.lock().ok()?.best_share
+    }
+
+    /// The share cadence this channel's target was sized for.
+    pub fn shares_per_minute(&self) -> f64 {
+        self.shares_per_minute
     }
 
     fn lock_writer(&self) -> Result<std::sync::MutexGuard<'_, ConnectionWriter>> {

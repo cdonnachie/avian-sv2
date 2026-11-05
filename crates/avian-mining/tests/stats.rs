@@ -104,6 +104,25 @@ fn a_connected_miner_appears_on_the_endpoint() {
     // Stated rather than left to be assumed by whoever reads the page.
     assert!(body.contains("\"vardiff\": false"), "{body}");
     assert!(body.contains("there is no persistence"), "{body}");
+    // A channel that has just opened has refused nothing and found nothing,
+    // and says so with an empty object and a null rather than by leaving the
+    // keys out: a renderer should not have to tell "none yet" from "this
+    // pool does not report that".
+    assert!(body.contains("\"rejected_by_reason\": {}"), "{body}");
+    assert!(body.contains("\"best_share\": null"), "{body}");
+    assert!(body.contains("\"best_share_hashes\": null"), "{body}");
+    // Nothing has been accepted yet, so the estimate rests on nothing.
+    assert!(body.contains("\"estimate_stable\": false"), "{body}");
+    // The cadence the share target was sized for, which is the only thing
+    // that makes the observed rate worth comparing with anything.
+    assert!(
+        body.contains("\"expected_shares_per_minute\":"),
+        "the cadence the target was chosen for should be published: {body}"
+    );
+    // The scale a best share is read against, from the target the pool is
+    // judging blocks by rather than from a renderer's own idea of it.
+    assert!(body.contains("\"network_target\":"), "{body}");
+    assert!(body.contains("\"hashes_per_block\":"), "{body}");
 }
 
 #[test]
@@ -248,6 +267,12 @@ fn shares_move_the_counters_and_an_estimate_appears() {
     );
     assert!(body.contains("\"estimated_hashrate\""), "{body}");
     assert!(body.contains("\"share_target\""), "{body}");
+    // One accepted share is enough to have a best one, and this rig has the
+    // only channel, so a null here would mean the hash was never kept.
+    assert!(
+        !body.contains("\"best_share\": null"),
+        "an accepted share should have given this channel a best share: {body}"
+    );
     // Published verbatim, so a miner can paste it straight into
     // --sv2-authority without the operator reading it out of a log.
     assert!(

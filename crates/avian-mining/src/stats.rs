@@ -31,15 +31,17 @@
 //!   all look the same from here, the refusal being logged and not kept.
 //!   A service beside the node can finish the job with `getblock` on
 //!   each hash: `confirmations` of -1 is a block that lost its race, one or
-//!   more is a block on the chain, and error -5 is a hash the node never
-//!   saw. That turns submitted minus confirmed into a resolved number
-//!   without the pool holding anything more, or writing anything at all.
+//!   more is a block on the chain, and error -5 is a hash the node is not
+//!   holding, which is one that never reached it or one it refused. That
+//!   turns submitted minus confirmed into a resolved number without the pool
+//!   holding anything more, or writing anything at all.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use avian_sv2::avian::PowType;
 use avian_sv2::error::{Error, Result};
@@ -48,6 +50,26 @@ use crate::server::AlgoContext;
 
 /// How much of a payout address the endpoint will show.
 const ADDRESS_PREFIX: usize = 8;
+
+/// How many accepted shares an estimated hashrate rests on before this
+/// endpoint is willing to call it settled.
+///
+/// Share arrivals are Poisson, so a rate inferred from `n` of them carries a
+/// relative standard error of 1/sqrt(n): twenty-five shares is twenty
+/// percent, a hundred is ten. Twenty-five is the point where the number stops
+/// moving enough to be read as a measurement when it is an estimate, and at
+/// the cadence the pool aims for it is minutes rather than an hour.
+///
+/// This is not vardiff convergence, which is what the same idea means in
+/// SRI's monitoring API. There is no vardiff here, and `vardiff` in the
+/// output says so; this is only about how much the estimate is built on.
+const SETTLED_SHARES: u32 = 25;
+
+/// Whether an estimate built on this many accepted shares is worth reading as
+/// a measurement. See `SETTLED_SHARES`.
+fn estimate_is_stable(accepted: u32) -> bool {
+    accepted >= SETTLED_SHARES
+}
 
 /// The operator's side of the coinbase, as configured.
 ///
@@ -101,6 +123,9 @@ pub struct AlgoSnapshot {
     /// them against the node, not a history.
     pub unconfirmed: Vec<[u8; 32]>,
     pub prev_hash: Option<[u8; 32]>,
+    /// The network target in force, which is the scale a channel's best share
+    /// is read against.
+    pub network_target: Option<[u8; 32]>,
     pub channels: Vec<ChannelSnapshot>,
 }
 
@@ -130,7 +155,23 @@ pub struct ChannelSnapshot {
     pub connected_for: Duration,
     /// Hashes per second, inferred from accepted shares and the share target.
     pub estimated_hashrate: f64,
+    /// Whether `estimated_hashrate` rests on enough shares to be read as
+    /// more than an opening guess. See `SETTLED_SHARES`.
+    pub estimate_stable: bool,
+    /// The share cadence this channel's target was sized for, which is what
+    /// the observed rate should be compared against.
+    pub expected_shares_per_minute: f64,
     pub share_target_hex: String,
+    /// The lowest hash this channel has produced, in internal order.
+    ///
+    /// The closest this worker has come to a block, which on a solo pool is
+    /// the number a miner is actually asking about. Reported as a hash and
+    /// not as a difficulty for the reason `hashes_per_share` gives: a
+    /// difficulty needs a reference target to mean anything, and a wrong one
+    /// is worse here than none.
+    pub best_share: Option<[u8; 32]>,
+    /// Every refusal this channel has been sent, by code.
+    pub refusals: BTreeMap<&'static str, u32>,
 }
 
 /// A hash is at or under a target with probability (target + 1) / 2^256, so
@@ -216,7 +257,11 @@ impl Snapshot {
                             current_job_id: channel.current_job_id(),
                             connected_for,
                             estimated_hashrate,
+                            estimate_stable: estimate_is_stable(accepted),
+                            expected_shares_per_minute: channel.shares_per_minute(),
                             share_target_hex: hex(&share_target),
+                            best_share: channel.best_share(),
+                            refusals: channel.refusals_by_code(),
                         }
                     })
                     .collect();
@@ -227,6 +272,7 @@ impl Snapshot {
                     blocks_confirmed: algo.confirmed(),
                     unconfirmed: algo.unconfirmed(),
                     prev_hash: algo.prev_hash(),
+                    network_target: algo.network_target(),
                     channels,
                 }
             })
@@ -311,6 +357,25 @@ impl Snapshot {
                 )),
                 None => out.push_str("      \"mining_on\": null,\n"),
             }
+            // Internal order, as share_target is, since both are targets and
+            // neither is a block hash.
+            match &algo.network_target {
+                Some(target) => {
+                    out.push_str(&format!("      \"network_target\": \"{}\",\n", hex(target)));
+                    // The hashes a block costs at that target, which is what
+                    // makes best_share_hashes below mean something: the two
+                    // divide into "how much of a block this worker has
+                    // already done in one share".
+                    out.push_str(&format!(
+                        "      \"hashes_per_block\": {:.0},\n",
+                        hashes_per_share(target)
+                    ));
+                }
+                None => out.push_str(
+                    "      \"network_target\": null,\n      \
+                     \"hashes_per_block\": null,\n",
+                ),
+            }
             out.push_str("      \"channels\": [\n");
             for (j, channel) in algo.channels.iter().enumerate() {
                 out.push_str("        {\n");
@@ -351,9 +416,60 @@ impl Snapshot {
                     "          \"estimated_hashrate\": {:.1},\n",
                     channel.estimated_hashrate
                 ));
+                // Beside the estimate rather than folded into it: a rate from
+                // four shares and a rate from four hundred are both numbers,
+                // and only one of them is a measurement.
                 out.push_str(&format!(
-                    "          \"share_target\": \"{}\"\n",
+                    "          \"estimate_stable\": {},\n",
+                    channel.estimate_stable
+                ));
+                // What the target was sized for. The observed rate is
+                // accepted over connected_seconds, which a renderer can work
+                // out for itself; what it cannot work out is what cadence the
+                // pool was aiming at when it chose the target.
+                out.push_str(&format!(
+                    "          \"expected_shares_per_minute\": {:.3},\n",
+                    channel.expected_shares_per_minute
+                ));
+                out.push_str(&format!(
+                    "          \"share_target\": \"{}\",\n",
                     channel.share_target_hex
+                ));
+                // Display order, as a block hash is, so it pastes into an
+                // explorer and reads the way the miner's own log printed it.
+                match &channel.best_share {
+                    Some(hash) => {
+                        out.push_str(&format!(
+                            "          \"best_share\": \"{}\",\n",
+                            hex_reversed(hash)
+                        ));
+                        // The hashes that share stands for, which is the
+                        // comparable quantity: set against hashes_per_share
+                        // of the network target, it says how much of a block
+                        // this worker has already done in one go.
+                        out.push_str(&format!(
+                            "          \"best_share_hashes\": {:.0},\n",
+                            hashes_per_share(hash)
+                        ));
+                    }
+                    None => out.push_str(
+                        "          \"best_share\": null,\n          \
+                         \"best_share_hashes\": null,\n",
+                    ),
+                }
+                // Every refusal by code, which sums to more than "rejected"
+                // because invalid-job-id is refused without being counted
+                // against the channel. The keys are Refusal::code(), which is
+                // kebab-case ASCII and needs none of the escaping a worker
+                // label does.
+                let refusals: Vec<String> = channel
+                    .refusals
+                    .iter()
+                    .map(|(code, count)| format!("\"{code}\": {count}"))
+                    .collect();
+                out.push_str(&format!(
+                    "          \"rejected_by_reason\": {{{}}}\n",
+                    refusals.join(", ")
                 ));
                 out.push_str("        }");
                 out.push_str(if j + 1 == algo.channels.len() {
@@ -372,6 +488,21 @@ impl Snapshot {
         out.push_str("  ]\n}\n");
         out
     }
+}
+
+/// What `/healthz` answers.
+///
+/// JSON with the pool's own clock on it rather than the word "ok". A status
+/// on its own cannot tell a live answer from one something kept, and a
+/// watcher comparing this with its own clock is the cheapest way to notice a
+/// container whose time has drifted, which otherwise stays invisible until
+/// two services disagree about how old something is.
+fn health_body() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    format!("{{\"status\": \"ok\", \"timestamp\": {seconds}}}\n")
 }
 
 /// A worker label comes from a miner, so it is not trusted to be clean JSON.
@@ -487,7 +618,7 @@ where
             let body = source().to_json();
             respond(&mut stream, "200 OK", "application/json", &body)
         }
-        "/healthz" => respond(&mut stream, "200 OK", "text/plain", "ok\n"),
+        "/healthz" => respond(&mut stream, "200 OK", "application/json", &health_body()),
         _ => respond(&mut stream, "404 Not Found", "text/plain", "not found\n"),
     }
 }
@@ -561,6 +692,7 @@ mod tests {
                 blocks_confirmed: 1,
                 unconfirmed: vec![internal],
                 prev_hash: None,
+                network_target: None,
                 channels: Vec::new(),
             }],
         };
@@ -586,10 +718,185 @@ mod tests {
                 blocks_confirmed: 0,
                 unconfirmed: Vec::new(),
                 prev_hash: None,
+                network_target: None,
                 channels: Vec::new(),
             }],
         };
         assert!(snapshot.to_json().contains("\"unconfirmed\": [],"));
+    }
+
+    /// One channel with nothing interesting about it, for a test to change
+    /// the single field it is about.
+    fn channel() -> ChannelSnapshot {
+        ChannelSnapshot {
+            id: 1,
+            extended: true,
+            worker: "rig".into(),
+            payout_prefix: "avn1qmyq".into(),
+            accepted: 0,
+            rejected: 0,
+            desync: 0,
+            donation_bp: 0,
+            donation_paid: false,
+            blocks_submitted: 0,
+            current_job_id: None,
+            connected_for: Duration::from_secs(60),
+            estimated_hashrate: 0.0,
+            estimate_stable: false,
+            expected_shares_per_minute: 4.0,
+            share_target_hex: hex(&[0xff; 32]),
+            best_share: None,
+            refusals: BTreeMap::new(),
+        }
+    }
+
+    /// One algorithm holding whatever channels a test hands it.
+    fn algo(channels: Vec<ChannelSnapshot>) -> Snapshot {
+        Snapshot {
+            uptime: Duration::from_secs(1),
+            authority_public_key: String::new(),
+            operator_fee: OperatorFee::default(),
+            algorithms: vec![AlgoSnapshot {
+                pow: PowType::X16rt,
+                upstream_connected: true,
+                blocks_submitted: 0,
+                blocks_confirmed: 0,
+                unconfirmed: Vec::new(),
+                prev_hash: None,
+                network_target: None,
+                channels,
+            }],
+        }
+    }
+
+    #[test]
+    fn an_estimate_is_called_stable_only_once_it_rests_on_enough_shares() {
+        assert!(!estimate_is_stable(0));
+        assert!(!estimate_is_stable(SETTLED_SHARES - 1));
+        assert!(estimate_is_stable(SETTLED_SHARES));
+        // The flag is about the sample, so it cannot come back off once the
+        // shares are in.
+        assert!(estimate_is_stable(u32::MAX));
+    }
+
+    #[test]
+    fn a_best_share_is_shown_in_display_order_with_the_work_it_stands_for() {
+        let mut internal = [0u8; 32];
+        internal[0] = 0xcd;
+        internal[31] = 0x02;
+        let mut one = channel();
+        one.best_share = Some(internal);
+        let json = algo(vec![one]).to_json();
+        // Reversed, as a block hash is printed, so it pastes into an explorer.
+        let shown = format!("02{}cd", "00".repeat(30));
+        assert!(
+            json.contains(&format!("\"best_share\": \"{shown}\",")),
+            "{json}"
+        );
+        // The same arithmetic a share target gets, because the question is
+        // the same one: how many hashes does a value this low stand for.
+        let expected = format!("{:.0}", hashes_per_share(&internal));
+        assert!(
+            json.contains(&format!("\"best_share_hashes\": {expected},")),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn a_channel_with_no_accepted_share_reports_a_null_best_share() {
+        // Null rather than absent, and null rather than zero: a channel that
+        // has found nothing has no best share, and zero would read as a hash
+        // of zero, which would be the best one possible.
+        let json = algo(vec![channel()]).to_json();
+        assert!(json.contains("\"best_share\": null,"), "{json}");
+        assert!(json.contains("\"best_share_hashes\": null,"), "{json}");
+    }
+
+    #[test]
+    fn refusal_codes_are_an_object_and_may_sum_past_rejected() {
+        let mut one = channel();
+        one.rejected = 2;
+        one.desync = 3;
+        one.refusals.insert("stale-share", 2);
+        one.refusals.insert("invalid-job-id", 3);
+        let json = one_channel_json(one);
+        // BTreeMap order, so the same state renders the same JSON twice.
+        assert!(
+            json.contains("\"rejected_by_reason\": {\"invalid-job-id\": 3, \"stale-share\": 2}"),
+            "{json}"
+        );
+        // The breakdown sums to five against a rejected count of two, which
+        // is the point: an unknown job id is refused and not held against the
+        // channel, so it appears here and not there.
+        assert!(json.contains("\"rejected\": 2,"), "{json}");
+        assert!(json.contains("\"desync\": 3,"), "{json}");
+    }
+
+    #[test]
+    fn no_refusals_is_an_empty_object_and_not_an_absent_key() {
+        let json = one_channel_json(channel());
+        assert!(json.contains("\"rejected_by_reason\": {}"), "{json}");
+    }
+
+    #[test]
+    fn what_a_block_costs_is_published_beside_the_target_it_comes_from() {
+        let mut snapshot = algo(Vec::new());
+        // Half of the easiest target, so a block is worth two hashes.
+        let mut target = [0xffu8; 32];
+        target[31] = 0x7f;
+        snapshot.algorithms[0].network_target = Some(target);
+        let json = snapshot.to_json();
+        assert!(
+            json.contains(&format!("\"network_target\": \"{}\",", hex(&target))),
+            "{json}"
+        );
+        let expected = format!("{:.0}", hashes_per_share(&target));
+        assert!(
+            json.contains(&format!("\"hashes_per_block\": {expected},")),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn no_template_yet_leaves_the_network_target_null_rather_than_absent() {
+        // A renderer dividing a best share by this needs to tell "no
+        // template" from "a block costs nothing".
+        let json = algo(Vec::new()).to_json();
+        assert!(json.contains("\"network_target\": null,"), "{json}");
+        assert!(json.contains("\"hashes_per_block\": null,"), "{json}");
+    }
+
+    #[test]
+    fn the_cadence_a_target_was_sized_for_is_published() {
+        let mut one = channel();
+        one.expected_shares_per_minute = 4.5;
+        one.accepted = 30;
+        one.estimate_stable = true;
+        let json = one_channel_json(one);
+        assert!(
+            json.contains("\"expected_shares_per_minute\": 4.500,"),
+            "{json}"
+        );
+        assert!(json.contains("\"estimate_stable\": true,"), "{json}");
+    }
+
+    /// The JSON of a pool serving one algorithm with this one channel on it.
+    fn one_channel_json(channel: ChannelSnapshot) -> String {
+        algo(vec![channel]).to_json()
+    }
+
+    #[test]
+    fn health_answers_json_with_a_clock_on_it() {
+        let body = health_body();
+        assert!(body.contains("\"status\": \"ok\""), "{body}");
+        // The clock, not a constant: anything later than the day this was
+        // written means a real one was read.
+        let stamp: u64 = body
+            .split("\"timestamp\": ")
+            .nth(1)
+            .and_then(|rest| rest.trim_end().trim_end_matches('}').parse().ok())
+            .unwrap_or(0);
+        assert!(stamp > 1_762_000_000, "{body}");
     }
 
     #[test]

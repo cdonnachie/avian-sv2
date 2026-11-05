@@ -366,6 +366,16 @@ impl AlgoContext {
         self.state.lock().ok()?.prev.as_ref().map(|p| p.prev_hash)
     }
 
+    /// The network target in force, from the same place a job takes it.
+    ///
+    /// Published so a channel's best share can be read against a block.
+    /// Without it, the hash the pool reports is a number with no scale: a
+    /// renderer would have to carry its own idea of the network's difficulty
+    /// and would be free to disagree with the target shares are judged by.
+    pub fn network_target(&self) -> Option<[u8; 32]> {
+        self.state.lock().ok()?.prev.as_ref().map(|p| p.target)
+    }
+
     /// Records a round of work and pushes a job to every channel.
     ///
     /// Returns the errors of any channels that could not be written to, which
