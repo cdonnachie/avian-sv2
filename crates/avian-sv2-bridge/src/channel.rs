@@ -89,6 +89,10 @@ pub struct BridgeChannel {
     /// How far past a job's `ntime` a miner may roll. Zero pins it.
     ntime_roll: u32,
     rate_limit: RateLimitConfig,
+    /// Whether this peer negotiated `EXT_AVIAN_BLOCKS`. False means it is
+    /// never sent a block notification, which is what makes the message safe
+    /// to serve to clients built before it existed.
+    blocks_negotiated: bool,
     writer: Arc<Mutex<ConnectionWriter>>,
     state: Mutex<State>,
 }
@@ -135,6 +139,7 @@ impl BridgeChannel {
         nominal_hash_rate: f64,
         ntime_roll: u32,
         rate_limit: RateLimitConfig,
+        blocks_negotiated: bool,
         writer: Arc<Mutex<ConnectionWriter>>,
     ) -> Result<Self> {
         if let ChannelKind::Extended { extranonce_size } = kind {
@@ -159,6 +164,7 @@ impl BridgeChannel {
             nominal_hash_rate,
             ntime_roll,
             rate_limit,
+            blocks_negotiated,
             writer,
             state: Mutex::new(State {
                 subscription,
@@ -654,14 +660,25 @@ impl BridgeChannel {
     }
 
     fn send_block_found(&self, sequence_number: u32, block_hash: &[u8; 32]) -> Result<()> {
+        // A client that did not ask for block notifications is not sent one.
+        // Silently, and that is the point: this used to be a message inside
+        // the extension every client must negotiate, so a client built before
+        // it existed received one and ended the session.
+        if !self.blocks_negotiated {
+            return Ok(());
+        }
         let payload = avian::encode_block_found(&avian::BlockFound {
             channel_id: self.id,
             sequence_number,
             block_hash: *block_hash,
             confirmed: false,
         });
-        self.lock_writer()?
-            .send_raw(EXT_AVIAN, avian::MSG_BLOCK_FOUND, true, &payload)
+        self.lock_writer()?.send_raw(
+            avian::EXT_AVIAN_BLOCKS,
+            avian::MSG_BLOCK_FOUND,
+            true,
+            &payload,
+        )
     }
 
     fn lock_writer(&self) -> Result<MutexGuard<'_, ConnectionWriter>> {

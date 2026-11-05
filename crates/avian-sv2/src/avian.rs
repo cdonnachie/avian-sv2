@@ -12,8 +12,15 @@ use crate::wire::{Reader, Writer};
 
 pub const EXT_CORE: u16 = 0x0000;
 pub const EXT_NEGOTIATION: u16 = 0x0001;
-/// Experimental, and a mainnet release blocker until a registry allocation
-/// replaces it. doc/sv2.md says so in as many words.
+/// Allocated in Avian's own registry rather than Stratum v2's.
+///
+/// An `extension_type` need only be unique among peers that can share a
+/// connection, and an Avian connection and a Bitcoin one never do. That is
+/// the Stratum v2 maintainers' own position, given when this extension was
+/// submitted upstream and declined as out of scope
+/// (stratum-mining/sv2-spec#250), so this is not an experimental squat and
+/// not a mainnet blocker. `0x4000`-`0x4fff` is Avian's allocated space and
+/// `0x5000`-`0x7fff` is what it keeps experimental. See doc/sv2.md.
 pub const EXT_AVIAN: u16 = 0x4001;
 
 pub const MSG_REQUEST_EXTENSIONS: u8 = 0x00;
@@ -29,16 +36,40 @@ pub const MSG_TIME_CONSTRAINTS: u8 = 0x03;
 /// client never sees one; it is here because Stage 3 is the side that does.
 pub const MSG_JOB_TIME_CONSTRAINTS: u8 = 0x04;
 
-/// `AvianBlockFound`, upstream to downstream, on the Mining Protocol.
+/// Block notifications, their own extension and optional.
 ///
-/// A channel message, so bit 15 of `extension_type` is set.
+/// [`EXT_AVIAN`] is required, and a required extension cannot carry an
+/// optional capability: negotiating it is mandatory, so a client has no way
+/// to decline one message inside it. These were briefly message `0x05` there
+/// during development, which is how that was noticed. A client that does not
+/// know about `0x4002` does not ask for it and so is never sent one, which
+/// fixes it structurally rather than by documentation.
 ///
-/// This one is not really Avian's: nothing about it concerns multiple
-/// algorithms or time bounds, and any solo pool on any chain has the same gap.
-/// It is deliberately excluded from the registry submission for that reason,
-/// and belongs in core Stratum v2. It lives here because the gap is real now
-/// and the specification process is not fast.
-pub const MSG_BLOCK_FOUND: u8 = 0x05;
+/// Nothing about telling a miner what became of its share concerns multiple
+/// algorithms or time bounds either, so it had no business inside an
+/// identifier allocated for those.
+pub const EXT_AVIAN_BLOCKS: u16 = 0x4002;
+
+/// `BlockFound`, upstream to downstream, on the Mining Protocol.
+///
+/// Message `0x00` of [`EXT_AVIAN_BLOCKS`], not of [`EXT_AVIAN`]. A channel
+/// message, so bit 15 of the extension type is set and it travels under
+/// `0xc002`.
+pub const MSG_BLOCK_FOUND: u8 = 0x00;
+
+/// TLV field `0x01` of [`EXT_AVIAN`]: the proof of work one channel carries.
+///
+/// A `U8`, the same values `AvianSelectAlgorithm` uses, appended to
+/// `OpenStandardMiningChannel` or `OpenExtendedMiningChannel`. It overrides
+/// the connection's algorithm for that channel alone.
+///
+/// A TLV field rather than a message, because section 3.4.1 requires the
+/// frame's `extension_type` to stay `0x0000` for a message the core protocol
+/// defined, and because a separate message would have to be matched to an
+/// open by `request_id` and could race it. Absent, which is what every peer
+/// built before this sends, means the connection's algorithm, so nothing has
+/// to change for a miner that mines one thing.
+pub const TLV_FIELD_POW_TYPE: u8 = 0x01;
 
 /// X16RT rederives its hash chain every 128 seconds.
 pub const TIME_MASK: u32 = 0xffff_ff80;

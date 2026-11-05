@@ -188,7 +188,7 @@ impl Bridge {
         // The handshake is the solo pool's, verbatim: a miner built for one
         // connects to the other without knowing the difference.
         setup_connection(&mut reader, &writer)?;
-        request_extensions(&mut reader, &writer)?;
+        let extensions = request_extensions(&mut reader, &writer)?;
         let pow = select_algorithm(&mut reader, &writer, &self.offered())?;
         let upstream_addr = self
             .config
@@ -198,7 +198,14 @@ impl Bridge {
             .map(|(_, addr)| *addr)
             .ok_or_else(|| Error::Protocol(format!("no upstream for {pow}")))?;
 
-        let (channel, upstream) = self.open_channel(&mut reader, &writer, pow, upstream_addr)?;
+        // The bridge can say a share was a block, because it hashes every
+        // share to validate it. It cannot say whether the block was accepted:
+        // the Stratum v1 pool upstream has no way to tell it, so the second
+        // notification never comes and a miner here only ever sees the
+        // submitted one.
+        let blocks = extensions.contains(&avian_sv2::avian::EXT_AVIAN_BLOCKS);
+        let (channel, upstream) =
+            self.open_channel(&mut reader, &writer, pow, upstream_addr, blocks)?;
         logln!(
             "[bridge] {peer} opened channel {} on {pow} as {:?}, difficulty {} upstream at {}",
             channel.id,
@@ -226,7 +233,7 @@ impl Bridge {
             })
         };
 
-        let result = self.pump_submissions(&mut reader, &channel);
+        let result = self.pump_submissions(&mut reader, &channel, &extensions);
         // The upstream session was opened in this miner's name; nobody else
         // may submit on it. Closing the socket is what lets the pump thread
         // finish, since it holds its own reference to the client.
@@ -249,6 +256,7 @@ impl Bridge {
         writer: &Arc<Mutex<ConnectionWriter>>,
         pow: PowType,
         upstream_addr: SocketAddr,
+        blocks_negotiated: bool,
     ) -> Result<(Arc<BridgeChannel>, Arc<Client>)> {
         let mut frame = reader.recv()?;
         if frame.extension_type != EXT_CORE_MINING {
@@ -384,6 +392,7 @@ impl Bridge {
             self.config.believed_hash_rate(nominal_hash_rate),
             self.config.ntime_roll,
             self.config.rate_limit,
+            blocks_negotiated,
             writer.clone(),
         ) {
             Ok(channel) => Arc::new(channel),
@@ -410,6 +419,7 @@ impl Bridge {
         &self,
         reader: &mut ConnectionReader,
         channel: &Arc<BridgeChannel>,
+        negotiated: &[u16],
     ) -> Result<()> {
         loop {
             let mut frame = reader.recv()?;
@@ -458,10 +468,23 @@ impl Bridge {
                     channel.handle_submit(submission, sequence_number, self.hasher.as_ref())?;
                 }
                 _ => {
+                    // As in the pool: an unknown message number inside an
+                    // extension this bridge granted means the miner was built
+                    // at another time, and is read past so that a message can
+                    // be added without breaking it.
+                    if frame.is_skippable(negotiated) {
+                        logln!(
+                            "[bridge] channel {} sent {}, which this build does not serve; \
+                             ignoring it",
+                            channel.id,
+                            frame.describe()
+                        );
+                        continue;
+                    }
                     return Err(Error::Protocol(format!(
                         "unexpected {} on a mining connection",
                         frame.describe()
-                    )))
+                    )));
                 }
             }
         }

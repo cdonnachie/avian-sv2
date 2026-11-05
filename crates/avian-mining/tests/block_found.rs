@@ -1,11 +1,12 @@
-//! `AvianBlockFound` (0x05): a miner being told it found a block.
+//! `BlockFound` (extension `0x4002`, message `0x00`): a miner being told it
+//! found a block.
 //!
-//! Nothing in the Mining Protocol carries this. A miner is given a share
-//! target and never the network target, so it cannot work out that its own
-//! share was a block. For a pool paying by share that is unremarkable. For a
-//! solo pool it is backwards, because consensus pays the miner directly for
-//! exactly these, and the miner was the one piece of software that could not
-//! see them.
+//! A miner can recognise a candidate on its own, because `SetNewPrevHash`
+//! carries `nbits`. What it cannot see is what became of the share it sent:
+//! `SubmitShares.Success` means "accepted as a share" and nothing more. For a
+//! pool paying by share that is unremarkable. For a solo pool it is
+//! backwards, because consensus pays the miner directly for exactly these and
+//! it would otherwise not know which of its shares won.
 //!
 //! On regtest the share target is the network target, so nearly every share is
 //! a block, which makes this cheap to test here and is the one way regtest
@@ -90,7 +91,7 @@ fn a_miner_is_told_when_its_share_was_a_block() {
     }
 
     let (sequence, hash, confirmed) = submitted.expect(
-        "a share at or under the network target should have produced an AvianBlockFound; \
+        "a share at or under the network target should have produced a BlockFound; \
          without it a solo miner cannot tell it found anything",
     );
     assert!(

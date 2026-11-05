@@ -23,13 +23,20 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use avian_sv2::avian::PowType;
+use avian_sv2::avian::EXT_CORE;
+use avian_sv2::avian::{PowType, EXT_AVIAN_BLOCKS};
 use avian_sv2::block;
 use avian_sv2::client::{Event, MiningClient, Trace};
 use avian_sv2::flags;
 use common::{
-    expect_job, find_share, poll_event, position_of, raw_request_extensions, raw_setup, trace, Rig,
-    SetupAnswer, AVIAN_EXTENSION,
+    expect_job, find_share, open_standard, open_standard_on, poll_event, position_of, raw_ready,
+    raw_request_extensions, raw_setup, trace, Rig, SetupAnswer, AVIAN_EXTENSION, WORKER_ADDRESS,
+};
+use mining_sv2::{
+    CloseChannel, NewMiningJob, OpenMiningChannelError, OpenStandardMiningChannel, UpdateChannel,
+    UpdateChannelError, MESSAGE_TYPE_CLOSE_CHANNEL, MESSAGE_TYPE_NEW_MINING_JOB,
+    MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
+    MESSAGE_TYPE_UPDATE_CHANNEL, MESSAGE_TYPE_UPDATE_CHANNEL_ERROR,
 };
 
 macro_rules! rig {
@@ -169,7 +176,372 @@ fn the_extension_is_required_of_a_miner_too() {
 
     let (accepted_list, _, accepted) = raw_request_extensions(&rig, &[AVIAN_EXTENSION]);
     assert!(accepted);
-    assert_eq!(accepted_list, vec![AVIAN_EXTENSION]);
+    assert_eq!(
+        accepted_list,
+        vec![AVIAN_EXTENSION],
+        "a miner that asks for one extension is told it got one: block \
+         notifications are not handed out unasked, which is the whole point of \
+         them having their own identifier"
+    );
+}
+
+/// One connection carries as many channels as the worker opens.
+///
+/// The pool used to open exactly one, before the message loop, and anything
+/// arriving afterwards that was not a share on that channel reached the
+/// catch-all arm. A proxy aggregating several rigs is the ordinary reason to
+/// want more than one, and the specification has always allowed it.
+///
+/// The library client is one channel per connection, so this drives the wire
+/// directly. Both channels are on the connection's algorithm: `SelectAlgorithm`
+/// is still connection-scoped, which is the next thing to change.
+#[test]
+fn one_connection_carries_several_channels() {
+    let rig = rig!("multichan", 94, &[PowType::X16rt], None);
+    let mut conn = raw_ready(&rig, PowType::X16rt);
+
+    let (first, before) = open_standard(&mut conn, 1, WORKER_ADDRESS);
+    let (second, between) = open_standard(&mut conn, 2, WORKER_ADDRESS);
+    assert_ne!(
+        first, second,
+        "each channel gets an id of its own, or nothing can be routed to it"
+    );
+
+    // Both are live, not merely recorded. A channel the pool opened but did
+    // not register is one the publisher never reaches, and the only thing
+    // that tells the two apart from out here is whether work arrives for it.
+    // The frames read past during the second open are where the first
+    // channel's job is, which is why the helper hands them back.
+    fn note(worked: &mut std::collections::HashSet<u32>, frame: avian_sv2::transport::Frame) {
+        if frame.msg_type == MESSAGE_TYPE_NEW_MINING_JOB {
+            let mut payload = frame.payload;
+            let job: NewMiningJob = binary_sv2::from_bytes(&mut payload).expect("decode job");
+            worked.insert(job.channel_id);
+        }
+    }
+    let mut worked = std::collections::HashSet::new();
+    for frame in before.into_iter().chain(between) {
+        note(&mut worked, frame);
+    }
+    // The second channel is answered and then served, so its own job is still
+    // in flight when its open returns. Drain until both have one.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while worked.len() < 2 && Instant::now() < deadline {
+        let Ok(frame) = conn.recv() else { break };
+        note(&mut worked, frame);
+    }
+    assert!(
+        worked.contains(&first) && worked.contains(&second),
+        "both channels should have been pushed work on opening, saw {worked:?} \
+         for channels {first} and {second}"
+    );
+
+    // Closing one closes one. The pool used to end the whole session on a
+    // CloseChannel, which with several channels on a connection would take
+    // down every other worker behind a proxy.
+    let reason: &[u8] = b"done";
+    conn.send(
+        EXT_CORE,
+        MESSAGE_TYPE_CLOSE_CHANNEL,
+        true,
+        CloseChannel {
+            channel_id: first,
+            reason_code: reason.try_into().unwrap(),
+        },
+    )
+    .expect("send close");
+
+    // Probing with UpdateChannel rather than waiting for the next job,
+    // because work only arrives on a template refresh and that is a test
+    // spent asleep. The closed channel must now be unknown, and saying so
+    // proves three things at once: the connection survived the close, the
+    // channel really was removed, and the id is being routed rather than
+    // assumed.
+    let max_target = [0xffu8; 32];
+    for id in [first, second] {
+        conn.send(
+            EXT_CORE,
+            MESSAGE_TYPE_UPDATE_CHANNEL,
+            true,
+            UpdateChannel {
+                channel_id: id,
+                nominal_hash_rate: 2_000_000.0,
+                maximum_target: max_target.as_slice().try_into().unwrap(),
+            },
+        )
+        .expect("send update");
+    }
+
+    let mut refused = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let Ok(frame) = conn.recv() else { break };
+        if frame.msg_type == MESSAGE_TYPE_UPDATE_CHANNEL_ERROR {
+            let mut payload = frame.payload;
+            let error: UpdateChannelError =
+                binary_sv2::from_bytes(&mut payload).expect("decode update error");
+            refused.push(error.channel_id);
+        }
+    }
+    assert_eq!(
+        refused,
+        vec![first],
+        "only the closed channel should be unknown; the survivor must still be \
+         served on the same connection"
+    );
+}
+
+/// Two algorithms on one connection, one per channel.
+///
+/// `AvianSelectAlgorithm` settles the connection's algorithm and used to
+/// settle every channel's with it, because there was only ever one channel.
+/// A channel now overrides it with a `pow_type` TLV field on its open, which
+/// is what lets a proxy put mixed rigs behind a single upstream connection
+/// instead of one connection per algorithm.
+///
+/// The proof is which job each channel is sent: a job carries the template's
+/// version, and the algorithm lives in bits 16-23 of it, so the work itself
+/// says which algorithm the pool thinks that channel is on. Nothing else
+/// visible from out here distinguishes the two.
+#[test]
+fn a_channel_can_carry_an_algorithm_the_connection_did_not_select() {
+    let rig = rig!(
+        "perchanalgo",
+        95,
+        &[PowType::X16rt, PowType::MinotaurX],
+        None
+    );
+    // The connection selects X16RT, so a channel that says nothing gets it.
+    let mut conn = raw_ready(&rig, PowType::X16rt);
+
+    let (inherited, a) = open_standard_on(&mut conn, 1, WORKER_ADDRESS, None);
+    let (overridden, b) = open_standard_on(&mut conn, 2, WORKER_ADDRESS, Some(PowType::MinotaurX));
+    assert_ne!(inherited, overridden);
+
+    fn note(seen: &mut std::collections::HashMap<u32, u32>, frame: avian_sv2::transport::Frame) {
+        if frame.msg_type == MESSAGE_TYPE_NEW_MINING_JOB {
+            let mut payload = frame.payload;
+            let job: NewMiningJob = binary_sv2::from_bytes(&mut payload).expect("decode job");
+            seen.entry(job.channel_id).or_insert(job.version);
+        }
+    }
+    let mut seen = std::collections::HashMap::new();
+    for frame in a.into_iter().chain(b) {
+        note(&mut seen, frame);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while seen.len() < 2 && Instant::now() < deadline {
+        let Ok(frame) = conn.recv() else { break };
+        note(&mut seen, frame);
+    }
+
+    let pow_of = |version: u32| ((version >> 16) & 0xff) as u8;
+    let inherited_version = *seen
+        .get(&inherited)
+        .unwrap_or_else(|| panic!("channel {inherited} was never sent work"));
+    let overridden_version = *seen
+        .get(&overridden)
+        .unwrap_or_else(|| panic!("channel {overridden} was never sent work"));
+
+    assert_eq!(
+        pow_of(inherited_version),
+        PowType::X16rt as u8,
+        "a channel that sent no pow_type field must inherit the connection's \
+         algorithm, or every miner built before the field changes algorithm \
+         on upgrade"
+    );
+    assert_eq!(
+        pow_of(overridden_version),
+        PowType::MinotaurX as u8,
+        "the channel asked for MinotaurX and must be served MinotaurX work, \
+         on the same connection as an X16RT channel"
+    );
+}
+
+/// An algorithm the pool does not serve is refused, and only that channel is.
+#[test]
+fn a_channel_asking_for_an_algorithm_the_pool_lacks_is_refused_alone() {
+    // X16RT only, so a channel asking for MinotaurX is asking for something
+    // the chain defines and this pool was not configured to serve.
+    let rig = rig!("perchanrefuse", 96, &[PowType::X16rt], None);
+    let mut conn = raw_ready(&rig, PowType::X16rt);
+
+    let (good, _) = open_standard_on(&mut conn, 1, WORKER_ADDRESS, None);
+
+    let mut payload = binary_sv2::to_bytes(OpenStandardMiningChannel {
+        request_id: 2,
+        user_identity: WORKER_ADDRESS.as_bytes().try_into().unwrap(),
+        nominal_hash_rate: 1_000_000.0,
+        max_target: [0xffu8; 32].as_slice().try_into().unwrap(),
+    })
+    .expect("encode");
+    avian_sv2::tlv::append(
+        &mut payload,
+        &[avian_sv2::tlv::Field::u8(
+            AVIAN_EXTENSION,
+            avian_sv2::avian::TLV_FIELD_POW_TYPE,
+            PowType::MinotaurX as u8,
+        )],
+    )
+    .expect("append");
+    conn.send_raw(
+        EXT_CORE,
+        MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
+        false,
+        &payload,
+    )
+    .expect("send open");
+
+    let mut code = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while code.is_none() && Instant::now() < deadline {
+        let Ok(frame) = conn.recv() else { break };
+        if frame.msg_type == MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR {
+            let mut payload = frame.payload;
+            let error: OpenMiningChannelError =
+                binary_sv2::from_bytes(&mut payload).expect("decode open error");
+            code = Some(String::from_utf8_lossy(error.error_code.as_ref()).into_owned());
+        }
+    }
+    assert_eq!(
+        code.as_deref(),
+        Some("pow-type-not-enabled"),
+        "the chain defines MinotaurX, so this is the operator's configuration \
+         and not the worker's mistake, and the code has to say which"
+    );
+
+    // And the connection stands, with the channel it already had. Refusing a
+    // channel is not refusing a connection: behind a proxy, one rig asking
+    // for an algorithm the pool does not serve must not disconnect the rest.
+    let max_target = [0xffu8; 32];
+    conn.send(
+        EXT_CORE,
+        MESSAGE_TYPE_UPDATE_CHANNEL,
+        true,
+        UpdateChannel {
+            channel_id: good,
+            nominal_hash_rate: 2_000_000.0,
+            maximum_target: max_target.as_slice().try_into().unwrap(),
+        },
+    )
+    .expect("the connection should still be up");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let Ok(frame) = conn.recv() else { break };
+        assert_ne!(
+            frame.msg_type, MESSAGE_TYPE_UPDATE_CHANNEL_ERROR,
+            "the surviving channel must still be known to the pool"
+        );
+    }
+}
+
+/// A message number the pool does not serve, inside an extension it granted,
+/// is read past rather than treated as a violation.
+///
+/// Message numbers inside an extension grow over time, and negotiating an
+/// `extension_type` says nothing about which of those numbers either side
+/// knows, because the two were built at different times. Without this rule,
+/// the first message added to `0x4001` ends the session of every worker built
+/// before it, which is exactly what happened when block notifications were
+/// first wired up here.
+#[test]
+fn an_unknown_message_in_a_negotiated_extension_is_ignored() {
+    let rig = rig!("unknownmsg", 97, &[PowType::X16rt], None);
+    let mut conn = raw_ready(&rig, PowType::X16rt);
+    let (first, _) = open_standard(&mut conn, 1, WORKER_ADDRESS);
+
+    // 0x7f of 0x4001: an extension this connection negotiated, and a number
+    // no build of this pool serves.
+    conn.send_raw(AVIAN_EXTENSION, 0x7f, false, &[1, 2, 3])
+        .expect("send an unknown message");
+
+    // Opening a second channel is the proof, because only a live session that
+    // is still reading and still routing can answer one. Asserting that no
+    // error came back would not be proof: a closed connection sends no errors
+    // either.
+    let (second, _) = open_standard_on(&mut conn, 2, WORKER_ADDRESS, None);
+    assert_ne!(
+        first, second,
+        "the pool must still be serving this connection after ignoring a \
+         message it does not know"
+    );
+}
+
+/// A message in an extension this connection never negotiated still ends it.
+#[test]
+fn a_message_in_an_unnegotiated_extension_ends_the_connection() {
+    let rig = rig!("unnegotiated", 98, &[PowType::X16rt], None);
+    let mut conn = raw_ready(&rig, PowType::X16rt);
+    let (_, _) = open_standard(&mut conn, 1, WORKER_ADDRESS);
+
+    // The pool implements 0x4002, and `raw_ready` asked only for 0x4001. That
+    // is the case worth pinning: tolerance is owed to a peer built at another
+    // time, not to one sending messages for a capability it never negotiated.
+    conn.send_raw(
+        EXT_AVIAN_BLOCKS,
+        avian_sv2::avian::MSG_BLOCK_FOUND,
+        true,
+        &[],
+    )
+    .expect("send");
+
+    // The read failing well inside its own timeout is what distinguishes a
+    // closed connection from one the pool merely went quiet on. A read that
+    // ran to the timeout would mean the frame had been ignored, which is the
+    // regression this guards.
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set a read timeout");
+    let start = Instant::now();
+    let err = loop {
+        match conn.recv() {
+            Ok(_) => continue,
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "the pool should have closed the connection, but the read only ended \
+         after {:?}: {err}",
+        start.elapsed()
+    );
+}
+
+/// Block notifications are optional, separately negotiated, and never
+/// volunteered.
+///
+/// This is the compatibility fix, expressed as a test rather than as a
+/// paragraph. They were briefly a message inside the extension every miner is
+/// required to negotiate, so a miner built before they existed had no way to
+/// decline one, received it, and ended the session as a protocol violation.
+/// A miner that does not know about `0x4002` does not ask for it, and the
+/// case above proves the pool then does not accept it, so `send_block_found`
+/// has nothing to send to.
+#[test]
+fn block_notifications_are_optional_and_separately_negotiated() {
+    let rig = rig!("blocksopt", 93, &[PowType::X16rt], None);
+
+    // Asked for, and granted alongside the required one.
+    let (accepted_list, _, accepted) =
+        raw_request_extensions(&rig, &[AVIAN_EXTENSION, EXT_AVIAN_BLOCKS]);
+    assert!(accepted);
+    assert_eq!(accepted_list, vec![AVIAN_EXTENSION, EXT_AVIAN_BLOCKS]);
+
+    // Optional does not mean sufficient. The multi-PoW extension is still
+    // required, and asking only for the optional one is the same refusal as
+    // asking for something unrelated: every failure 0x4001 prevents is
+    // silent, which is why it is required and this is not.
+    let (unsupported, required, accepted) = raw_request_extensions(&rig, &[EXT_AVIAN_BLOCKS]);
+    assert!(!accepted);
+    assert_eq!(
+        required,
+        vec![AVIAN_EXTENSION],
+        "the error names what is missing, so a miner can correct itself"
+    );
+    assert!(
+        unsupported.is_empty(),
+        "0x4002 must not be listed as unsupported, because the pool does          support it: what it will not do is serve a connection without          0x4001. Saying otherwise would send a miner off to implement          something it had already got right, got {unsupported:04x?}"
+    );
 }
 
 /// The client refuses a non-zero mask rather than rolling, and the pool never
@@ -384,7 +756,7 @@ fn a_share_below_the_network_target_is_accepted_but_not_submitted() {
     }
 
     // Nothing was forwarded, so the tip is where it was. Polling again also
-    // proves no AvianBlockFound arrived, since a block would report one.
+    // proves no BlockFound arrived, since a block would report one.
     assert!(
         poll_event(&mut miner, Duration::from_millis(500)).is_none(),
         "a share under the network target must not be reported as a block"
@@ -411,7 +783,7 @@ fn a_duplicate_share_is_refused() {
 
     miner.submit(&job, nonce, ntime).unwrap();
     // On regtest the share target is the network target, so that first share
-    // was also a block and an AvianBlockFound is on its way. Skip past
+    // was also a block and a BlockFound is on its way. Skip past
     // anything that is not a verdict on the resubmission.
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut verdict = None;

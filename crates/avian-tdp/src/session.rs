@@ -35,6 +35,7 @@ use avian_sv2::avian::{
     MSG_SELECT_ALGORITHM_ERROR, MSG_SELECT_ALGORITHM_SUCCESS, MSG_TIME_CONSTRAINTS,
 };
 use avian_sv2::error::{Error, Result};
+use avian_sv2::logln;
 use avian_sv2::reconnect::{self, Backoff};
 use avian_sv2::transport::{Connection, ConnectionReader, ConnectionWriter, Frame, ServerIdentity};
 use avian_sv2::wire::Writer;
@@ -195,6 +196,9 @@ pub struct TdpSession {
     pow: PowType,
     version_rolling_mask: u32,
     tip: Option<PrevHash>,
+    /// What the node accepted, which is what makes an unrecognised message
+    /// from it skippable rather than fatal. See [`TdpSession::skippable`].
+    negotiated: Vec<u16>,
 }
 
 impl TdpSession {
@@ -212,7 +216,7 @@ impl TdpSession {
         let identity = conn.identity().clone();
 
         setup_connection(&mut conn)?;
-        request_extensions(&mut conn)?;
+        let negotiated = request_extensions(&mut conn)?;
         let version_rolling_mask = select_algorithm(&mut conn, config.pow)?;
         conn.send(
             EXT_CORE,
@@ -234,7 +238,32 @@ impl TdpSession {
             pow: config.pow,
             version_rolling_mask,
             tip: None,
+            negotiated,
         })
+    }
+
+    /// Whether a frame can be read past, logging it when it can.
+    ///
+    /// The node adds messages to its extensions over time, and negotiating an
+    /// `extension_type` says nothing about which numbers inside it either
+    /// side knows. So one this build does not recognise is skipped rather
+    /// than treated as a violation, which is the rule doc/sv2.md states and
+    /// the node itself now follows in the other direction. Without it, the
+    /// first message the node adds ends every session here.
+    ///
+    /// The handshake deliberately stays strict. Nothing is negotiated yet
+    /// when `SetupConnection` is answered, and the node sends nothing
+    /// unprompted before the first template, so a frame interleaved there is
+    /// a node talking out of order rather than one built at another time.
+    fn skippable(&self, frame: &Frame) -> bool {
+        if !frame.is_skippable(&self.negotiated) {
+            return false;
+        }
+        logln!(
+            "[tdp] the node sent {}, which this build does not know; ignoring it",
+            frame.describe()
+        );
+        true
     }
 
     pub fn pow(&self) -> PowType {
@@ -267,9 +296,20 @@ impl TdpSession {
     /// message guaranteed after every template, so a caller cannot assume a
     /// fixed number of messages per round.
     pub fn next_work(&mut self) -> Result<Work> {
-        let mut frame = self
-            .reader
-            .recv_expect(EXT_CORE, MESSAGE_TYPE_NEW_TEMPLATE)?;
+        // Not recv_expect, because a message this build does not know is not
+        // the wrong reply. See `skippable`.
+        let mut frame = loop {
+            let frame = self.reader.recv()?;
+            if frame.is(EXT_CORE, MESSAGE_TYPE_NEW_TEMPLATE) {
+                break frame;
+            }
+            if !self.skippable(&frame) {
+                return Err(Error::Protocol(format!(
+                    "expected a template, got {}",
+                    frame.describe()
+                )));
+            }
+        };
         let template = Template::decode(&mut frame.payload)?;
 
         let mut prev_hash = None;
@@ -302,10 +342,13 @@ impl TdpSession {
                     });
                 }
                 _ => {
+                    if self.skippable(&frame) {
+                        continue;
+                    }
                     return Err(Error::Protocol(format!(
                         "unexpected {} alongside a template",
                         frame.describe()
-                    )))
+                    )));
                 }
             }
         }
@@ -322,22 +365,29 @@ impl TdpSession {
                 RequestTransactionData { template_id },
             )?;
 
-        let mut frame = self.reader.recv()?;
-        match (frame.extension_type, frame.msg_type) {
-            (EXT_CORE, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS) => {
-                TransactionData::decode(&mut frame.payload)
+        loop {
+            let mut frame = self.reader.recv()?;
+            match (frame.extension_type, frame.msg_type) {
+                (EXT_CORE, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS) => {
+                    return TransactionData::decode(&mut frame.payload)
+                }
+                (EXT_CORE, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_ERROR) => {
+                    let (id, code) = decode_transaction_data_error(&frame.payload)?;
+                    return Err(Error::Refused(format!(
+                        "RequestTransactionData for template {id}: {code} ({})",
+                        explain_transaction_data_error(&code)
+                    )));
+                }
+                _ => {
+                    if self.skippable(&frame) {
+                        continue;
+                    }
+                    return Err(Error::Protocol(format!(
+                        "unexpected reply to RequestTransactionData: {}",
+                        frame.describe()
+                    )));
+                }
             }
-            (EXT_CORE, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_ERROR) => {
-                let (id, code) = decode_transaction_data_error(&frame.payload)?;
-                Err(Error::Refused(format!(
-                    "RequestTransactionData for template {id}: {code} ({})",
-                    explain_transaction_data_error(&code)
-                )))
-            }
-            _ => Err(Error::Protocol(format!(
-                "unexpected reply to RequestTransactionData: {}",
-                frame.describe()
-            ))),
         }
     }
 

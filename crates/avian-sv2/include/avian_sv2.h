@@ -68,23 +68,31 @@ extern "C" {
  * race from one still propagating, so no second event is unresolved rather
  * than failure.
  *
- * Nothing in the Mining Protocol carries this. A miner is given a share
- * target and never the network target, so it cannot work out that its own
- * share was a block, which for a solo pool is backwards: consensus pays the
- * miner directly for exactly these. It is AvianBlockFound (0x05) in the
- * Avian extension, and is deliberately excluded from the registry submission
- * because it belongs in core Stratum v2 rather than in an extension
- * allocated for multi-algorithm work. */
+ * A caller can recognise a candidate without this, by comparing against the
+ * network target nbits encodes. What it cannot see is what became of the
+ * share: SubmitShares.Success means "accepted as a share" and nothing more,
+ * which for a solo pool is backwards, since consensus pays the miner directly
+ * for exactly these. It is BlockFound, message 0x00 of extension 0x4002,
+ * which is separate from and optional to Avian's multi-PoW extension: a
+ * client that does not negotiate 0x4002 is never sent one. That separation
+ * is why the capability could be added at all without breaking clients
+ * already in the field. */
 #define AVIAN_SV2_EVENT_BLOCK_FOUND 7
 
 #define AVIAN_SV2_MESSAGE_LEN 256
 
 /* A job, in a form that knows nothing about Stratum v2.
  *
- * There is no network_target, and its absence is the contract: a standard
- * channel is told only its share target. Whether a share is also a block is
- * the pool's determination, because only the pool holds the template, and the
- * pool forwards a winning share to the node itself.
+ * nbits is the candidate header's compact network target, from
+ * SetNewPrevHash. A caller that wants to know whether its own share is a block
+ * candidate can decode it and compare, and does not have to take the pool's
+ * word for it. An earlier version of this comment claimed the opposite while
+ * this struct carried the field twelve lines below, which is worth knowing
+ * about any comment that says a thing is impossible.
+ *
+ * What the pool alone can report is what became of the solution: whether it
+ * was forwarded and whether the node adopted it. That is
+ * AVIAN_SV2_EVENT_BLOCK_FOUND, not this struct.
  *
  * prev_hash, merkle_root and share_target are all in uint256's internal
  * little-endian order, which is the order they go into the header and the

@@ -101,6 +101,10 @@ pub struct Channel {
     /// When the channel opened, which is what turns a share count into a rate.
     pub opened_at: Instant,
     coinbase_tag: Vec<u8>,
+    /// Whether this peer negotiated `EXT_AVIAN_BLOCKS`. False means it is
+    /// never sent a block notification, which is what makes the message safe
+    /// to add to a pool serving clients built before it existed.
+    blocks_negotiated: bool,
     writer: Arc<Mutex<ConnectionWriter>>,
     state: Mutex<ChannelState>,
 }
@@ -152,6 +156,7 @@ impl Channel {
         coinbase_tag: Vec<u8>,
         shares_per_minute: f64,
         rate_limit: RateLimitConfig,
+        blocks_negotiated: bool,
         writer: Arc<Mutex<ConnectionWriter>>,
     ) -> Self {
         Self {
@@ -171,6 +176,7 @@ impl Channel {
             payout_address,
             opened_at: Instant::now(),
             coinbase_tag,
+            blocks_negotiated,
             writer,
             state: Mutex::new(ChannelState {
                 next_job_id: 1,
@@ -588,25 +594,39 @@ impl Channel {
     /// Tells the miner one of its shares was a block, and later that the
     /// block became the tip.
     ///
-    /// Nothing in the Mining Protocol carries this: a miner is given a share
-    /// target and never the network target, so it cannot work out that its own
-    /// share was a block. For a pool paying by share that does not matter. For
-    /// a solo pool it is backwards, because consensus pays the miner directly
-    /// for exactly these.
+    /// Not because the miner cannot recognise a candidate: `SetNewPrevHash`
+    /// carries `nbits`, so it can compare against the network target itself.
+    /// What the protocol gives it back for a winning share is an ordinary
+    /// `SubmitShares.Success`, which means "accepted as a share" and says
+    /// nothing about whether this pool forwarded it or the node took it. For a
+    /// pool paying by share that does not matter. For a solo pool it is
+    /// backwards, because consensus pays the miner directly for exactly these
+    /// and it would otherwise not know which of its shares won.
     pub fn send_block_found(
         &self,
         sequence_number: u32,
         block_hash: &[u8; 32],
         confirmed: bool,
     ) -> Result<()> {
+        // A client that did not ask for block notifications is not sent one.
+        // Silently, and that is the point: this used to be a message inside
+        // the extension every client must negotiate, so a client built before
+        // it existed received one and ended the session.
+        if !self.blocks_negotiated {
+            return Ok(());
+        }
         let payload = avian::encode_block_found(&avian::BlockFound {
             channel_id: self.id,
             sequence_number,
             block_hash: *block_hash,
             confirmed,
         });
-        self.lock_writer()?
-            .send_raw(EXT_AVIAN, avian::MSG_BLOCK_FOUND, true, &payload)
+        self.lock_writer()?.send_raw(
+            avian::EXT_AVIAN_BLOCKS,
+            avian::MSG_BLOCK_FOUND,
+            true,
+            &payload,
+        )
     }
 
     pub fn send_error(&self, sequence_number: u32, refusal: Refusal) -> Result<()> {

@@ -53,10 +53,12 @@ pub const AVIAN_SV2_MESSAGE_LEN: usize = 256;
 
 /// A job, in the neutral form of plan section 10.
 ///
-/// `network_target` from that struct is absent, and its absence is the
-/// contract: a standard-channel worker is told only its share target. Whether
-/// a share is also a block is the pool's determination, because only the pool
-/// holds the template, and the pool forwards a winning one itself.
+/// `network_target` from that struct is absent as a field, but not as
+/// information: `nbits` carries the candidate header's compact network target
+/// from `SetNewPrevHash`, and a caller that wants it decodes that. What only
+/// the pool can report is what became of a winning share, since it is the one
+/// that forwards it, and that is the block-found event rather than this
+/// struct.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct AvianMiningJob {

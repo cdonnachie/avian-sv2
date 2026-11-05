@@ -18,12 +18,21 @@ use avian_mining::server::ServerConfig;
 use avian_mining::share::{AvianHasher, PowHasher};
 use avian_regtest::Node;
 use avian_sv2::address::Network;
-use avian_sv2::avian::{PowType, EXT_AVIAN, EXT_CORE, EXT_NEGOTIATION, MSG_REQUEST_EXTENSIONS};
+use avian_sv2::avian::{
+    self, PowType, EXT_AVIAN, EXT_CORE, EXT_NEGOTIATION, MSG_REQUEST_EXTENSIONS,
+    MSG_SELECT_ALGORITHM, MSG_SELECT_ALGORITHM_SUCCESS,
+};
 use avian_sv2::block;
 use avian_sv2::client::{ClientConfig, Event, MiningClient, MiningJob, Trace};
 use avian_sv2::transport::Connection;
 use avian_sv2::wire::{self, Reader, Writer};
 use avian_sv2::Backoff;
+use mining_sv2::{
+    OpenStandardMiningChannel, OpenStandardMiningChannelSuccess,
+    MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
+    MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+};
+
 use common_messages_sv2::{
     Protocol, SetupConnection, MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
     MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
@@ -332,6 +341,112 @@ pub fn raw_request_extensions(rig: &Rig, wanted: &[u16]) -> (Vec<u16>, Vec<u16>,
 }
 
 pub const AVIAN_EXTENSION: u16 = EXT_AVIAN;
+
+/// A raw connection taken as far as a miner takes one before it opens a
+/// channel: handshake, `SetupConnection`, `RequestExtensions`,
+/// `AvianSelectAlgorithm`.
+///
+/// The library client is one channel per connection, so a test that wants two
+/// has to drive the wire itself.
+pub fn raw_ready(rig: &Rig, pow: PowType) -> Connection {
+    let mut conn = raw_connect(rig);
+    send_setup(&mut conn, avian_sv2::flags::REQUIRES_STANDARD_JOBS);
+    conn.recv_expect(EXT_CORE, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS)
+        .expect("setup success");
+
+    let mut w = Writer::new();
+    let payload = w.u16(1).seq_u16(&[EXT_AVIAN]).finish();
+    conn.send_raw(EXT_NEGOTIATION, MSG_REQUEST_EXTENSIONS, false, &payload)
+        .expect("send extensions");
+    conn.recv_expect(EXT_NEGOTIATION, avian::MSG_REQUEST_EXTENSIONS_SUCCESS)
+        .expect("extensions success");
+
+    conn.send_raw(
+        EXT_AVIAN,
+        MSG_SELECT_ALGORITHM,
+        false,
+        &avian::encode_select_algorithm(pow),
+    )
+    .expect("send select");
+    conn.recv_expect(EXT_AVIAN, MSG_SELECT_ALGORITHM_SUCCESS)
+        .expect("select success");
+    conn
+}
+
+/// Opens one standard channel on an already-ready connection.
+///
+/// Returns the channel id the pool assigned, and every frame read past while
+/// waiting for the answer. Those are not noise: on a connection that already
+/// has a channel they are that channel's target and work, and a caller that
+/// drops them has silently thrown away the evidence it was about to assert
+/// on.
+pub fn open_standard(
+    conn: &mut Connection,
+    request_id: u32,
+    identity: &str,
+) -> (u32, Vec<avian_sv2::transport::Frame>) {
+    open_standard_on(conn, request_id, identity, None)
+}
+
+/// The same, with an explicit algorithm for this channel alone, sent as the
+/// `pow_type` TLV field on the open.
+///
+/// `None` sends no field at all, which is what a miner built before the field
+/// existed does, and must still mean the connection's algorithm.
+pub fn open_standard_on(
+    conn: &mut Connection,
+    request_id: u32,
+    identity: &str,
+    pow: Option<PowType>,
+) -> (u32, Vec<avian_sv2::transport::Frame>) {
+    let max_target = [0xffu8; 32];
+    let mut payload = binary_sv2::to_bytes(OpenStandardMiningChannel {
+        request_id,
+        user_identity: identity.as_bytes().try_into().unwrap(),
+        nominal_hash_rate: 1_000_000.0,
+        max_target: max_target.as_slice().try_into().unwrap(),
+    })
+    .expect("encode open");
+    if let Some(pow) = pow {
+        avian_sv2::tlv::append(
+            &mut payload,
+            &[avian_sv2::tlv::Field::u8(
+                EXT_AVIAN,
+                avian_sv2::avian::TLV_FIELD_POW_TYPE,
+                pow as u8,
+            )],
+        )
+        .expect("append pow_type");
+    }
+    conn.send_raw(
+        EXT_CORE,
+        MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
+        false,
+        &payload,
+    )
+    .expect("send open");
+    // Not recv_expect: the success is followed immediately by SetTarget and
+    // a job, so by the time a second channel is opened there is already other
+    // traffic in flight. Read past whatever is not the answer to this open.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut skipped = Vec::new();
+    while Instant::now() < deadline {
+        let frame = conn.recv().expect("open reply");
+        match frame.msg_type {
+            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS => {
+                let mut payload = frame.payload;
+                let success: OpenStandardMiningChannelSuccess =
+                    binary_sv2::from_bytes(&mut payload).expect("decode open success");
+                return (success.channel_id, skipped);
+            }
+            MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR => {
+                panic!("the pool refused the channel: {}", frame.describe())
+            }
+            _ => skipped.push(frame),
+        }
+    }
+    panic!("the pool never answered the channel open")
+}
 
 /// A regtest address for the test miner to be paid at, with its scriptPubKey.
 ///

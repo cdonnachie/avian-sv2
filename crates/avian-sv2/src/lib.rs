@@ -42,6 +42,7 @@ pub mod client;
 pub mod error;
 pub mod log;
 pub mod reconnect;
+pub mod tlv;
 pub mod transport;
 pub mod wire;
 

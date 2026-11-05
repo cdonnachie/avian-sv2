@@ -35,9 +35,10 @@ use mining_sv2::{
 use secp256k1::XOnlyPublicKey;
 
 use crate::avian::{
-    self, PowType, EXT_AVIAN, EXT_CORE, EXT_NEGOTIATION, MSG_JOB_TIME_CONSTRAINTS,
-    MSG_REQUEST_EXTENSIONS, MSG_REQUEST_EXTENSIONS_ERROR, MSG_REQUEST_EXTENSIONS_SUCCESS,
-    MSG_SELECT_ALGORITHM, MSG_SELECT_ALGORITHM_ERROR, MSG_SELECT_ALGORITHM_SUCCESS,
+    self, PowType, EXT_AVIAN, EXT_AVIAN_BLOCKS, EXT_CORE, EXT_NEGOTIATION,
+    MSG_JOB_TIME_CONSTRAINTS, MSG_REQUEST_EXTENSIONS, MSG_REQUEST_EXTENSIONS_ERROR,
+    MSG_REQUEST_EXTENSIONS_SUCCESS, MSG_SELECT_ALGORITHM, MSG_SELECT_ALGORITHM_ERROR,
+    MSG_SELECT_ALGORITHM_SUCCESS,
 };
 use crate::block;
 use crate::error::{Error, Result};
@@ -356,6 +357,12 @@ pub enum Trace {
         generation: u64,
     },
     Disconnected,
+    /// A message inside an extension this client negotiated, whose number it
+    /// does not recognise, read past rather than treated as a violation.
+    Ignored {
+        extension_type: u16,
+        msg_type: u8,
+    },
 }
 
 struct Session {
@@ -364,6 +371,9 @@ struct Session {
     channel_id: u32,
     extranonce_prefix: Vec<u8>,
     extranonce_size: usize,
+    /// What the pool accepted, which is what makes an unrecognised message
+    /// from it skippable rather than fatal.
+    negotiated: Vec<u16>,
 }
 
 pub struct MiningClient {
@@ -765,6 +775,7 @@ impl MiningClient {
             channel_id: 0,
             extranonce_prefix: Vec::new(),
             extranonce_size: 0,
+            negotiated: Vec::new(),
         };
         Self::setup_connection(&mut session, trace)?;
         Self::request_extensions(&mut session, trace)?;
@@ -852,7 +863,9 @@ impl MiningClient {
     }
 
     fn request_extensions(session: &mut Session, trace: &mut Vec<Trace>) -> Result<()> {
-        let payload = avian::encode_request_extensions(1, &[EXT_AVIAN]);
+        // Both, and only the first is required. A pool that does not support
+        // block notifications answers with EXT_AVIAN alone and is served.
+        let payload = avian::encode_request_extensions(1, &[EXT_AVIAN, EXT_AVIAN_BLOCKS]);
         Self::send_raw(
             session,
             EXT_NEGOTIATION,
@@ -870,6 +883,7 @@ impl MiningClient {
                         success.extensions
                     )));
                 }
+                session.negotiated = success.extensions.clone();
                 trace.push(Trace::ExtensionsSuccess(success.extensions));
                 Ok(())
             }
@@ -1159,10 +1173,10 @@ impl MiningClient {
                 }
                 Ok(Event::Idle)
             }
-            (EXT_AVIAN, avian::MSG_BLOCK_FOUND) => {
+            (EXT_AVIAN_BLOCKS, avian::MSG_BLOCK_FOUND) => {
                 if !frame.channel_msg {
                     return Err(Error::Protocol(
-                        "AvianBlockFound must set the channel_msg bit, so that it travels                          under 0xc001"
+                        "BlockFound must set the channel_msg bit, so that it travels under 0xc002"
                             .into(),
                     ));
                 }
@@ -1278,10 +1292,29 @@ impl MiningClient {
                     code,
                 })
             }
-            _ => Err(Error::Protocol(format!(
-                "the pool sent an unexpected {}",
-                frame.describe()
-            ))),
+            _ => {
+                // Inside an extension this client negotiated, a message
+                // number it does not know means the pool is newer, not
+                // broken. This is the arm that ended the session when block
+                // notifications were first wired up, leaving the miner
+                // hashing into a connection nobody was serving, and the rule
+                // in doc/sv2.md exists because of it.
+                let skippable = self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| frame.is_skippable(&session.negotiated));
+                if skippable {
+                    self.record(Trace::Ignored {
+                        extension_type: frame.extension_type,
+                        msg_type: frame.msg_type,
+                    });
+                    return Ok(Event::Idle);
+                }
+                Err(Error::Protocol(format!(
+                    "the pool sent an unexpected {}",
+                    frame.describe()
+                )))
+            }
         }
     }
 

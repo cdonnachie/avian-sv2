@@ -3,7 +3,7 @@
 //!
 //! Both used to reach the catch-all arm of the pool's dispatcher and end the
 //! session as a protocol violation. That is the same fault `doc/sv2.md`
-//! records against the first `AvianBlockFound` deployment, where a correctly
+//! records against the first block notification deployment, where a correctly
 //! encoded message killed the session of a peer that did not know it, one
 //! layer down: there it was an extension message, here it is a message the
 //! specification has always defined and the pool simply did not handle.

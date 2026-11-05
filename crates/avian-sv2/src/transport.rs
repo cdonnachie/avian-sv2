@@ -55,6 +55,29 @@ impl Frame {
         self.extension_type == extension_type && self.msg_type == msg_type
     }
 
+    /// Whether a frame this build does not recognise may be read past instead
+    /// of ending the connection.
+    ///
+    /// `negotiated` is the extensions the two ends agreed on. Inside one of
+    /// those, a `msg_type` this build does not know means only that the peer
+    /// was built at a different time, so doc/sv2.md requires it to be logged
+    /// and skipped: negotiation agrees an `extension_type` and says nothing
+    /// about which message numbers inside it either side knows. Without the
+    /// rule, adding a message is not a compatible change at all, because it
+    /// breaks every peer built before it.
+    ///
+    /// Two cases stay fatal. An extension that was never negotiated means a
+    /// peer that is confused rather than merely older. And an unknown core
+    /// `msg_type` means a peer disagreeing with the Stratum v2
+    /// specification, which fixes those numbers rather than growing them.
+    ///
+    /// A caller reaches this only after failing to match the frame itself, so
+    /// the unknown `msg_type` is implied and not checked here.
+    pub fn is_skippable(&self, negotiated: &[u16]) -> bool {
+        self.extension_type != crate::avian::EXT_CORE
+            && negotiated.contains(&self.extension_type)
+    }
+
     pub fn describe(&self) -> String {
         let ext = self.extension_type | if self.channel_msg { CHANNEL_MSG_BIT } else { 0 };
         format!(
@@ -502,6 +525,41 @@ mod tests {
         assert!(header.channel_msg());
         assert_eq!(header.msg_type(), 0x04);
         assert_eq!(header.payload_length(), 16);
+    }
+
+    fn frame(extension_type: u16, channel_msg: bool, msg_type: u8) -> Frame {
+        Frame {
+            extension_type,
+            channel_msg,
+            msg_type,
+            payload: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_unknown_message_inside_a_negotiated_extension_is_skippable() {
+        let unknown = frame(0x4001, false, 0x7f);
+        assert!(unknown.is_skippable(&[0x4001]));
+
+        // Negotiation is per connection and not per build. This process
+        // implements 0x4002, but a connection that did not ask for it has not
+        // negotiated it, and a peer sending messages for a capability it never
+        // asked for is confused rather than merely older.
+        assert!(!unknown.is_skippable(&[0x4002]));
+        assert!(!unknown.is_skippable(&[]));
+    }
+
+    #[test]
+    fn a_core_message_is_never_skippable() {
+        // Core message numbers are fixed by the Stratum v2 specification
+        // rather than grown by Avian, so an unknown one is a disagreement
+        // about the protocol and not a version skew. The channel_msg bit does
+        // not change that: it is cleared before an extension is looked up, so
+        // 0x8000 and 0x0000 are the same extension.
+        for channel_msg in [false, true] {
+            let unknown = frame(0x0000, channel_msg, 0x7f);
+            assert!(!unknown.is_skippable(&[0x0000, 0x4001]));
+        }
     }
 
     #[test]

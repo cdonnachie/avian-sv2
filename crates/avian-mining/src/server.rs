@@ -1,6 +1,6 @@
 //! The worker-facing listener and the session each worker gets.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,12 +9,13 @@ use avian_sv2::address::{self, Network};
 use avian_sv2::avian::{
     PowType, EXT_AVIAN, EXT_NEGOTIATION, MSG_REQUEST_EXTENSIONS, MSG_REQUEST_EXTENSIONS_ERROR,
     MSG_REQUEST_EXTENSIONS_SUCCESS, MSG_SELECT_ALGORITHM, MSG_SELECT_ALGORITHM_ERROR,
-    MSG_SELECT_ALGORITHM_SUCCESS,
+    MSG_SELECT_ALGORITHM_SUCCESS, TLV_FIELD_POW_TYPE,
 };
 use avian_sv2::block;
 use avian_sv2::error::{Error, Result};
 use avian_sv2::logln;
-use avian_sv2::transport::{Connection, ConnectionReader, ConnectionWriter};
+use avian_sv2::tlv;
+use avian_sv2::transport::{Connection, ConnectionReader, ConnectionWriter, Frame};
 use avian_sv2::wire::{Reader, Writer};
 use avian_tdp::coinbase::{
     PayoutPlan, EXTENDED_EXTRANONCE_PREFIX, EXTENDED_EXTRANONCE_SIZE, MAX_COINBASE_TAG,
@@ -22,27 +23,41 @@ use avian_tdp::coinbase::{
 };
 use avian_tdp::tdp::PrevHash;
 use avian_tdp::{SolutionSubmitter, Work};
+use binary_sv2::GetSize;
 use common_messages_sv2::{
     SetupConnectionError, SetupConnectionSuccess, MESSAGE_TYPE_SETUP_CONNECTION,
     MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
     SV2_MINING_PROTOCOL_DISCRIMINANT,
 };
 use mining_sv2::{
-    OpenMiningChannelError, MESSAGE_TYPE_CLOSE_CHANNEL, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
-    MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
+    OpenMiningChannelError, SubmitSharesError, UpdateChannelError, CHANNEL_BIT_SUBMIT_SHARES_ERROR,
+    CHANNEL_BIT_UPDATE_CHANNEL_ERROR, MESSAGE_TYPE_CLOSE_CHANNEL,
+    MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL, MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
+    MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL, MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
     MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED, MESSAGE_TYPE_SUBMIT_SHARES_STANDARD,
-    MESSAGE_TYPE_UPDATE_CHANNEL,
+    MESSAGE_TYPE_UPDATE_CHANNEL, MESSAGE_TYPE_UPDATE_CHANNEL_ERROR,
 };
 
 /// The bits of a submission that are the same in both forms.
 struct SubmitMeta {
     sequence_number: u32,
 }
+
+/// One channel and the algorithm it is being served on.
+///
+/// The two travel together because the algorithm is no longer a property of
+/// the connection: a channel may carry one the rest of the connection does
+/// not, so the work, the target and the solution submitter all have to be
+/// looked up per channel rather than taken from the session.
+struct Served {
+    channel: Arc<Channel>,
+    algo: Arc<AlgoContext>,
+}
 use secp256k1::Keypair;
 
 use crate::channel::{Channel, ChannelKind};
 use crate::ratelimit::RateLimitConfig;
-use crate::share::{PowHasher, Submission};
+use crate::share::{PowHasher, Refusal, Submission};
 use avian_sv2::flags;
 
 use crate::{EXT_CORE_MINING, PROTOCOL_VERSION};
@@ -521,116 +536,226 @@ impl Server {
         logln!("[pool] {peer} completed the Noise handshake");
 
         setup_connection(&mut reader, &writer)?;
-        request_extensions(&mut reader, &writer)?;
+        let extensions = request_extensions(&mut reader, &writer)?;
         let offered: Vec<PowType> = self.algos.iter().map(|algo| algo.pow).collect();
         let pow = select_algorithm(&mut reader, &writer, &offered)?;
         let algo = self
             .algo(pow)
             .ok_or_else(|| Error::Protocol(format!("no session for {pow}")))?;
 
-        let channel = self.open_channel(&mut reader, &writer, algo)?;
-        logln!("[pool] {peer} opened channel {} on {pow}", channel.id);
+        // A connection carries however many channels the worker opens, each
+        // on whichever algorithm it asked for. `SelectAlgorithm` settles the
+        // connection's default, which is what a channel gets when it says
+        // nothing, and that is what every peer built before the TLV field
+        // does.
+        let mut channels: HashMap<u32, Served> = HashMap::new();
+        let result = self.pump(&mut reader, &writer, algo, &extensions, &mut channels, peer);
 
-        let result = self.pump_submissions(&mut reader, algo, &channel);
-        algo.unregister(channel.id);
+        // Every channel, on its own algorithm. One left registered is one the
+        // publisher goes on pushing work to, down a socket nobody reads.
+        for served in channels.values() {
+            served.algo.unregister(served.channel.id);
+        }
         result
     }
 
+    /// Refuses a share on a channel this connection does not have.
+    ///
+    /// A free function rather than a `Channel` method, because the whole point
+    /// is that there is no such channel to call one on. The id is echoed back
+    /// as the worker sent it, so it can see which one was not recognised.
+    fn refuse_unknown_share(
+        writer: &Arc<Mutex<ConnectionWriter>>,
+        channel_id: u32,
+        sequence_number: u32,
+    ) -> Result<()> {
+        send(
+            writer,
+            EXT_CORE_MINING,
+            MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
+            CHANNEL_BIT_SUBMIT_SHARES_ERROR,
+            SubmitSharesError {
+                channel_id,
+                sequence_number,
+                error_code: Refusal::InvalidChannelId.code().as_bytes().try_into()?,
+            },
+        )
+    }
+
+    /// The same for `UpdateChannel`, which has an error message of its own.
+    fn refuse_unknown_update(writer: &Arc<Mutex<ConnectionWriter>>, channel_id: u32) -> Result<()> {
+        send(
+            writer,
+            EXT_CORE_MINING,
+            MESSAGE_TYPE_UPDATE_CHANNEL_ERROR,
+            CHANNEL_BIT_UPDATE_CHANNEL_ERROR,
+            UpdateChannelError {
+                channel_id,
+                error_code: b"invalid-channel-id".as_slice().try_into()?,
+            },
+        )
+    }
+
+    /// Opens one channel from an already-read `OpenStandardMiningChannel` or
+    /// `OpenExtendedMiningChannel`.
+    ///
+    /// The frame is read by the caller's loop rather than here, because a
+    /// channel open is no longer the one thing that can arrive first. It is
+    /// one of several messages the connection dispatches, and it can arrive
+    /// again later.
+    ///
+    /// A refusal returns [`Error::Refused`] after the worker has been told
+    /// why. The caller keeps the connection for that, and only that: with
+    /// several channels on one connection, tearing it down over one bad open
+    /// would punish every other channel for a mistake that was not theirs.
+    ///
+    /// `default_algo` is the connection's, from `AvianSelectAlgorithm`. A
+    /// channel may override it with a `pow_type` TLV field, in which case it
+    /// is served on that algorithm and the connection's others are not
+    /// affected.
     fn open_channel(
         &self,
-        reader: &mut ConnectionReader,
+        frame: &mut Frame,
         writer: &Arc<Mutex<ConnectionWriter>>,
-        algo: &Arc<AlgoContext>,
-    ) -> Result<Arc<Channel>> {
-        let mut frame = reader.recv()?;
-        if frame.extension_type != EXT_CORE_MINING {
-            return Err(Error::Protocol(format!(
-                "expected a channel open, got {}",
-                frame.describe()
-            )));
-        }
-
+        default_algo: &Arc<AlgoContext>,
+        blocks_negotiated: bool,
+    ) -> Result<Served> {
         // Both kinds are served, and REQUIRES_EXTENDED_CHANNELS is never set,
         // because serving both is the point: a miner that can only do
         // standard channels still works, and one that can do extended
         // channels gets to assemble its own coinbase and see what it is
         // committing to. For solo mining that verification is the product.
-        let (request_id, identity, nominal_hash_rate, worker_max_target, kind) = match frame
-            .msg_type
-        {
-            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL => {
-                let open: mining_sv2::OpenStandardMiningChannel =
-                    binary_sv2::from_bytes(&mut frame.payload)?;
-                let mut max_target = [0u8; 32];
-                max_target.copy_from_slice(open.max_target.as_ref());
-                (
-                    open.request_id,
-                    String::from_utf8_lossy(open.user_identity.as_ref()).into_owned(),
-                    open.nominal_hash_rate,
-                    max_target,
-                    ChannelKind::Standard,
-                )
-            }
-            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => {
-                let open: mining_sv2::OpenExtendedMiningChannel =
-                    binary_sv2::from_bytes(&mut frame.payload)?;
-                let mut max_target = [0u8; 32];
-                max_target.copy_from_slice(open.max_target.as_ref());
-                let wanted = open.min_extranonce_size as usize;
-                // The scriptSig is the constraint: the BIP34 height push, the
-                // operator tag and the extranonce all share 100 bytes. A miner
-                // asking for more than is left is refused rather than given a
-                // channel whose every coinbase the node would reject.
-                let available = MAX_SCRIPT_SIG
-                    .saturating_sub(MAX_HEIGHT_PUSH)
-                    .saturating_sub(self.config.coinbase_tag.len())
-                    .saturating_sub(EXTENDED_EXTRANONCE_PREFIX);
-                let size = EXTENDED_EXTRANONCE_SIZE.max(wanted);
-                if size > available {
-                    send(
-                        writer,
-                        EXT_CORE_MINING,
-                        MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
-                        false,
-                        OpenMiningChannelError {
-                            request_id: open.request_id,
-                            error_code: b"min-extranonce-size-too-large".as_slice().try_into()?,
-                        },
-                    )?;
-                    return Err(Error::Refused(format!(
+        let (request_id, identity, nominal_hash_rate, worker_max_target, kind, tlv_start) =
+            match frame.msg_type {
+                MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL => {
+                    let open: mining_sv2::OpenStandardMiningChannel =
+                        binary_sv2::from_bytes(&mut frame.payload)?;
+                    let mut max_target = [0u8; 32];
+                    max_target.copy_from_slice(open.max_target.as_ref());
+                    (
+                        open.request_id,
+                        String::from_utf8_lossy(open.user_identity.as_ref()).into_owned(),
+                        open.nominal_hash_rate,
+                        max_target,
+                        ChannelKind::Standard,
+                        open.get_size(),
+                    )
+                }
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => {
+                    let open: mining_sv2::OpenExtendedMiningChannel =
+                        binary_sv2::from_bytes(&mut frame.payload)?;
+                    let mut max_target = [0u8; 32];
+                    max_target.copy_from_slice(open.max_target.as_ref());
+                    let wanted = open.min_extranonce_size as usize;
+                    // The scriptSig is the constraint: the BIP34 height push, the
+                    // operator tag and the extranonce all share 100 bytes. A miner
+                    // asking for more than is left is refused rather than given a
+                    // channel whose every coinbase the node would reject.
+                    let available = MAX_SCRIPT_SIG
+                        .saturating_sub(MAX_HEIGHT_PUSH)
+                        .saturating_sub(self.config.coinbase_tag.len())
+                        .saturating_sub(EXTENDED_EXTRANONCE_PREFIX);
+                    let size = EXTENDED_EXTRANONCE_SIZE.max(wanted);
+                    if size > available {
+                        send(
+                            writer,
+                            EXT_CORE_MINING,
+                            MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
+                            false,
+                            OpenMiningChannelError {
+                                request_id: open.request_id,
+                                error_code: b"min-extranonce-size-too-large"
+                                    .as_slice()
+                                    .try_into()?,
+                            },
+                        )?;
+                        return Err(Error::Refused(format!(
                         "a {wanted}-byte extranonce was asked for and only {available} bytes of \
                          scriptSig are left after a {}-byte height push, a {}-byte operator tag \
                          and {EXTENDED_EXTRANONCE_PREFIX} bytes of pool prefix",
                         MAX_HEIGHT_PUSH,
                         self.config.coinbase_tag.len()
                     )));
+                    }
+                    let tlv_start = open.get_size();
+                    (
+                        open.request_id,
+                        String::from_utf8_lossy(open.user_identity.as_ref()).into_owned(),
+                        open.nominal_hash_rate,
+                        max_target,
+                        ChannelKind::Extended {
+                            extranonce_size: size,
+                        },
+                        tlv_start,
+                    )
                 }
-                (
-                    open.request_id,
-                    String::from_utf8_lossy(open.user_identity.as_ref()).into_owned(),
-                    open.nominal_hash_rate,
-                    max_target,
-                    ChannelKind::Extended {
-                        extranonce_size: size,
-                    },
-                )
-            }
-            other => {
-                send(
-                    writer,
-                    EXT_CORE_MINING,
-                    MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
-                    false,
-                    OpenMiningChannelError {
-                        request_id: 0,
-                        error_code: b"unsupported-channel-type".as_slice().try_into()?,
-                    },
-                )?;
-                return Err(Error::Protocol(format!(
-                    "expected a channel open, got message 0x{other:02x}"
-                )));
+                other => {
+                    send(
+                        writer,
+                        EXT_CORE_MINING,
+                        MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
+                        false,
+                        OpenMiningChannelError {
+                            request_id: 0,
+                            error_code: b"unsupported-channel-type".as_slice().try_into()?,
+                        },
+                    )?;
+                    return Err(Error::Protocol(format!(
+                        "expected a channel open, got message 0x{other:02x}"
+                    )));
+                }
+            };
+
+        // Which algorithm this channel carries. A `pow_type` TLV field names
+        // one; no field means the connection's, which is what everything
+        // built before this sends and is why adding the field broke nothing.
+        //
+        // A malformed TLV region tears the connection down rather than
+        // refusing the channel. A peer that cannot encode one correctly will
+        // not encode the next one correctly either, and unlike a mistyped
+        // address it is not something an operator can fix by retrying.
+        let fields = tlv::parse(&frame.payload[tlv_start..]).map_err(|e| {
+            Error::Protocol(format!(
+                "the channel open carried a malformed TLV region: {e}"
+            ))
+        })?;
+        let algo = match tlv::find(&fields, EXT_AVIAN, TLV_FIELD_POW_TYPE) {
+            None => default_algo.clone(),
+            Some(field) => {
+                let declared = field.as_u8()?;
+                let known = PowType::from_u8(declared).ok();
+                match known.and_then(|pow| self.algo(pow).cloned()) {
+                    Some(algo) => algo,
+                    None => {
+                        // Two different failures, and a worker can act on
+                        // the difference: a value the chain does not define
+                        // is the worker's bug, one the chain defines but
+                        // this pool does not serve is the operator's
+                        // configuration.
+                        let code = if known.is_some() {
+                            "pow-type-not-enabled"
+                        } else {
+                            "unsupported-pow-type"
+                        };
+                        send(
+                            writer,
+                            EXT_CORE_MINING,
+                            MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
+                            false,
+                            OpenMiningChannelError {
+                                request_id,
+                                error_code: code.as_bytes().try_into()?,
+                            },
+                        )?;
+                        return Err(Error::Refused(format!(
+                            "a channel asked for pow_type {declared} and this pool serves                              {:?} ({code})",
+                            self.algos.iter().map(|a| a.pow).collect::<Vec<_>>()
+                        )));
+                    }
+                }
             }
         };
+        let algo = &algo;
 
         // The money. On a solo pool the worker's own address goes in the
         // coinbase and consensus pays them directly, so this is the one place
@@ -721,6 +846,7 @@ impl Server {
             self.config.coinbase_tag.clone(),
             self.config.shares_per_minute,
             self.config.rate_limit,
+            blocks_negotiated,
             writer.clone(),
         ));
         logln!(
@@ -751,7 +877,10 @@ impl Server {
         if let Some((work, prev)) = algo.current() {
             channel.push_work(&work, &prev)?;
         }
-        Ok(channel)
+        Ok(Served {
+            channel,
+            algo: algo.clone(),
+        })
     }
 
     /// Answers `UpdateChannel`: a worker revising the hash rate it declared
@@ -776,9 +905,9 @@ impl Server {
         channel: &Arc<Channel>,
         update: &mining_sv2::UpdateChannel,
     ) -> Result<()> {
-        if update.channel_id != channel.id {
-            return channel.send_update_error(update.channel_id, "invalid-channel-id");
-        }
+        // The id was matched by the caller's routing, so there is nothing to
+        // check here: an unknown one never reaches this.
+        //
         // Worker-supplied and unverifiable, as at channel open, so it goes
         // through the same clamp. A non-finite or negative one is not
         // something share_target can floor into sense, and it is the one shape
@@ -811,15 +940,39 @@ impl Server {
         Ok(())
     }
 
-    fn pump_submissions(
+    /// The connection's message loop, for as many channels as it opens.
+    fn pump(
         &self,
         reader: &mut ConnectionReader,
+        writer: &Arc<Mutex<ConnectionWriter>>,
         algo: &Arc<AlgoContext>,
-        channel: &Arc<Channel>,
+        negotiated: &[u16],
+        channels: &mut HashMap<u32, Served>,
+        peer: SocketAddr,
     ) -> Result<()> {
+        let blocks = negotiated.contains(&avian_sv2::avian::EXT_AVIAN_BLOCKS);
         loop {
             let mut frame = reader.recv()?;
             match (frame.extension_type, frame.msg_type) {
+                (EXT_CORE_MINING, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL)
+                | (EXT_CORE_MINING, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) => {
+                    match self.open_channel(&mut frame, writer, algo, blocks) {
+                        Ok(served) => {
+                            logln!(
+                                "[pool] {peer} opened channel {} on {}",
+                                served.channel.id,
+                                served.algo.pow
+                            );
+                            channels.insert(served.channel.id, served);
+                        }
+                        // Told, and told why, so the connection stands and
+                        // whatever else it is carrying goes on working.
+                        Err(Error::Refused(why)) => {
+                            logln!("[pool] {peer} was refused a channel: {why}");
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
                 (EXT_CORE_MINING, MESSAGE_TYPE_SUBMIT_SHARES_STANDARD)
                 | (EXT_CORE_MINING, MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED) => {
                     let extended = frame.msg_type == MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED;
@@ -852,17 +1005,17 @@ impl Server {
                             },
                         )
                     };
-                    if channel_id != channel.id {
-                        channel
-                            .send_error(sequence_number, crate::share::Refusal::InvalidChannelId)?;
+                    let Some(served) = channels.get(&channel_id) else {
+                        Self::refuse_unknown_share(writer, channel_id, sequence_number)?;
                         continue;
-                    }
+                    };
+                    // Shadowed so the body below reads as it did, but both
+                    // now come from the channel rather than the connection.
+                    let channel = &served.channel;
+                    let algo = &served.algo;
                     // A miner must submit the form its channel was opened as.
                     if extended != channel.kind.is_extended() {
-                        channel.send_error(
-                            sequence_number,
-                            crate::share::Refusal::InvalidExtranonce,
-                        )?;
+                        channel.send_error(sequence_number, Refusal::InvalidExtranonce)?;
                         continue;
                     }
                     let submit = SubmitMeta { sequence_number };
@@ -924,36 +1077,60 @@ impl Server {
                 (EXT_CORE_MINING, MESSAGE_TYPE_UPDATE_CHANNEL) => {
                     let update: mining_sv2::UpdateChannel =
                         binary_sv2::from_bytes(&mut frame.payload)?;
-                    self.update_channel(algo, channel, &update)?;
+                    let Some(served) = channels.get(&update.channel_id) else {
+                        Self::refuse_unknown_update(writer, update.channel_id)?;
+                        continue;
+                    };
+                    self.update_channel(&served.algo, &served.channel, &update)?;
                 }
                 (EXT_CORE_MINING, MESSAGE_TYPE_CLOSE_CHANNEL) => {
                     let close: mining_sv2::CloseChannel =
                         binary_sv2::from_bytes(&mut frame.payload)?;
-                    if close.channel_id != channel.id {
-                        // There is no CloseChannel.Error to answer with, and
-                        // one channel per connection means the id can only be
-                        // this one. Logged and dropped rather than guessed at.
+                    let reason = String::from_utf8_lossy(close.reason_code.as_ref()).into_owned();
+                    match channels.remove(&close.channel_id) {
+                        Some(served) => {
+                            // Unregistered here and not only at the end,
+                            // because the publisher would otherwise go on
+                            // pushing work to a channel the worker has said
+                            // it is finished with. On its own algorithm,
+                            // which need not be the connection's.
+                            served.algo.unregister(served.channel.id);
+                            logln!(
+                                "[pool] channel {} closed by the worker: {reason}",
+                                served.channel.id
+                            );
+                        }
+                        None => {
+                            // There is no CloseChannel.Error to answer with.
+                            // Logged and dropped rather than guessed at.
+                            logln!(
+                                "[pool] {peer} asked to close channel {}, which it does not have",
+                                close.channel_id
+                            );
+                        }
+                    }
+                    // The connection stands. Closing a channel is not closing
+                    // a connection, and a worker may open another.
+                }
+                _ => {
+                    // A message number this build does not know, inside an
+                    // extension it granted, means the worker was built at
+                    // another time. Reading past it is what lets a message be
+                    // added at all; disconnecting would break every worker
+                    // built before the next one. An extension that was never
+                    // negotiated, or an unknown core message, still ends the
+                    // connection.
+                    if frame.is_skippable(negotiated) {
                         logln!(
-                            "[pool] channel {} asked to close {}, which is not its own",
-                            channel.id,
-                            close.channel_id
+                            "[pool] {peer} sent {}, which this build does not serve; ignoring it",
+                            frame.describe()
                         );
                         continue;
                     }
-                    logln!(
-                        "[pool] channel {} closed by the worker: {}",
-                        channel.id,
-                        String::from_utf8_lossy(close.reason_code.as_ref())
-                    );
-                    // Ok, not an error: the worker did the correct thing, and
-                    // the caller unregisters the channel either way.
-                    return Ok(());
-                }
-                _ => {
                     return Err(Error::Protocol(format!(
                         "unexpected {} on a mining connection",
                         frame.describe()
-                    )))
+                    )));
                 }
             }
         }
@@ -1072,10 +1249,16 @@ pub fn setup_connection(
 /// silent, so a worker that has not negotiated it is refused rather than
 /// served work it cannot mine correctly.
 /// Public for the bridge, like [`setup_connection`].
+/// Answers `RequestExtensions`, returning what was agreed.
+///
+/// `EXT_AVIAN` is required and its absence refuses the connection.
+/// `EXT_AVIAN_BLOCKS` is optional: a client that does not ask for it is served
+/// exactly as before and is never sent a block notification, which is the
+/// whole reason that message no longer lives inside `EXT_AVIAN`.
 pub fn request_extensions(
     reader: &mut ConnectionReader,
     writer: &Arc<Mutex<ConnectionWriter>>,
-) -> Result<()> {
+) -> Result<Vec<u16>> {
     let frame = reader.recv_expect(EXT_NEGOTIATION, MSG_REQUEST_EXTENSIONS)?;
     let mut r = Reader::new(&frame.payload);
     let request_id = r.u16()?;
@@ -1086,7 +1269,7 @@ pub fn request_extensions(
         let unsupported: Vec<u16> = wanted
             .iter()
             .copied()
-            .filter(|ext| *ext != EXT_AVIAN)
+            .filter(|ext| *ext != EXT_AVIAN && *ext != avian_sv2::avian::EXT_AVIAN_BLOCKS)
             .collect();
         let mut w = Writer::new();
         // The error names what it could not provide and what it requires, so
@@ -1108,15 +1291,20 @@ pub fn request_extensions(
         )));
     }
 
+    let mut accepted = vec![EXT_AVIAN];
+    if wanted.contains(&avian_sv2::avian::EXT_AVIAN_BLOCKS) {
+        accepted.push(avian_sv2::avian::EXT_AVIAN_BLOCKS);
+    }
     let mut w = Writer::new();
-    let payload = w.u16(request_id).seq_u16(&[EXT_AVIAN]).finish();
+    let payload = w.u16(request_id).seq_u16(&accepted).finish();
     send_raw(
         writer,
         EXT_NEGOTIATION,
         MSG_REQUEST_EXTENSIONS_SUCCESS,
         false,
         &payload,
-    )
+    )?;
+    Ok(accepted)
 }
 
 /// Answers `AvianSelectAlgorithm` with one of `offered`, or refuses.
