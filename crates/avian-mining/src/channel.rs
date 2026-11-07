@@ -38,6 +38,7 @@ use mining_sv2::{
 
 use crate::job::{self, Job, JobWork};
 use crate::ratelimit::{Decision, Limiter, RateLimitConfig};
+use crate::server::PeerIdentity;
 use crate::share::{self, Outcome, PowHasher, Refusal, Submission};
 use crate::EXT_CORE_MINING;
 
@@ -99,6 +100,13 @@ pub struct Channel {
     /// can show a prefix: enough for someone to recognise their own channel,
     /// not enough to publish where everyone is paid.
     pub payout_address: String,
+    /// What the connection this channel arrived on said it was running.
+    ///
+    /// Per connection on the wire and copied onto every channel opened over
+    /// it, because a channel is the unit anybody reads: two rigs behind one
+    /// address are two channels, and a reader asking which build found a
+    /// share is asking about the channel that found it.
+    pub peer: PeerIdentity,
     /// When the channel opened, which is what turns a share count into a rate.
     pub opened_at: Instant,
     /// The cadence the pool sized this channel's share target for.
@@ -210,6 +218,7 @@ impl Channel {
         shares_per_minute: f64,
         rate_limit: RateLimitConfig,
         blocks_negotiated: bool,
+        peer: PeerIdentity,
         writer: Arc<Mutex<ConnectionWriter>>,
     ) -> Self {
         Self {
@@ -227,6 +236,7 @@ impl Channel {
             donation_basis_points,
             worker,
             payout_address,
+            peer,
             opened_at: Instant::now(),
             shares_per_minute,
             coinbase_tag,

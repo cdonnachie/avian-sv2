@@ -548,7 +548,7 @@ impl Server {
         let (mut reader, writer) = conn.split();
         logln!("[pool] {peer} completed the Noise handshake");
 
-        setup_connection(&mut reader, &writer)?;
+        let identity = setup_connection(&mut reader, &writer)?;
         let extensions = request_extensions(&mut reader, &writer)?;
         let offered: Vec<PowType> = self.algos.iter().map(|algo| algo.pow).collect();
         let pow = select_algorithm(&mut reader, &writer, &offered)?;
@@ -562,7 +562,18 @@ impl Server {
         // nothing, and that is what every peer built before the TLV field
         // does.
         let mut channels: HashMap<u32, Served> = HashMap::new();
-        let result = self.pump(&mut reader, &writer, algo, &extensions, &mut channels, peer);
+        let from = Peer {
+            addr: peer,
+            identity,
+        };
+        let result = self.pump(
+            &mut reader,
+            &writer,
+            algo,
+            &extensions,
+            &mut channels,
+            &from,
+        );
 
         // Every channel, on its own algorithm. One left registered is one the
         // publisher goes on pushing work to, down a socket nobody reads.
@@ -632,6 +643,7 @@ impl Server {
         writer: &Arc<Mutex<ConnectionWriter>>,
         default_algo: &Arc<AlgoContext>,
         blocks_negotiated: bool,
+        peer: &PeerIdentity,
     ) -> Result<Served> {
         // Both kinds are served, and REQUIRES_EXTENDED_CHANNELS is never set,
         // because serving both is the point: a miner that can only do
@@ -861,6 +873,7 @@ impl Server {
             self.config.shares_per_minute,
             self.config.rate_limit,
             blocks_negotiated,
+            peer.clone(),
             writer.clone(),
         ));
         logln!(
@@ -962,15 +975,18 @@ impl Server {
         algo: &Arc<AlgoContext>,
         negotiated: &[u16],
         channels: &mut HashMap<u32, Served>,
-        peer: SocketAddr,
+        from: &Peer,
     ) -> Result<()> {
+        // Unpacked once so every log line below still names the address the
+        // way it always has, and the claim stays a separate thing to pass on.
+        let (peer, identity) = (from.addr, &from.identity);
         let blocks = negotiated.contains(&avian_sv2::avian::EXT_AVIAN_BLOCKS);
         loop {
             let mut frame = reader.recv()?;
             match (frame.extension_type, frame.msg_type) {
                 (EXT_CORE_MINING, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL)
                 | (EXT_CORE_MINING, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL) => {
-                    match self.open_channel(&mut frame, writer, algo, blocks) {
+                    match self.open_channel(&mut frame, writer, algo, blocks, identity) {
                         Ok(served) => {
                             logln!(
                                 "[pool] {peer} opened channel {} on {}",
@@ -1190,13 +1206,64 @@ pub fn send_raw(
         .send_raw(extension_type, msg_type, channel_msg, payload)
 }
 
+/// What a worker said it is, from the tail of `SetupConnection`.
+///
+/// The protocol reserves four free-text fields for this and the pool read
+/// past every one of them until now, which left no way to tell a rig on last
+/// month's build from one on today's. That is worth more here than on a pool
+/// with vardiff: the share target is derived from the hash rate a worker
+/// declares when it opens a channel and then never moves, so which build did
+/// the declaring decides whether the whole session is aimed correctly.
+///
+/// Every field is the worker's claim about itself. Nothing in here is
+/// checked, nothing in here can be checked, and anything that displays it
+/// should say so rather than present it as something the pool established.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PeerIdentity {
+    /// Who makes the software, as it describes itself.
+    pub vendor: String,
+    /// Which build. The specification names the field for firmware, which
+    /// for a software miner is its version.
+    pub firmware: String,
+}
+
+/// The other end of a connection: where it dialled from, and what it says
+/// it is running.
+///
+/// One argument rather than two because they travel together everywhere and
+/// answer the same question. The address is the pool's own observation; the
+/// identity is the worker's claim, and keeping them in one place is a
+/// reminder that a line printing both is printing one of each.
+pub struct Peer {
+    pub addr: SocketAddr,
+    pub identity: PeerIdentity,
+}
+
+impl PeerIdentity {
+    /// Reads the fields that follow the flags.
+    ///
+    /// `endpoint_host` and `endpoint_port` are read only to get past them:
+    /// they are what the worker believes it dialled, and the pool knows its
+    /// own address better than a worker does. `device_id` comes after
+    /// `firmware` and is left unread, because it names one unit of hardware
+    /// to the vendor that built it and this pool has no use for it.
+    fn read(r: &mut Reader) -> Result<Self> {
+        let _endpoint_host = r.text()?;
+        let _endpoint_port = r.u16()?;
+        let vendor = r.text()?;
+        let _hardware_version = r.text()?;
+        let firmware = r.text()?;
+        Ok(Self { vendor, firmware })
+    }
+}
+
 /// `SetupConnection` with the v1 contract from doc/sv2.md.
 /// Public because the bridge serves the same handshake in front of a
 /// different pool: `SetupConnection` is the protocol, not solo policy.
 pub fn setup_connection(
     reader: &mut ConnectionReader,
     writer: &Arc<Mutex<ConnectionWriter>>,
-) -> Result<()> {
+) -> Result<PeerIdentity> {
     let frame = reader.recv_expect(EXT_CORE_MINING, MESSAGE_TYPE_SETUP_CONNECTION)?;
     // Hand-decoded rather than through SRI's SetupConnection, because that
     // struct's `protocol` is an enum and an unknown discriminant has to be
@@ -1207,7 +1274,7 @@ pub fn setup_connection(
     let max_version = r.u16()?;
     let requested = r.u32()?;
 
-    let refuse = |flags: u32, code: &str| -> Result<()> {
+    let refuse = |flags: u32, code: &str| -> Result<PeerIdentity> {
         send(
             writer,
             EXT_CORE_MINING,
@@ -1245,6 +1312,13 @@ pub fn setup_connection(
         return refuse(flags::REQUIRES_WORK_SELECTION, "unsupported-feature-flags");
     }
 
+    // Read after every check that can refuse this connection, and never
+    // allowed to cause one. A worker whose identity fields are malformed is
+    // still a worker with hash rate, and trading a mining session for a label
+    // nobody needs would be the wrong way round. A peer that sends nothing
+    // readable is simply a peer that said nothing about itself.
+    let identity = PeerIdentity::read(&mut r).unwrap_or_default();
+
     send(
         writer,
         EXT_CORE_MINING,
@@ -1255,7 +1329,8 @@ pub fn setup_connection(
             // REQUIRES_FIXED_VERSION always, REQUIRES_EXTENDED_CHANNELS never.
             flags: flags::REQUIRES_FIXED_VERSION,
         },
-    )
+    )?;
+    Ok(identity)
 }
 
 /// The upstream half of the Extensions Negotiation extension.
@@ -1604,5 +1679,65 @@ mod share_target_tests {
         whole_coinbase.fee_script = vec![0x51];
         whole_coinbase.fee_basis_points = 10_001;
         assert!(whole_coinbase.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod peer_identity_tests {
+    use super::*;
+
+    /// The tail of a `SetupConnection`, from `endpoint_host` on.
+    fn tail(host: &str, port: u16, vendor: &str, hardware: &str, firmware: &str) -> Vec<u8> {
+        fn text(out: &mut Vec<u8>, value: &str) {
+            out.push(value.len() as u8);
+            out.extend_from_slice(value.as_bytes());
+        }
+        let mut out = Vec::new();
+        text(&mut out, host);
+        out.extend_from_slice(&port.to_le_bytes());
+        text(&mut out, vendor);
+        text(&mut out, hardware);
+        text(&mut out, firmware);
+        out
+    }
+
+    #[test]
+    fn the_vendor_and_the_build_are_read_out_of_the_right_fields() {
+        // The order is the specification's, and getting it wrong does not
+        // fail: it reports the hardware string as the version, or the host
+        // as the vendor, and looks plausible on a page either way.
+        let bytes = tail("pool.example", 3333, "avian-miner", "ryzen", "1.2.0");
+        let identity = PeerIdentity::read(&mut Reader::new(&bytes)).unwrap();
+        assert_eq!(identity.vendor, "avian-miner");
+        assert_eq!(identity.firmware, "1.2.0");
+    }
+
+    #[test]
+    fn a_worker_that_fills_nothing_in_says_nothing() {
+        let bytes = tail("0.0.0.0", 0, "", "", "");
+        let identity = PeerIdentity::read(&mut Reader::new(&bytes)).unwrap();
+        assert_eq!(identity.vendor, "");
+        assert_eq!(identity.firmware, "");
+    }
+
+    #[test]
+    fn a_truncated_tail_is_an_error_the_handshake_swallows() {
+        // Every miner built before the pool read these fields still has to
+        // mine. The read fails and `setup_connection` takes the default,
+        // which is why this asserts the error rather than a panic: the
+        // failure has to be the ordinary kind that `unwrap_or_default`
+        // turns into an empty identity.
+        let mut bytes = tail("0.0.0.0", 0, "avian-miner", "", "1.2.0");
+        bytes.truncate(bytes.len() - 3);
+        assert!(PeerIdentity::read(&mut Reader::new(&bytes)).is_err());
+        assert_eq!(
+            PeerIdentity::read(&mut Reader::new(&bytes)).unwrap_or_default(),
+            PeerIdentity::default()
+        );
+    }
+
+    #[test]
+    fn nothing_at_all_is_an_empty_identity_and_not_a_panic() {
+        assert!(PeerIdentity::read(&mut Reader::new(&[])).is_err());
     }
 }

@@ -134,6 +134,13 @@ pub struct ChannelSnapshot {
     pub extended: bool,
     pub worker: String,
     pub payout_prefix: String,
+    /// What the worker said it is running, from `SetupConnection`. Empty
+    /// when it said nothing, which is every miner built before the pool
+    /// started asking and is not the same as an unknown version.
+    ///
+    /// A claim and not a finding. See `server::PeerIdentity`.
+    pub vendor: String,
+    pub firmware: String,
     pub accepted: u32,
     /// Submissions the pool counted against the channel: wrong, or too many.
     pub rejected: u32,
@@ -248,6 +255,8 @@ impl Snapshot {
                             extended: channel.kind.is_extended(),
                             worker: channel.worker.clone(),
                             payout_prefix,
+                            vendor: channel.peer.vendor.clone(),
+                            firmware: channel.peer.firmware.clone(),
                             accepted,
                             rejected,
                             desync: channel.desync(),
@@ -285,9 +294,9 @@ impl Snapshot {
         }
     }
 
-    /// Hand-rolled, because the only strings that reach it are a worker label
-    /// and a payout prefix and both are escaped below. Everything else is a
-    /// number or a bool.
+    /// Hand-rolled, because the only strings that reach it are a worker
+    /// label, a payout prefix and what the worker said it is running, all of
+    /// which are escaped below. Everything else is a number or a bool.
     pub fn to_json(&self) -> String {
         let mut out = String::with_capacity(1024);
         out.push_str("{\n");
@@ -388,6 +397,18 @@ impl Snapshot {
                 out.push_str(&format!(
                     "          \"payout_prefix\": \"{}\",\n",
                     escape(&channel.payout_prefix)
+                ));
+                // Two fields rather than one joined string, because joining
+                // them is a display decision and this is not the place for
+                // one. Empty is "said nothing", which a reader must not
+                // print as a version it does not have.
+                out.push_str(&format!(
+                    "          \"vendor\": \"{}\",\n",
+                    escape(&channel.vendor)
+                ));
+                out.push_str(&format!(
+                    "          \"firmware\": \"{}\",\n",
+                    escape(&channel.firmware)
                 ));
                 out.push_str(&format!("          \"accepted\": {},\n", channel.accepted));
                 out.push_str(&format!("          \"rejected\": {},\n", channel.rejected));
@@ -733,6 +754,8 @@ mod tests {
             extended: true,
             worker: "rig".into(),
             payout_prefix: "avn1qmyq".into(),
+            vendor: String::new(),
+            firmware: String::new(),
             accepted: 0,
             rejected: 0,
             desync: 0,
@@ -897,6 +920,43 @@ mod tests {
             .and_then(|rest| rest.trim_end().trim_end_matches('}').parse().ok())
             .unwrap_or(0);
         assert!(stamp > 1_762_000_000, "{body}");
+    }
+
+    #[test]
+    fn what_the_worker_said_it_is_running_is_published() {
+        let mut one = channel();
+        one.vendor = "avian-miner".into();
+        one.firmware = "1.2.0".into();
+        let json = one_channel_json(one);
+        assert!(json.contains("\"vendor\": \"avian-miner\","), "{json}");
+        assert!(json.contains("\"firmware\": \"1.2.0\","), "{json}");
+    }
+
+    #[test]
+    fn a_worker_that_said_nothing_is_published_as_having_said_nothing() {
+        // Empty and not absent, and not a placeholder either. Every miner
+        // built before the pool started asking sends empty fields, and a
+        // page that printed "unknown" for them would be inventing a fact
+        // about a perfectly ordinary worker.
+        let json = one_channel_json(channel());
+        assert!(json.contains("\"vendor\": \"\","), "{json}");
+        assert!(json.contains("\"firmware\": \"\","), "{json}");
+    }
+
+    #[test]
+    fn a_version_string_cannot_break_the_json_either() {
+        // The same untrusted text as a worker label, from the same place and
+        // through the same escape. Asserted separately because it reaches
+        // the JSON through its own format! and a new field is exactly where
+        // an unescaped one gets written.
+        let mut one = channel();
+        one.firmware = "1.0\" , \"accepted\": 999999".into();
+        let json = one_channel_json(one);
+        assert!(
+            json.contains("\"firmware\": \"1.0\\\" , \\\"accepted\\\": 999999\","),
+            "{json}"
+        );
+        assert!(json.contains("\"accepted\": 0,"), "{json}");
     }
 
     #[test]
