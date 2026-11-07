@@ -87,6 +87,15 @@ pub struct ClientConfig {
     /// The least extranonce a miner wants on an extended channel. The pool may
     /// give more and will refuse the channel if it cannot give this much.
     pub min_extranonce_size: u16,
+    /// Who is mining and which build, for `SetupConnection`.
+    ///
+    /// The application's, not this library's. A pool showing an operator
+    /// which of their rigs is behind wants the name the operator downloaded
+    /// and the version they would compare against a release page, and
+    /// "libavian-sv2" is neither. Empty leaves the fields empty, which is
+    /// what every caller that has not been told about them sends.
+    pub vendor: String,
+    pub firmware: String,
 }
 
 impl ClientConfig {
@@ -102,6 +111,8 @@ impl ClientConfig {
             reconnect: Backoff::default(),
             extended: true,
             min_extranonce_size: 8,
+            vendor: String::new(),
+            firmware: String::new(),
         }
     }
 }
@@ -777,16 +788,29 @@ impl MiningClient {
             extranonce_size: 0,
             negotiated: Vec::new(),
         };
-        Self::setup_connection(&mut session, trace)?;
+        Self::setup_connection(&mut session, config, trace)?;
         Self::request_extensions(&mut session, trace)?;
         Self::select_algorithm(&mut session, config.pow, trace)?;
         Self::open_channel(&mut session, config, trace)?;
         Ok(session)
     }
 
-    fn setup_connection(session: &mut Session, trace: &mut Vec<Trace>) -> Result<()> {
+    fn setup_connection(
+        session: &mut Session,
+        config: &ClientConfig,
+        trace: &mut Vec<Trace>,
+    ) -> Result<()> {
         let host = b"0.0.0.0";
-        let vendor = b"libavian-sv2";
+        // The caller's, falling back to this library's name so that a peer
+        // which says nothing still says something true. The fallback carries
+        // no version on purpose: this crate's version is not the miner's, and
+        // an operator reading it off a pool page would compare it against the
+        // wrong release page.
+        let vendor = if config.vendor.is_empty() {
+            "libavian-sv2"
+        } else {
+            config.vendor.as_str()
+        };
         let empty: &[u8] = b"";
         Self::send(
             session,
@@ -805,9 +829,9 @@ impl MiningClient {
                 flags: flags::REQUIRES_STANDARD_JOBS,
                 endpoint_host: host.as_slice().try_into()?,
                 endpoint_port: 0,
-                vendor: vendor.as_slice().try_into()?,
+                vendor: vendor.as_bytes().try_into()?,
                 hardware_version: empty.try_into()?,
-                firmware: empty.try_into()?,
+                firmware: config.firmware.as_bytes().try_into()?,
                 device_id: empty.try_into()?,
             },
         )?;

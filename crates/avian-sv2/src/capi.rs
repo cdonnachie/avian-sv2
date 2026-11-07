@@ -205,6 +205,16 @@ pub struct AvianSv2ClientConfig {
     /// The least extranonce to ask for on an extended channel. 0 for the
     /// default of 8.
     pub min_extranonce_size: c_uint,
+    /// Who is mining and which build, for the pool to show its operator.
+    /// Both may be null, which sends nothing and is what a caller built
+    /// before these fields existed does.
+    ///
+    /// The application's name and version, not this library's: an operator
+    /// comparing a rig against a release page is comparing the thing they
+    /// downloaded. Stratum v2 calls the second field firmware, which for a
+    /// software miner is its version.
+    pub vendor: *const c_char,
+    pub firmware: *const c_char,
     /// Non-zero to allow a pool that is not on this machine.
     ///
     /// Zero, the default a zeroed config gets, restricts this library to
@@ -266,6 +276,12 @@ fn build_config(raw: &AvianSv2ClientConfig) -> Result<ClientConfig, &'static str
     }
     if let Some(identity) = unsafe { text(raw.user_identity) } {
         config.user_identity = identity;
+    }
+    if let Some(vendor) = unsafe { text(raw.vendor) } {
+        config.vendor = vendor;
+    }
+    if let Some(firmware) = unsafe { text(raw.firmware) } {
+        config.firmware = firmware;
     }
     if raw.nominal_hash_rate > 0.0 {
         config.nominal_hash_rate = raw.nominal_hash_rate;
@@ -898,6 +914,8 @@ mod tests {
             max_reconnects: 1,
             extended: 0,
             min_extranonce_size: 0,
+            vendor: std::ptr::null(),
+            firmware: std::ptr::null(),
             allow_public_pool: 0,
         };
         let mut status = AVIAN_SV2_OK;
@@ -928,6 +946,8 @@ mod tests {
             max_reconnects: 1,
             extended: 0,
             min_extranonce_size: 0,
+            vendor: std::ptr::null(),
+            firmware: std::ptr::null(),
             allow_public_pool: 1,
         };
         let mut status = AVIAN_SV2_OK;

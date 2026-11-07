@@ -187,6 +187,15 @@ typedef struct {
      * much, because the scriptSig is only 100 bytes and the height push and
      * the operator tag are in there too. */
     uint32_t min_extranonce_size;
+    /* Who is mining and which build, for the pool to show its operator.
+     * Both may be NULL, which sends nothing.
+     *
+     * The application's name and version, not this library's: an operator
+     * comparing a rig against a release page is comparing the thing they
+     * downloaded. Stratum v2 calls the second field firmware, which for a
+     * software miner is its version. */
+    const char *vendor;
+    const char *firmware;
     /* Non-zero to allow a pool that is not on this machine.
      *
      * Zero, which is what a zeroed config gets, restricts this library to
