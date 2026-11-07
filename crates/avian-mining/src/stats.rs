@@ -926,10 +926,13 @@ mod tests {
     fn what_the_worker_said_it_is_running_is_published() {
         let mut one = channel();
         one.vendor = "avian-miner".into();
-        one.firmware = "1.2.0".into();
+        one.firmware = "avian-miner-1.2.0-x64W".into();
         let json = one_channel_json(one);
         assert!(json.contains("\"vendor\": \"avian-miner\","), "{json}");
-        assert!(json.contains("\"firmware\": \"1.2.0\","), "{json}");
+        assert!(
+            json.contains("\"firmware\": \"avian-miner-1.2.0-x64W\","),
+            "{json}"
+        );
     }
 
     #[test]

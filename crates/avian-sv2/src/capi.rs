@@ -212,7 +212,8 @@ pub struct AvianSv2ClientConfig {
     /// The application's name and version, not this library's: an operator
     /// comparing a rig against a release page is comparing the thing they
     /// downloaded. Stratum v2 calls the second field firmware, which for a
-    /// software miner is its version.
+    /// software miner is whatever it would put in a user agent: typically
+    /// its name, version and the platform it was built for.
     pub vendor: *const c_char,
     pub firmware: *const c_char,
     /// Non-zero to allow a pool that is not on this machine.

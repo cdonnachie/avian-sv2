@@ -91,9 +91,11 @@ pub struct ClientConfig {
     ///
     /// The application's, not this library's. A pool showing an operator
     /// which of their rigs is behind wants the name the operator downloaded
-    /// and the version they would compare against a release page, and
-    /// "libavian-sv2" is neither. Empty leaves the fields empty, which is
-    /// what every caller that has not been told about them sends.
+    /// and the build they would compare against a release page, and
+    /// "libavian-sv2" is neither. A caller that already composes a user
+    /// agent for stratum v1 should send that same string here rather than
+    /// spell the same build two ways. Empty leaves the fields empty, which
+    /// is what every caller that has not been told about them sends.
     pub vendor: String,
     pub firmware: String,
 }
