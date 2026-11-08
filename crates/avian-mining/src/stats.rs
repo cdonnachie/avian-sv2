@@ -104,6 +104,20 @@ pub struct Snapshot {
     pub authority_public_key: String,
     /// What the operator takes, and whether a donation goes anywhere.
     pub operator_fee: OperatorFee,
+    /// The tag this pool stamps into every coinbase it builds.
+    ///
+    /// Published for the reason given against the authority key above, and it
+    /// is the same reason: taken from the configuration the coinbase is built
+    /// from, so it cannot drift from the one in use. Nothing is given away by
+    /// saying it, because it is written into every block this pool finds on a
+    /// public chain and anyone reading that chain already has it.
+    ///
+    /// What it buys is that a service walking the chain for this pool's
+    /// blocks can be told the string instead of being configured with its own
+    /// copy. A second copy is free to disagree with this one, and when it
+    /// does the walk matches nothing and the only symptom is a pool that
+    /// appears never to have found a block.
+    pub coinbase_tag: String,
     /// There is no persistence, so every count below starts at this process's
     /// start. The endpoint says so rather than leaving it to be assumed.
     pub algorithms: Vec<AlgoSnapshot>,
@@ -244,6 +258,7 @@ impl Snapshot {
         algos: &[Arc<AlgoContext>],
         authority_public_key: String,
         operator_fee: OperatorFee,
+        coinbase_tag: String,
     ) -> Self {
         let now = Instant::now();
         let algorithms = algos
@@ -321,6 +336,7 @@ impl Snapshot {
             uptime: now.saturating_duration_since(started_at),
             authority_public_key,
             operator_fee,
+            coinbase_tag,
             algorithms,
         }
     }
@@ -356,6 +372,14 @@ impl Snapshot {
         out.push_str(&format!(
             "  \"donations_accepted\": {},\n",
             self.operator_fee.has_address
+        ));
+        // Escaped like a worker label rather than written out like the key
+        // above, because this one is a string an operator typed: the pool
+        // accepts any tag that fits a coinbase, and a quote in it would
+        // otherwise end the field early and hand the reader broken JSON.
+        out.push_str(&format!(
+            "  \"coinbase_tag\": \"{}\",\n",
+            escape(&self.coinbase_tag)
         ));
         out.push_str("  \"miners\": ");
         let miners: usize = self.algorithms.iter().map(|algo| algo.channels.len()).sum();
@@ -405,7 +429,11 @@ impl Snapshot {
                         escape(&block.worker),
                         escape(&block.payout_prefix)
                     ));
-                    out.push_str(if j + 1 == algo.found.len() { "\n" } else { ",\n" });
+                    out.push_str(if j + 1 == algo.found.len() {
+                        "\n"
+                    } else {
+                        ",\n"
+                    });
                 }
                 out.push_str("      ],\n");
             }
@@ -756,6 +784,7 @@ mod tests {
             uptime: Duration::from_secs(1),
             authority_public_key: String::new(),
             operator_fee: OperatorFee::default(),
+            coinbase_tag: String::new(),
             algorithms: vec![AlgoSnapshot {
                 pow: PowType::X16rt,
                 upstream_connected: true,
@@ -783,6 +812,7 @@ mod tests {
             uptime: Duration::from_secs(1),
             authority_public_key: String::new(),
             operator_fee: OperatorFee::default(),
+            coinbase_tag: String::new(),
             algorithms: vec![AlgoSnapshot {
                 pow: PowType::MinotaurX,
                 upstream_connected: false,
@@ -804,6 +834,7 @@ mod tests {
             uptime: Duration::from_secs(1),
             authority_public_key: String::new(),
             operator_fee: OperatorFee::default(),
+            coinbase_tag: String::new(),
             algorithms: vec![AlgoSnapshot {
                 pow: PowType::X16rt,
                 upstream_connected: true,
@@ -895,6 +926,7 @@ mod tests {
             uptime: Duration::from_secs(1),
             authority_public_key: String::new(),
             operator_fee: OperatorFee::default(),
+            coinbase_tag: String::new(),
             algorithms: vec![AlgoSnapshot {
                 pow: PowType::X16rt,
                 upstream_connected: true,
@@ -1099,6 +1131,7 @@ mod tests {
             uptime: Duration::from_secs(42),
             authority_public_key: "9cZsf3kvbayTC4M2bamzCoHkmcSneX68fb7Yc3JEfwtEsk2cXDA".into(),
             operator_fee: OperatorFee::default(),
+            coinbase_tag: String::new(),
             algorithms: vec![],
         };
         let json = snapshot.to_json();
@@ -1109,10 +1142,67 @@ mod tests {
     }
 
     #[test]
+    fn the_coinbase_tag_is_published_so_nothing_has_to_be_told_it_twice() {
+        let snapshot = Snapshot {
+            uptime: Duration::from_secs(1),
+            authority_public_key: String::new(),
+            operator_fee: OperatorFee::default(),
+            coinbase_tag: "/avian-sv2/yyz/".into(),
+            algorithms: vec![],
+        };
+        assert!(
+            snapshot
+                .to_json()
+                .contains("\"coinbase_tag\": \"/avian-sv2/yyz/\","),
+            "{}",
+            snapshot.to_json()
+        );
+    }
+
+    #[test]
+    fn an_empty_tag_is_reported_as_empty_and_not_left_out() {
+        // The distinction this pool has already been bitten by. A tag that is
+        // not there matches nothing when a chain is walked for it, and an
+        // endpoint that simply omitted the field would leave a reader unable
+        // to tell that from an older pool that never published one.
+        let snapshot = Snapshot {
+            uptime: Duration::from_secs(1),
+            authority_public_key: String::new(),
+            operator_fee: OperatorFee::default(),
+            coinbase_tag: String::new(),
+            algorithms: vec![],
+        };
+        assert!(
+            snapshot.to_json().contains("\"coinbase_tag\": \"\","),
+            "{}",
+            snapshot.to_json()
+        );
+    }
+
+    #[test]
+    fn a_tag_an_operator_typed_cannot_break_the_json() {
+        // Unlike the authority key beside it, this is a string somebody
+        // chose, and the pool takes any tag that fits in a coinbase.
+        let snapshot = Snapshot {
+            uptime: Duration::from_secs(1),
+            authority_public_key: String::new(),
+            operator_fee: OperatorFee::default(),
+            coinbase_tag: "/a\"b\\c/".into(),
+            algorithms: vec![],
+        };
+        let json = snapshot.to_json();
+        assert!(
+            json.contains("\"coinbase_tag\": \"/a\\\"b\\\\c/\","),
+            "{json}"
+        );
+    }
+
+    #[test]
     fn the_fee_and_whether_a_donation_is_paid_are_stated() {
         let mut snapshot = Snapshot {
             uptime: Duration::from_secs(1),
             authority_public_key: String::new(),
+            coinbase_tag: String::new(),
             operator_fee: OperatorFee {
                 basis_points: 25,
                 has_address: true,

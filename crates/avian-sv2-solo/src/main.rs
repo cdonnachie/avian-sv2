@@ -125,6 +125,20 @@ Submission limits, per channel:
   --algo <name>          x16rt or minotaurx; repeatable, default: both
   --duration <seconds>   stop after this long; default: run until killed
   --verbose              print every template in full
+
+Every flag above that takes a single value can also be given as an
+environment variable, named for the flag: --coinbase-tag is
+AVIAN_SV2_COINBASE_TAG, --shares-per-minute is AVIAN_SV2_SHARES_PER_MINUTE.
+A flag wins over the variable, the variable wins over the default, and a
+variable set to nothing at all is the same as not setting it.
+
+That is for a deployment where the flags live in a file something overwrites,
+which is what a systemd unit is: a unit has no defaulting of its own, so the
+flags are written out in it, and the ones that differ between two sites of
+the same pool then have nowhere to live. An environment file is the thing
+that survives a deploy. The repeatable and the on-off flags have no variable:
+neither is worth varying per site, and both would need a convention invented
+for them. The pool prints what it ended up with when it starts.
 ";
 
 fn main() {
@@ -221,6 +235,27 @@ fn run(options: Options) -> Result<(), String> {
         options.algorithms.len()
     );
 
+    // What this pool is configured as, said out loud once a run.
+    //
+    // Each of these can now come from a flag or from the environment, and
+    // between a unit, a drop-in and an environment file there is no single
+    // file to read to find out which one won. A line costs nothing and
+    // settles it.
+    //
+    // The tag is why the line exists. A wrong or empty one is silent: the
+    // pool goes on finding and submitting blocks exactly as before, and the
+    // only symptom is that whatever walks the chain for them comes up empty,
+    // which is a long way from the cause and was a morning to track down.
+    // Quoted, so that a trailing space or an empty string is visible as
+    // itself rather than as the end of the line.
+    logln!(
+        "[pool] chain {}, node {}, coinbase tag {:?}, {} shares/minute",
+        options.network.name(),
+        options.node,
+        String::from_utf8_lossy(&options.coinbase_tag),
+        options.shares_per_minute
+    );
+
     // Held for as long as the pool runs; dropping it stops the listener.
     let _stats = match options.stats_bind {
         Some(bind) => {
@@ -228,8 +263,19 @@ fn run(options: Options) -> Result<(), String> {
             let started_at = handle.started_at();
             let published_key = address::encode_authority_key(&pool_pubkey);
             let operator_fee = handle.operator_fee();
+            // From the running pool rather than from `options`, so that what
+            // the endpoint publishes is the string the coinbase is built
+            // from. The two are the same value today; taking it from the
+            // handle is what keeps them the same value.
+            let coinbase_tag = handle.coinbase_tag().to_string();
             let handle = stats::serve(bind, move || {
-                Snapshot::gather(started_at, &algos, published_key.clone(), operator_fee)
+                Snapshot::gather(
+                    started_at,
+                    &algos,
+                    published_key.clone(),
+                    operator_fee,
+                    coinbase_tag.clone(),
+                )
             })
             .map_err(|e| format!("--stats-bind {bind}: {e}"))?;
             logln!(
@@ -356,31 +402,107 @@ fn fee_script(
     }
 }
 
+/// The environment variable that stands in for a flag: `--coinbase-tag` is
+/// `AVIAN_SV2_COINBASE_TAG`.
+///
+/// A rule and not a table, because a table is a second list of flag names to
+/// keep in step with the first, and a flag somebody forgot to add to it would
+/// read as an environment that said nothing rather than as a mistake.
+///
+/// Prefixed, and the prefix is the point rather than tidiness. `CHAIN` is a
+/// word a shell is entitled to have exported in it, and a pool that read it
+/// bare would take a stray export as an instruction to mine another network.
+/// That exact failure has happened here once already, from a flag left on
+/// testnet while the node synced mainnet, and it is not worth opening a
+/// second road to it.
+fn env_name(flag: &str) -> String {
+    format!(
+        "AVIAN_SV2_{}",
+        flag.trim_start_matches('-')
+            .replace('-', "_")
+            .to_uppercase()
+    )
+}
+
+/// What the environment says a flag's value is, or nothing at all.
+///
+/// Blank is nothing, because an environment file spells an unset value `KEY=`
+/// and an operator who writes that means leave it alone. An empty
+/// `--coinbase-tag=` is a different statement and is still taken from a flag,
+/// where somebody typed it on purpose.
+fn env_value(flag: &str) -> Option<String> {
+    match std::env::var(env_name(flag)) {
+        Ok(text) if !text.trim().is_empty() => Some(text),
+        _ => None,
+    }
+}
+
+/// A number from the environment, with the variable named in the complaint.
+///
+/// Named, because the flag is not where its reader will look: a pool whose
+/// cadence came out of an environment file and whose error said
+/// `--shares-per-minute` would send somebody to a unit with no such flag in
+/// it, to look for a typo that is in another file entirely.
+fn env_number<T: std::str::FromStr>(flag: &str) -> Result<Option<T>, String> {
+    match env_value(flag) {
+        None => Ok(None),
+        Some(text) => text
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("{} wants a number, not {text:?}", env_name(flag))),
+    }
+}
+
 fn parse_args() -> Result<Option<Options>, String> {
-    let mut datadir: Option<PathBuf> = None;
-    let mut chain = "regtest".to_string();
-    let mut connect: Option<String> = None;
-    let mut authority_hex: Option<String> = None;
+    // Seeded from the environment before a single argument is read, so that
+    // an argument simply overwrites one of these and the order of precedence
+    // needs no bookkeeping to enforce: flag, then environment, then the
+    // default written here.
+    //
+    // This is here for a deployment that runs the same unit file at more than
+    // one site. A systemd unit has no ${VAR:-default} in it, so every flag is
+    // written out in the unit, and the values that have to differ per site
+    // were therefore inside the one file a deploy script overwrites on every
+    // run. An environment file is the part of such a deployment that survives
+    // a deploy, and this is what lets the per-site values live in one.
+    //
+    // Only the flags that take a single value. A repeatable flag would need a
+    // separator invented for it and the boolean flags would need a spelling
+    // of truth agreed, and neither is a value anybody needs to vary per site;
+    // both would be a new way to be surprised for no one's benefit.
+    let mut datadir: Option<PathBuf> = env_value("--datadir").map(PathBuf::from);
+    let mut chain = env_value("--chain").unwrap_or_else(|| "regtest".to_string());
+    let mut connect: Option<String> = env_value("--connect");
+    let mut authority_hex: Option<String> = env_value("--authority");
     let mut insecure = false;
     let mut algorithms: Vec<PowType> = Vec::new();
-    let mut mining_bind = "127.0.0.1:34254".to_string();
-    let mut stats_bind: Option<String> = None;
+    let mut mining_bind =
+        env_value("--mining-bind").unwrap_or_else(|| "127.0.0.1:34254".to_string());
+    let mut stats_bind: Option<String> = env_value("--stats-bind");
     let mut allow_public_bind = false;
-    let mut pool_key = PathBuf::from("avian-pool-authority-key");
-    let mut fee_address: Option<String> = None;
-    let mut fee_basis_points = 0u32;
-    let mut coinbase_tag = DEFAULT_TAG.to_string();
+    let mut pool_key = env_value("--pool-key")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("avian-pool-authority-key"));
+    let mut fee_address: Option<String> = env_value("--operator-fee");
+    let mut fee_basis_points: u32 = env_number("--operator-fee-bp")?.unwrap_or(0);
+    let mut coinbase_tag = env_value("--coinbase-tag").unwrap_or_else(|| DEFAULT_TAG.to_string());
     // Four and a half a minute: often enough that a dashboard shows
     // something within a minute of a worker connecting, rare enough that the
     // pool spends a hash per share without noticing.
-    let mut shares_per_minute = 4.5f64;
-    let mut min_hash_rate = 1000.0f64;
-    let mut max_hash_rate = 1e12f64;
+    let mut shares_per_minute: f64 = env_number("--shares-per-minute")?.unwrap_or(4.5);
+    let mut min_hash_rate: f64 = env_number("--min-hash-rate")?.unwrap_or(1000.0);
+    let mut max_hash_rate: f64 = env_number("--max-hash-rate")?.unwrap_or(1e12);
     let mut rate_limit = RateLimitConfig::default();
+    if let Some(value) = env_number("--share-rate-tolerance")? {
+        rate_limit.tolerance = value;
+    }
+    if let Some(value) = env_number("--max-invalid-shares")? {
+        rate_limit.max_invalid = value;
+    }
     let mut verbose = false;
-    let mut duration = None;
-    let mut coinbase_size = 1000u32;
-    let mut coinbase_sigops = 10u16;
+    let mut duration = env_number::<u64>("--duration")?.map(Duration::from_secs);
+    let mut coinbase_size: u32 = env_number("--coinbase-size")?.unwrap_or(1000);
+    let mut coinbase_sigops: u16 = env_number("--coinbase-sigops")?.unwrap_or(10);
 
     let mut args = std::env::args().skip(1);
     while let Some(whole) = args.next() {
@@ -585,6 +707,63 @@ fn resolve(target: &str) -> Result<SocketAddr, String> {
         .map_err(|e| format!("cannot resolve {target}: {e}"))?
         .next()
         .ok_or_else(|| format!("{target} resolved to nothing"))
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    #[test]
+    fn a_variable_is_named_for_its_flag_by_a_rule() {
+        assert_eq!(env_name("--coinbase-tag"), "AVIAN_SV2_COINBASE_TAG");
+        assert_eq!(
+            env_name("--shares-per-minute"),
+            "AVIAN_SV2_SHARES_PER_MINUTE"
+        );
+        assert_eq!(env_name("--chain"), "AVIAN_SV2_CHAIN");
+    }
+
+    #[test]
+    fn and_the_prefix_is_there_so_a_bare_word_cannot_reach_it() {
+        // The whole reason for the prefix: CHAIN is a word a shell may have
+        // exported for its own purposes, and reading it bare would let an
+        // unrelated export point this pool at another network.
+        assert_ne!(env_name("--chain"), "CHAIN");
+    }
+
+    // One test for everything that touches the process environment, because
+    // the environment is global and the test harness is threaded: two tests
+    // setting the same variable would race, and the failure would look like
+    // the feature rather than like the test.
+    #[test]
+    fn the_environment_fills_in_what_no_flag_said() {
+        let tag = env_name("--coinbase-tag");
+        let cadence = env_name("--shares-per-minute");
+
+        std::env::set_var(&tag, "/avian-sv2/par/");
+        assert_eq!(
+            env_value("--coinbase-tag").as_deref(),
+            Some("/avian-sv2/par/")
+        );
+
+        // Blank is an environment file saying nothing, which is how an
+        // operator spells "leave this alone" in a KEY= line.
+        std::env::set_var(&tag, "   ");
+        assert_eq!(env_value("--coinbase-tag"), None);
+        std::env::remove_var(&tag);
+        assert_eq!(env_value("--coinbase-tag"), None);
+
+        std::env::set_var(&cadence, "6.0");
+        assert_eq!(env_number::<f64>("--shares-per-minute").unwrap(), Some(6.0));
+
+        // And the complaint names the variable, not the flag, because the
+        // flag is not the file its reader will go and open.
+        std::env::set_var(&cadence, "often");
+        let err = env_number::<f64>("--shares-per-minute").unwrap_err();
+        assert!(err.contains("AVIAN_SV2_SHARES_PER_MINUTE"), "{err}");
+        assert!(err.contains("often"), "{err}");
+        std::env::remove_var(&cadence);
+    }
 }
 
 #[cfg(test)]

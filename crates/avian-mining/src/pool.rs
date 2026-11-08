@@ -44,6 +44,7 @@ pub struct PoolHandle {
     started_at: Instant,
     algos: Vec<Arc<AlgoContext>>,
     operator_fee: OperatorFee,
+    coinbase_tag: String,
     _server: ServerHandle,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -73,6 +74,18 @@ impl PoolHandle {
     /// the page is rendered.
     pub fn operator_fee(&self) -> OperatorFee {
         self.operator_fee
+    }
+
+    /// The coinbase tag as configured, for the stats endpoint, and for the
+    /// same reason as the fee above: it is the string the coinbase is built
+    /// from rather than a copy of it kept wherever the chain is walked.
+    ///
+    /// Lossy, because the field is bytes and the endpoint is JSON. A tag that
+    /// needs that conversion cannot have come from a flag or an environment
+    /// variable on this platform, so in practice nothing is lost; what the
+    /// conversion buys is that this cannot fail at the point of being asked.
+    pub fn coinbase_tag(&self) -> &str {
+        &self.coinbase_tag
     }
 
     pub fn join(self) {
@@ -113,6 +126,10 @@ pub fn spawn(
         basis_points: config.server.fee_basis_points,
         has_address: !config.server.fee_script.is_empty(),
     };
+    // Read here rather than in the caller, so that what the endpoint reports
+    // is the value this pool was built with and not a second reading of the
+    // same configuration. Taken before the line below, which moves it.
+    let coinbase_tag = String::from_utf8_lossy(&config.server.coinbase_tag).into_owned();
     let server = Arc::new(Server::new(config.server, algos.clone(), hasher)?);
 
     for (session, algo) in &mut sessions {
@@ -149,6 +166,7 @@ pub fn spawn(
         started_at: Instant::now(),
         algos,
         operator_fee,
+        coinbase_tag,
         _server: handle,
         threads,
     })

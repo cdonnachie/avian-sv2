@@ -65,8 +65,15 @@ fn serve(rig: &Rig) -> stats::StatsHandle {
     let started_at = rig.pool.started_at();
     let authority = PUBLISHED_KEY.to_string();
     let operator_fee = rig.pool.operator_fee();
+    let coinbase_tag = rig.pool.coinbase_tag().to_string();
     stats::serve("127.0.0.1:0".parse().unwrap(), move || {
-        Snapshot::gather(started_at, &algos, authority.clone(), operator_fee)
+        Snapshot::gather(
+            started_at,
+            &algos,
+            authority.clone(),
+            operator_fee,
+            coinbase_tag.clone(),
+        )
     })
     .expect("the stats listener should bind")
 }
