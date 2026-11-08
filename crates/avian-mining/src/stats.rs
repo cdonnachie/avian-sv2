@@ -122,11 +122,29 @@ pub struct AlgoSnapshot {
     /// pool to the last sixteen, so this is a worklist for whatever resolves
     /// them against the node, not a history.
     pub unconfirmed: Vec<[u8; 32]>,
+    /// Blocks this algorithm made lately with the worker that made each,
+    /// oldest first, whatever became of them. Not a second copy of the two
+    /// counts above and not a substitute for `unconfirmed`: those say how
+    /// many and which are still open, and this says whose.
+    pub found: Vec<FoundSnapshot>,
     pub prev_hash: Option<[u8; 32]>,
     /// The network target in force, which is the scale a channel's best share
     /// is read against.
     pub network_target: Option<[u8; 32]>,
     pub channels: Vec<ChannelSnapshot>,
+}
+
+/// One block, with the only two facts about it that the chain cannot
+/// supply. Everything else a reader wants, the height, the depth, the
+/// timestamp, the algorithm, is in the block itself.
+pub struct FoundSnapshot {
+    pub hash: [u8; 32],
+    pub worker: String,
+    /// The same prefix rule as a channel's, from the same constant, because
+    /// it is the same address seen from a different direction and two
+    /// answers of different lengths would only invite the question of which
+    /// one is the real address.
+    pub payout_prefix: String,
 }
 
 pub struct ChannelSnapshot {
@@ -280,6 +298,19 @@ impl Snapshot {
                     blocks_submitted: algo.blocks(),
                     blocks_confirmed: algo.confirmed(),
                     unconfirmed: algo.unconfirmed(),
+                    found: algo
+                        .found()
+                        .into_iter()
+                        .map(|block| FoundSnapshot {
+                            hash: block.hash,
+                            worker: block.worker,
+                            payout_prefix: block
+                                .payout_address
+                                .chars()
+                                .take(ADDRESS_PREFIX)
+                                .collect(),
+                        })
+                        .collect(),
                     prev_hash: algo.prev_hash(),
                     network_target: algo.network_target(),
                     channels,
@@ -359,6 +390,25 @@ impl Snapshot {
                 "      \"unconfirmed\": [{}],\n",
                 unconfirmed.join(", ")
             ));
+            // Who found what, for the same reader. Display order again, so a
+            // hash here and a hash in the list above are the same string and
+            // can be matched without either end reversing anything.
+            if algo.found.is_empty() {
+                out.push_str("      \"found\": [],\n");
+            } else {
+                out.push_str("      \"found\": [\n");
+                for (j, block) in algo.found.iter().enumerate() {
+                    out.push_str(&format!(
+                        "        {{\"hash\": \"{}\", \"worker\": \"{}\", \
+                         \"payout_prefix\": \"{}\"}}",
+                        hex_reversed(&block.hash),
+                        escape(&block.worker),
+                        escape(&block.payout_prefix)
+                    ));
+                    out.push_str(if j + 1 == algo.found.len() { "\n" } else { ",\n" });
+                }
+                out.push_str("      ],\n");
+            }
             match &algo.prev_hash {
                 Some(hash) => out.push_str(&format!(
                     "      \"mining_on\": \"{}\",\n",
@@ -712,6 +762,7 @@ mod tests {
                 blocks_submitted: 2,
                 blocks_confirmed: 1,
                 unconfirmed: vec![internal],
+                found: Vec::new(),
                 prev_hash: None,
                 network_target: None,
                 channels: Vec::new(),
@@ -738,12 +789,77 @@ mod tests {
                 blocks_submitted: 0,
                 blocks_confirmed: 0,
                 unconfirmed: Vec::new(),
+                found: Vec::new(),
                 prev_hash: None,
                 network_target: None,
                 channels: Vec::new(),
             }],
         };
         assert!(snapshot.to_json().contains("\"unconfirmed\": [],"));
+    }
+
+    /// One algorithm whose only interesting feature is the blocks it found.
+    fn with_found(found: Vec<FoundSnapshot>) -> Snapshot {
+        Snapshot {
+            uptime: Duration::from_secs(1),
+            authority_public_key: String::new(),
+            operator_fee: OperatorFee::default(),
+            algorithms: vec![AlgoSnapshot {
+                pow: PowType::X16rt,
+                upstream_connected: true,
+                blocks_submitted: 1,
+                blocks_confirmed: 1,
+                unconfirmed: Vec::new(),
+                found,
+                prev_hash: None,
+                network_target: None,
+                channels: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_found_block_says_whose_it_was() {
+        let mut internal = [0u8; 32];
+        internal[0] = 0xab;
+        internal[31] = 0x01;
+        let json = with_found(vec![FoundSnapshot {
+            hash: internal,
+            worker: "rig-a".into(),
+            payout_prefix: "RXp2d4ab".into(),
+        }])
+        .to_json();
+        // Display order, the way the unconfirmed list above spells a hash, so
+        // the two can be matched without either end reversing one.
+        let shown = format!("01{}ab", "00".repeat(30));
+        assert!(
+            json.contains(&format!(
+                "{{\"hash\": \"{shown}\", \"worker\": \"rig-a\", \
+                 \"payout_prefix\": \"RXp2d4ab\"}}"
+            )),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn no_blocks_found_is_an_empty_list_and_not_an_absent_key() {
+        // The same distinction the unconfirmed list makes: a pool that has
+        // found nothing and a pool too old to say are different facts, and
+        // an absent key cannot tell them apart.
+        assert!(with_found(Vec::new()).to_json().contains("\"found\": [],"));
+    }
+
+    #[test]
+    fn a_worker_label_on_a_found_block_cannot_break_the_json() {
+        // The same untrusted text as a channel's label, kept for longer and
+        // so outliving the connection it arrived on.
+        let json = with_found(vec![FoundSnapshot {
+            hash: [0u8; 32],
+            worker: "rig\"a\nb".into(),
+            payout_prefix: "RXp2d4ab".into(),
+        }])
+        .to_json();
+        assert!(json.contains("\"worker\": \"rig\\\"a\\nb\""), "{json}");
     }
 
     /// One channel with nothing interesting about it, for a test to change
@@ -785,6 +901,7 @@ mod tests {
                 blocks_submitted: 0,
                 blocks_confirmed: 0,
                 unconfirmed: Vec::new(),
+                found: Vec::new(),
                 prev_hash: None,
                 network_target: None,
                 channels,

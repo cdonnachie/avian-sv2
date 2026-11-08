@@ -1626,6 +1626,18 @@ than things it will never have:
   `getblock`: `confirmations` of -1 lost its race, one or more is on the
   chain, error -5 was never seen. No new dependency, no write path, no state
   the pool was not already holding.
+
+  Beside it, `found` lists the last thirty two blocks this process made with
+  the worker that made each and a prefix of the address its coinbase pays.
+  That is a different list for a different reason. `unconfirmed` is a
+  worklist and a block leaves it the moment the tip moves, usually inside a
+  second, so anything polling slower than the chain would collect only the
+  blocks that failed. `found` is kept whatever became of a block, because
+  every other fact a reader wants is in the chain and this one is not: a
+  coinbase carries the pool's tag and the address it paid, and no worker
+  label at all. Still no persistence. The list is this process's, and a
+  restart loses it, which is why it is the sort of thing worth copying
+  somewhere durable rather than reading late.
 - **Vardiff.** The pool never moves a target on its own judgement. Each
   channel's is derived once, from the hash rate the worker declared, and
   changes after that only when the worker asks with `UpdateChannel`, which is

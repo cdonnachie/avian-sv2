@@ -247,6 +247,32 @@ pub struct AlgoContext {
     /// was. Bounded: an unconfirmed block either becomes the tip within a few
     /// rounds or lost a race, and the pool cannot tell which.
     pending: Mutex<VecDeque<(u32, u32, [u8; 32])>>,
+    /// Blocks this algorithm made, and who each was made for, newest last.
+    ///
+    /// Separate from `pending` above because it answers a different question
+    /// and has to outlive the answer to that one. `pending` is a worklist
+    /// that `confirm_tip` drains, so a block that connects leaves it within
+    /// a round, usually inside a second: anything reading the endpoint
+    /// slower than the chain moves would collect a list made up of the
+    /// blocks that failed. This is kept whatever became of a block, because
+    /// the one thing only the pool can say about a block is which worker
+    /// found it, and the chain, which is the record of everything else,
+    /// carries no worker label at all.
+    found: Mutex<VecDeque<FoundBlock>>,
+}
+
+/// A block this pool made, and who it was made for.
+#[derive(Clone)]
+pub struct FoundBlock {
+    /// Internal byte order, like every other hash the pool holds.
+    pub hash: [u8; 32],
+    /// The channel's worker label. Untrusted text, straight from the miner.
+    pub worker: String,
+    /// The whole address its coinbase pays, not a prefix. How much of it an
+    /// endpoint will show is the endpoint's policy and is applied there, so
+    /// that one rule covers this and the channel list rather than two rules
+    /// that are free to disagree.
+    pub payout_address: String,
 }
 
 #[derive(Default)]
@@ -269,6 +295,7 @@ impl AlgoContext {
             blocks: AtomicU32::new(0),
             confirmed: AtomicU32::new(0),
             pending: Mutex::new(VecDeque::new()),
+            found: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -311,6 +338,35 @@ impl AlgoContext {
             .lock()
             .map(|pending| pending.iter().map(|(_, _, hash)| *hash).collect())
             .unwrap_or_default()
+    }
+
+    /// Every block this algorithm has made lately, oldest first.
+    pub fn found(&self) -> Vec<FoundBlock> {
+        self.found
+            .lock()
+            .map(|found| found.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Records who a forwarded block was made for.
+    ///
+    /// Thirty two, where `pending` keeps sixteen, and for the opposite
+    /// reason: nothing drains this, so the bound is the whole of its length.
+    /// At a rate that makes a solo pool worth running it is hours of
+    /// history, which is far longer than anything needs to poll on, and the
+    /// cost of being wrong about that is losing the attribution on the
+    /// oldest block rather than losing the block.
+    fn remember_found(&self, worker: &str, payout_address: &str, hash: [u8; 32]) {
+        if let Ok(mut found) = self.found.lock() {
+            found.push_back(FoundBlock {
+                hash,
+                worker: worker.to_string(),
+                payout_address: payout_address.to_string(),
+            });
+            while found.len() > 32 {
+                found.pop_front();
+            }
+        }
     }
 
     /// Records a forwarded block so a later tip can confirm it.
@@ -1085,6 +1141,11 @@ impl Server {
                         channel.record_block();
                         algo.blocks.fetch_add(1, Ordering::Relaxed);
                         algo.remember_block(channel.id, submit.sequence_number, candidate.hash);
+                        algo.remember_found(
+                            &channel.worker,
+                            &channel.payout_address,
+                            candidate.hash,
+                        );
                         // Told before the node is asked, because this
                         // notification means the share was a block and not
                         // that the node took it, and the miner is the one
@@ -1458,6 +1519,39 @@ mod unconfirmed_tests {
 
     fn hash(n: u8) -> [u8; 32] {
         [n; 32]
+    }
+
+    #[test]
+    fn attribution_outlives_the_confirmation_that_drains_the_worklist() {
+        // The whole reason this list is separate from the one above. A block
+        // that becomes the tip leaves the worklist at once, and who found it
+        // is asked long afterwards by something reading the chain, so the
+        // answer has to still be here when it is.
+        let algo = context();
+        algo.remember_block(1, 1, hash(1));
+        algo.remember_found("rig-a", "RXp2d4address", hash(1));
+        algo.confirm_tip(&hash(1), &[]);
+
+        assert!(algo.unconfirmed().is_empty());
+        let found = algo.found();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].hash, hash(1));
+        assert_eq!(found[0].worker, "rig-a");
+        assert_eq!(found[0].payout_address, "RXp2d4address");
+    }
+
+    #[test]
+    fn the_oldest_attribution_goes_rather_than_the_list_growing() {
+        let algo = context();
+        for i in 0..40u8 {
+            algo.remember_found("rig", "RXp2d4address", hash(i));
+        }
+        let found = algo.found();
+        assert_eq!(found.len(), 32);
+        // Oldest first, so what survives is the last thirty two: whatever
+        // somebody might still be asking about, rather than this morning.
+        assert_eq!(found[0].hash, hash(8));
+        assert_eq!(found[31].hash, hash(39));
     }
 
     #[test]
