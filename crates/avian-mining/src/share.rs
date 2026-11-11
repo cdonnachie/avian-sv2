@@ -214,6 +214,8 @@ mod tests {
                 coinbase: vec![],
             },
             future: false,
+            pays: String::new(),
+            pays_index: None,
         }
     }
 

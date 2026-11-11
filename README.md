@@ -8,7 +8,9 @@ built on it.
 Non-custodial is the line this project holds, and solo is how it holds it
 today. A solo pool has nothing to hold: the miner puts its own payout address
 in `user_identity` when it opens a channel, the coinbase pays that address,
-and consensus pays the miner directly. Pooled mining means holding other
+and consensus pays the miner directly. A miner that would rather not have every
+block land on one address gives a descriptor instead, `wpkh(xpub.../0/*)`, and
+each block pays the next address under it. Pooled mining means holding other
 people's money between a block and a payout, which is the part that is not
 here and the reason there is no `avian-sv2-pool`. An operator who already runs
 a pool and wants Stratum v2 at the miner edge does not need one either: see

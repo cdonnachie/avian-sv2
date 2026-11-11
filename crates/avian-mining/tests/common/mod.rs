@@ -82,6 +82,19 @@ impl Rig {
         fee: (Vec<u8>, u32),
         rate_limit: RateLimitConfig,
     ) -> Option<Rig> {
+        Self::attach_full(node, algorithms, share_target, fee, rate_limit, None)
+    }
+
+    /// Everything, including where the pool keeps the next index each
+    /// descriptor pays, for the test about that.
+    pub fn attach_full(
+        node: Node,
+        algorithms: &[PowType],
+        share_target: Option<[u8; 32]>,
+        fee: (Vec<u8>, u32),
+        rate_limit: RateLimitConfig,
+        payout_state: Option<std::path::PathBuf>,
+    ) -> Option<Rig> {
         let secp = Secp256k1::new();
         let authority = Keypair::new(&secp, &mut secp256k1::rand::thread_rng());
         let (pool_authority, _) = authority.x_only_public_key();
@@ -110,6 +123,7 @@ impl Rig {
                     authority,
                     cert_validity: 3600,
                     network: Network::Regtest,
+                    payout_state,
                     fee_script: fee.0,
                     fee_basis_points: fee.1,
                     coinbase_tag: b"/avian-sv2-test/".to_vec(),

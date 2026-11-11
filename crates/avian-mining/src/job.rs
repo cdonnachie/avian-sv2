@@ -51,6 +51,13 @@ pub struct Job {
     pub work: JobWork,
     /// True while this job has not been activated by a `SetNewPrevHash`.
     pub future: bool,
+    /// The address the coinbase pays, as a wallet prints it, and the
+    /// derivation index it came from on a channel that pays a descriptor.
+    /// Decided when the job is built and carried with it, because a block
+    /// found against this job pays this address whatever the channel's
+    /// ledger has moved on to since.
+    pub pays: String,
+    pub pays_index: Option<u32>,
 }
 
 impl Job {
@@ -214,6 +221,9 @@ pub fn build(
         network_target: prev.target,
         work,
         future,
+        // The channel fills these in: it knows what the plan it passed pays.
+        pays: String::new(),
+        pays_index: None,
     })
 }
 

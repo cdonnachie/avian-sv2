@@ -79,7 +79,8 @@ the node's own view of the block it accepted.
 A miner puts its own payout address in `user_identity` when it opens a channel.
 The pool turns that into a `scriptPubKey`, puts it in the coinbase, and
 consensus pays the miner. Nothing is held, nothing is owed, and there is no
-ledger, because there is nothing to keep a ledger of.
+ledger of balances, because there is nothing to keep one of. The one thing
+written down is which address a descriptor pays next, below.
 
 ### The identity format
 
@@ -92,6 +93,51 @@ mnPBEVKjU1zz9214C7M7Zp4FuurUAsU6ZS.bitaxe-1
 That is the Stratum v1 convention carried into v2, and it is what a miner's UI
 labels "User". The label is the operator's to read: it is logged and it never
 affects the payout.
+
+### A fresh address per block
+
+In place of the address a miner may give a ranged single-key descriptor, the
+form its own wallet prints under `parent_desc` in `getaddressinfo` or in
+`listdescriptors`:
+
+```
+wpkh([595898c5/84h/921h/0h]xpub6BzVp1b.../0/*)#08kg29g5.bitaxe-1
+```
+
+`pkh(...)` and `wpkh(...)` are accepted, with any number of unhardened steps
+before the `*`. The key origin in square brackets is ignored, since it says
+where the key came from and changes nothing about what it derives; the
+`#checksum` is verified when present, so a descriptor copied with one wrong
+character is refused rather than mined to the wrong key. A hardened step, a
+bare `xpub` with no function around it, a descriptor with no `*`, and any other
+function are all refused: the first because a public key cannot derive it, the
+second because the key alone does not say which script to pay, the third
+because one address is what an address is for.
+
+Every block the miner finds then pays child `i` of the descriptor, and the next
+pays `i + 1`. The index moves when a block is found, not when a job is built:
+a channel sees thousands of jobs per block, and a wallet looks for its payments
+along consecutive indices, so paying 0, then 4000, then 9000 would leave its
+gap limit staring at thousands of empty addresses. Two channels on one key
+share one sequence, so two rigs behind one wallet never pay the same address.
+The counter is kept in `--payout-state` across restarts; without that file it
+starts at zero on every start, which pays an address twice and costs nothing
+but the privacy the feature was for, and the pool says so in its log.
+
+The derivation is BIP32's, checked against the node: the addresses this
+derives for a key are the ones `deriveaddresses` prints for the same
+descriptor, on regtest and for a mainnet wallet's own receive descriptor. The
+pool holds only the public key and can derive addresses from it and nothing
+else.
+
+What this buys is that a chain observer sees no address receive two coinbases.
+It does not hide which pool found the block, since the coinbase tag does that,
+and it is undone the moment the miner spends two of those coinbases in one
+transaction. The pool cannot help with the second; a wallet with coin control
+can. One more thing a miner should know: if the descriptor is a wallet's own
+receive chain, the wallet hands out those same addresses to anyone who asks it
+for one, so a payout and a payment can land on the same index. A descriptor
+from a wallet kept for mining, or the key's change chain `/1/*`, avoids that.
 
 The split is on the **first** dot, not the last. No Avian address can contain
 one, since neither the base58 alphabet nor the bech32 charset includes a dot, so
@@ -109,15 +155,16 @@ address and is quietly mined to somebody else's is the worst thing this
 codebase can do, and it would be silent in exactly the way every other problem
 found in this project has been silent.
 
-Four codes, so a miner is told what is wrong rather than only that something
+Five codes, so a miner is told what is wrong rather than only that something
 is:
 
 | Code | Meaning |
 | --- | --- |
 | `missing-payout-address` | `user_identity` was empty, or had no address before the label |
 | `invalid-payout-address` | not base58 or bech32, wrong length, or the checksum failed |
-| `wrong-network-address` | decoded cleanly, for another chain |
+| `wrong-network-address` | decoded cleanly, for another chain; also an `xpub` on a test chain or a `tpub` on mainnet |
 | `unsupported-address-type` | a witness version or program length this pool does not pay |
+| `invalid-payout-descriptor` | a descriptor that is not `pkh()` or `wpkh()` of a ranged unhardened path, or whose `#checksum` or key does not decode |
 
 ### What it accepts
 

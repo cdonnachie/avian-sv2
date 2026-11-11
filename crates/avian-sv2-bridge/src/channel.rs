@@ -335,6 +335,10 @@ impl BridgeChannel {
             network_target: block::target_from_nbits(notify.nbits),
             work,
             future: tip_changed,
+            // The upstream pool decides the coinbase and what it pays; the
+            // bridge never knows, so there is nothing to carry here.
+            pays: String::new(),
+            pays_index: None,
         };
 
         // The pool's job declares its algorithm in nVersion, and a job for

@@ -2,10 +2,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use avian_sv2::address::{self, Network};
+use avian_sv2::address::{self, Network, Payout};
 use avian_sv2::avian::{
     PowType, EXT_AVIAN, EXT_NEGOTIATION, MSG_REQUEST_EXTENSIONS, MSG_REQUEST_EXTENSIONS_ERROR,
     MSG_REQUEST_EXTENSIONS_SUCCESS, MSG_SELECT_ALGORITHM, MSG_SELECT_ALGORITHM_ERROR,
@@ -55,7 +56,8 @@ struct Served {
 }
 use secp256k1::Keypair;
 
-use crate::channel::{Channel, ChannelKind};
+use crate::channel::{Channel, ChannelKind, Derivation};
+use crate::ledger::PayoutLedger;
 use crate::ratelimit::RateLimitConfig;
 use crate::share::{PowHasher, Refusal, Submission};
 use avian_sv2::flags;
@@ -74,6 +76,10 @@ pub struct ServerConfig {
     /// Which chain's addresses to accept. Getting this wrong means accepting
     /// an address for another network and mining to it.
     pub network: Network,
+    /// Where to keep the next derivation index for each descriptor a worker
+    /// pays through, across restarts. `None` keeps them in memory and starts
+    /// every key at index 0 on each start, which the pool says in its log.
+    pub payout_state: Option<PathBuf>,
     /// The operator's cut. Zero basis points, or an empty script, means the
     /// worker takes the whole coinbase, which is what solo mining is.
     pub fee_script: Vec<u8>,
@@ -268,11 +274,16 @@ pub struct FoundBlock {
     pub hash: [u8; 32],
     /// The channel's worker label. Untrusted text, straight from the miner.
     pub worker: String,
-    /// The whole address its coinbase pays, not a prefix. How much of it an
-    /// endpoint will show is the endpoint's policy and is applied there, so
-    /// that one rule covers this and the channel list rather than two rules
-    /// that are free to disagree.
+    /// What identifies the miner across blocks, whole and not a prefix: its
+    /// address, or the extended key when it pays a descriptor. How much of
+    /// it an endpoint will show is the endpoint's policy and is applied
+    /// there, so that one rule covers this and the channel list rather than
+    /// two rules that are free to disagree.
     pub payout_address: String,
+    /// The address this block's coinbase pays, in full. The same string as
+    /// `payout_address` for a worker paying an address; a fresh one for
+    /// every block from a worker paying a descriptor.
+    pub paid: String,
 }
 
 #[derive(Default)]
@@ -356,12 +367,13 @@ impl AlgoContext {
     /// history, which is far longer than anything needs to poll on, and the
     /// cost of being wrong about that is losing the attribution on the
     /// oldest block rather than losing the block.
-    fn remember_found(&self, worker: &str, payout_address: &str, hash: [u8; 32]) {
+    fn remember_found(&self, worker: &str, payout_address: &str, paid: &str, hash: [u8; 32]) {
         if let Ok(mut found) = self.found.lock() {
             found.push_back(FoundBlock {
                 hash,
                 worker: worker.to_string(),
                 payout_address: payout_address.to_string(),
+                paid: paid.to_string(),
             });
             while found.len() > 32 {
                 found.pop_front();
@@ -536,6 +548,9 @@ pub struct Server {
     // because 0 is the "no group channel" value in
     // OpenStandardMiningChannel.Success.
     next_channel_id: AtomicU32,
+    /// The next index each descriptor pays. Pool-wide, because two channels
+    /// on one key must not pay the same address.
+    ledger: Arc<PayoutLedger>,
 }
 
 impl Server {
@@ -546,19 +561,28 @@ impl Server {
         hasher: Arc<dyn PowHasher>,
     ) -> Result<Self> {
         config.validate()?;
-        Ok(Self::new_unchecked(config, algos, hasher))
+        // Opened before anything listens: a ledger file that is there and
+        // cannot be read is a reason not to start, since starting over at
+        // index 0 is what the file exists to prevent.
+        let ledger = match &config.payout_state {
+            Some(path) => PayoutLedger::open(path.clone()).map_err(Error::Io)?,
+            None => PayoutLedger::in_memory(),
+        };
+        Ok(Self::new_unchecked(config, algos, hasher, ledger))
     }
 
     fn new_unchecked(
         config: ServerConfig,
         algos: Vec<Arc<AlgoContext>>,
         hasher: Arc<dyn PowHasher>,
+        ledger: PayoutLedger,
     ) -> Self {
         Self {
             config,
             algos,
             hasher,
             next_channel_id: AtomicU32::new(1),
+            ledger: Arc::new(ledger),
         }
     }
 
@@ -909,8 +933,36 @@ impl Server {
             }
         }
 
+        // One address for the channel, or a fresh one per block. For the
+        // second the script here is only the first job's; the channel
+        // replaces it from the ledger as it builds each job.
+        let (worker_script, derivation, pays) = match &parsed.payout {
+            Payout::Address(address) => (
+                address.script_pubkey(),
+                None,
+                format!("{} ({:?})", parsed.address_text, address.kind),
+            ),
+            Payout::Descriptor(descriptor) => {
+                let index = self.ledger.next_index(&descriptor.canonical());
+                let address = descriptor.address_at(index).map_err(|e| {
+                    Error::Protocol(format!("{descriptor} cannot pay index {index}: {e}"))
+                })?;
+                let text = address.encode(self.config.network);
+                (
+                    address.script_pubkey(),
+                    Some(Derivation {
+                        descriptor: descriptor.clone(),
+                        ledger: self.ledger.clone(),
+                        network: self.config.network,
+                    }),
+                    format!(
+                        "a fresh address per block from {descriptor}, first {text} (index {index})"
+                    ),
+                )
+            }
+        };
         let payout = PayoutPlan {
-            worker_script: parsed.address.script_pubkey(),
+            worker_script,
             fee_script: self.config.fee_script.clone(),
             fee_basis_points,
         };
@@ -922,6 +974,7 @@ impl Server {
             algo.pow,
             share_target,
             payout,
+            derivation,
             parsed.donation_basis_points,
             parsed.worker.clone(),
             parsed.address_text.clone(),
@@ -933,14 +986,13 @@ impl Server {
             writer.clone(),
         ));
         logln!(
-            "[pool] {} channel {id} pays {} ({:?}){}, worker {:?}, up to {:.2} submissions/s",
+            "[pool] {} channel {id} pays {}{}, worker {:?}, up to {:.2} submissions/s",
             if kind.is_extended() {
                 "extended"
             } else {
                 "standard"
             },
-            parsed.address_text,
-            parsed.address.kind,
+            pays,
             if self.config.fee_basis_points > 0 {
                 format!(
                     " less an operator fee of {}.{:02}%",
@@ -1143,9 +1195,27 @@ impl Server {
                         algo.remember_block(channel.id, submit.sequence_number, candidate.hash);
                         algo.remember_found(
                             &channel.worker,
-                            &channel.payout_address,
+                            channel.payout_key(),
+                            &candidate.pays,
                             candidate.hash,
                         );
+                        // The address this block pays is used up. Every
+                        // channel on the same key reads the ledger as it
+                        // builds its next job, so all of them move on.
+                        if let (Some(derivation), Some(index)) =
+                            (&channel.derivation, candidate.pays_index)
+                        {
+                            let next = derivation
+                                .ledger
+                                .advance(&derivation.descriptor.canonical(), index);
+                            logln!(
+                                "[pool] channel {} paid {} at index {index}; the next block on {} \
+                                 pays index {next}",
+                                channel.id,
+                                candidate.pays,
+                                derivation.descriptor
+                            );
+                        }
                         // Told before the node is asked, because this
                         // notification means the share was a block and not
                         // that the node took it, and the miner is the one
@@ -1529,7 +1599,7 @@ mod unconfirmed_tests {
         // answer has to still be here when it is.
         let algo = context();
         algo.remember_block(1, 1, hash(1));
-        algo.remember_found("rig-a", "RXp2d4address", hash(1));
+        algo.remember_found("rig-a", "RXp2d4address", "RXp2d4address", hash(1));
         algo.confirm_tip(&hash(1), &[]);
 
         assert!(algo.unconfirmed().is_empty());
@@ -1538,13 +1608,14 @@ mod unconfirmed_tests {
         assert_eq!(found[0].hash, hash(1));
         assert_eq!(found[0].worker, "rig-a");
         assert_eq!(found[0].payout_address, "RXp2d4address");
+        assert_eq!(found[0].paid, "RXp2d4address");
     }
 
     #[test]
     fn the_oldest_attribution_goes_rather_than_the_list_growing() {
         let algo = context();
         for i in 0..40u8 {
-            algo.remember_found("rig", "RXp2d4address", hash(i));
+            algo.remember_found("rig", "RXp2d4address", "RXp2d4address", hash(i));
         }
         let found = algo.found();
         assert_eq!(found.len(), 32);
@@ -1625,6 +1696,7 @@ mod share_target_tests {
                 .unwrap(),
             cert_validity: 3600,
             network: Network::Regtest,
+            payout_state: None,
             fee_script: Vec::new(),
             fee_basis_points: 0,
             coinbase_tag: b"/test/".to_vec(),

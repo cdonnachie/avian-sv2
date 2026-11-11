@@ -157,15 +157,30 @@ pub struct FoundSnapshot {
     /// The same prefix rule as a channel's, from the same constant, because
     /// it is the same address seen from a different direction and two
     /// answers of different lengths would only invite the question of which
-    /// one is the real address.
+    /// one is the real address. On a channel paying a descriptor this is the
+    /// extended key's prefix, the thing that stays the same across blocks.
     pub payout_prefix: String,
+    /// The address this block's coinbase actually pays, to the same prefix
+    /// rule. The same as `payout_prefix` for a channel paying an address;
+    /// a different, fresh one for every block from a descriptor.
+    pub paid_prefix: String,
 }
 
 pub struct ChannelSnapshot {
     pub id: u32,
     pub extended: bool,
     pub worker: String,
+    /// What identifies the miner: the address, or on a channel that pays a
+    /// descriptor the extended key, cut to the same prefix.
     pub payout_prefix: String,
+    /// True when the channel pays a fresh address per block. Then
+    /// `payout_next` is the one its next block would pay, in full, since it
+    /// is a one-use address that reveals nothing about any other, and
+    /// `payout_index` its position under the descriptor. Both empty on a
+    /// channel paying an address.
+    pub payout_derived: bool,
+    pub payout_next: String,
+    pub payout_index: u32,
     /// What the worker said it is running, from `SetupConnection`. Empty
     /// when it said nothing, which is every miner built before the pool
     /// started asking and is not the same as an unknown version.
@@ -278,16 +293,17 @@ impl Snapshot {
                         } else {
                             0.0
                         };
-                        let payout_prefix = channel
-                            .payout_address
-                            .chars()
-                            .take(ADDRESS_PREFIX)
-                            .collect();
+                        let payout_prefix =
+                            channel.payout_key().chars().take(ADDRESS_PREFIX).collect();
+                        let next = channel.next_payout();
                         ChannelSnapshot {
                             id: channel.id,
                             extended: channel.kind.is_extended(),
                             worker: channel.worker.clone(),
                             payout_prefix,
+                            payout_derived: channel.derivation.is_some(),
+                            payout_next: next.as_ref().map(|(a, _)| a.clone()).unwrap_or_default(),
+                            payout_index: next.map(|(_, i)| i).unwrap_or(0),
                             vendor: channel.peer.vendor.clone(),
                             firmware: channel.peer.firmware.clone(),
                             accepted,
@@ -324,6 +340,7 @@ impl Snapshot {
                                 .chars()
                                 .take(ADDRESS_PREFIX)
                                 .collect(),
+                            paid_prefix: block.paid.chars().take(ADDRESS_PREFIX).collect(),
                         })
                         .collect(),
                     prev_hash: algo.prev_hash(),
@@ -424,10 +441,11 @@ impl Snapshot {
                 for (j, block) in algo.found.iter().enumerate() {
                     out.push_str(&format!(
                         "        {{\"hash\": \"{}\", \"worker\": \"{}\", \
-                         \"payout_prefix\": \"{}\"}}",
+                         \"payout_prefix\": \"{}\", \"paid_prefix\": \"{}\"}}",
                         hex_reversed(&block.hash),
                         escape(&block.worker),
-                        escape(&block.payout_prefix)
+                        escape(&block.payout_prefix),
+                        escape(&block.paid_prefix)
                     ));
                     out.push_str(if j + 1 == algo.found.len() {
                         "\n"
@@ -475,6 +493,21 @@ impl Snapshot {
                 out.push_str(&format!(
                     "          \"payout_prefix\": \"{}\",\n",
                     escape(&channel.payout_prefix)
+                ));
+                // The next address in full, on a descriptor channel only. A
+                // one-use address says nothing about the others, and the
+                // miner wants to recognise it when the block lands.
+                out.push_str(&format!(
+                    "          \"payout_derived\": {},\n",
+                    channel.payout_derived
+                ));
+                out.push_str(&format!(
+                    "          \"payout_next\": \"{}\",\n",
+                    escape(&channel.payout_next)
+                ));
+                out.push_str(&format!(
+                    "          \"payout_index\": {},\n",
+                    channel.payout_index
                 ));
                 // Two fields rather than one joined string, because joining
                 // them is a display decision and this is not the place for
@@ -858,6 +891,7 @@ mod tests {
             hash: internal,
             worker: "rig-a".into(),
             payout_prefix: "RXp2d4ab".into(),
+            paid_prefix: "RXp2d4ab".into(),
         }])
         .to_json();
         // Display order, the way the unconfirmed list above spells a hash, so
@@ -866,7 +900,7 @@ mod tests {
         assert!(
             json.contains(&format!(
                 "{{\"hash\": \"{shown}\", \"worker\": \"rig-a\", \
-                 \"payout_prefix\": \"RXp2d4ab\"}}"
+                 \"payout_prefix\": \"RXp2d4ab\", \"paid_prefix\": \"RXp2d4ab\"}}"
             )),
             "{json}"
         );
@@ -888,6 +922,7 @@ mod tests {
             hash: [0u8; 32],
             worker: "rig\"a\nb".into(),
             payout_prefix: "RXp2d4ab".into(),
+            paid_prefix: "RXp2d4ab".into(),
         }])
         .to_json();
         assert!(json.contains("\"worker\": \"rig\\\"a\\nb\""), "{json}");
@@ -901,6 +936,9 @@ mod tests {
             extended: true,
             worker: "rig".into(),
             payout_prefix: "avn1qmyq".into(),
+            payout_derived: false,
+            payout_next: String::new(),
+            payout_index: 0,
             vendor: String::new(),
             firmware: String::new(),
             accepted: 0,
@@ -1069,6 +1107,36 @@ mod tests {
             .and_then(|rest| rest.trim_end().trim_end_matches('}').parse().ok())
             .unwrap_or(0);
         assert!(stamp > 1_762_000_000, "{body}");
+    }
+
+    #[test]
+    fn a_descriptor_channel_says_where_its_next_block_goes() {
+        let mut one = channel();
+        one.payout_prefix = "xpub6BzV".into();
+        one.payout_derived = true;
+        one.payout_next = "avn1qmyqedhpwefp8qgpdd4enxe043nxe8kulvmavrx".into();
+        one.payout_index = 2;
+        let json = one_channel_json(one);
+        assert!(json.contains("\"payout_prefix\": \"xpub6BzV\","), "{json}");
+        assert!(json.contains("\"payout_derived\": true,"), "{json}");
+        // The whole address, not a prefix: it is used once and names no
+        // other, and the miner wants to recognise it when the block lands.
+        assert!(
+            json.contains("\"payout_next\": \"avn1qmyqedhpwefp8qgpdd4enxe043nxe8kulvmavrx\","),
+            "{json}"
+        );
+        assert!(json.contains("\"payout_index\": 2,"), "{json}");
+    }
+
+    #[test]
+    fn an_address_channel_has_the_fields_too_and_they_say_nothing() {
+        // Present and empty, so a page can read them without checking the
+        // pool's version first, and false means an address rather than an
+        // unknown.
+        let json = one_channel_json(channel());
+        assert!(json.contains("\"payout_derived\": false,"), "{json}");
+        assert!(json.contains("\"payout_next\": \"\","), "{json}");
+        assert!(json.contains("\"payout_index\": 0,"), "{json}");
     }
 
     #[test]

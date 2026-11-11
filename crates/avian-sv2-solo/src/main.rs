@@ -9,8 +9,9 @@
 //! `user_identity` at channel open, and an address that does not parse refuses
 //! the channel rather than falling back to anything.
 //!
-//! No accounting, no payout ledger, no persistence, no vardiff, no web or
-//! stats services, no Stratum v1.
+//! No accounting, no vardiff, no Stratum v1. The one thing kept across
+//! restarts is which address a descriptor pays next, in `--payout-state`,
+//! for a worker that asked for a fresh address per block.
 
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -56,6 +57,9 @@ struct Options {
     /// Passed through to ServerConfig. Loopback-only is the library's default
     /// and stays so; a container has to ask.
     allow_public_bind: bool,
+    /// Where the next derivation index per descriptor lives. None keeps it in
+    /// memory, and the pool says so in its log.
+    payout_state: Option<PathBuf>,
 }
 
 const DEFAULT_TAG: &str = "/avian-sv2/";
@@ -67,6 +71,12 @@ A worker puts its own payout address in user_identity when it opens a channel,
 as `address` or `address.workername`, and the coinbase pays it directly. An
 address that does not parse, or belongs to another network, refuses the
 channel. There is no fallback address, by design.
+
+A worker may give a descriptor in place of the address, `wpkh(xpub.../0/*)` or
+`pkh(xpub.../0/*)`, as its wallet's `listdescriptors` prints one, and each
+block it finds then pays a fresh address derived from the key: the index after
+the last block's, kept in --payout-state. A key origin and a #checksum are
+accepted; a hardened step or a bare xpub with no range are refused.
 
 A worker may also leave some of its own reward to the pool, by connecting as
 `donate/<percent>/address.workername`. The percentage takes up to two decimal
@@ -87,6 +97,9 @@ Upstream, to the node:
 Downstream, to miners:
   --mining-bind <addr>   where to serve the Mining Protocol
                          (default 127.0.0.1:34254, loopback only)
+  --payout-state <file>  where to keep the next address index for each
+                         descriptor a worker pays through (see below).
+                         Without it the indices restart at 0 on every start
   --pool-key <file>      the pool's authority private key, generated on first
                          run (default: ./avian-pool-authority-key)
   --coinbase-tag <text>  goes in the coinbase scriptSig
@@ -208,6 +221,7 @@ fn run(options: Options) -> Result<(), String> {
                 authority,
                 cert_validity: avian_sv2::transport::DEFAULT_CERT_VALIDITY_SECS,
                 network: options.network,
+                payout_state: options.payout_state.clone(),
                 fee_script: options.fee_script.clone(),
                 fee_basis_points: options.fee_basis_points,
                 coinbase_tag: options.coinbase_tag.clone(),
@@ -479,6 +493,7 @@ fn parse_args() -> Result<Option<Options>, String> {
     let mut mining_bind =
         env_value("--mining-bind").unwrap_or_else(|| "127.0.0.1:34254".to_string());
     let mut stats_bind: Option<String> = env_value("--stats-bind");
+    let mut payout_state: Option<PathBuf> = env_value("--payout-state").map(PathBuf::from);
     let mut allow_public_bind = false;
     let mut pool_key = env_value("--pool-key")
         .map(PathBuf::from)
@@ -538,6 +553,7 @@ fn parse_args() -> Result<Option<Options>, String> {
             "--stats-bind" => stats_bind = Some(value!()),
             "--allow-public-bind" => allow_public_bind = true,
             "--pool-key" => pool_key = PathBuf::from(value!()),
+            "--payout-state" => payout_state = Some(PathBuf::from(value!())),
             "--coinbase-tag" => coinbase_tag = value!(),
             "--operator-fee" => fee_address = Some(value!()),
             "--operator-fee-bp" => {
@@ -698,6 +714,7 @@ fn parse_args() -> Result<Option<Options>, String> {
         coinbase_size,
         coinbase_sigops,
         allow_public_bind,
+        payout_state,
     }))
 }
 

@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use avian_sv2::address::{Descriptor, Network};
 use avian_sv2::avian::{self, PowType, EXT_AVIAN, MSG_JOB_TIME_CONSTRAINTS};
 use avian_sv2::block;
 use avian_sv2::error::{Error, Result};
@@ -37,6 +38,7 @@ use mining_sv2::{
 };
 
 use crate::job::{self, Job, JobWork};
+use crate::ledger::PayoutLedger;
 use crate::ratelimit::{Decision, Limiter, RateLimitConfig};
 use crate::server::PeerIdentity;
 use crate::share::{self, Outcome, PowHasher, Refusal, Submission};
@@ -57,6 +59,18 @@ pub struct BlockCandidate {
     pub nonce: u32,
     pub coinbase: Vec<u8>,
     pub hash: [u8; 32],
+    /// What the coinbase pays, from the job the share was found against.
+    pub pays: String,
+    pub pays_index: Option<u32>,
+}
+
+/// A channel that pays a fresh address per block: the descriptor it derives
+/// them from and the ledger that says which index is next.
+pub struct Derivation {
+    pub descriptor: Descriptor,
+    pub ledger: Arc<PayoutLedger>,
+    /// For printing the derived addresses the way a wallet does.
+    pub network: Network,
 }
 
 /// Which kind of channel this is.
@@ -86,8 +100,11 @@ pub struct Channel {
     pub pow: PowType,
     pub extranonce_prefix: Vec<u8>,
     /// Who the coinbase pays. From the worker's `user_identity`, not from
-    /// configuration.
+    /// configuration. On a channel with a `derivation`, the worker script in
+    /// here is replaced for every job; the fee half is used as it stands.
     pub payout: PayoutPlan,
+    /// Set when the worker gave a descriptor instead of an address.
+    pub derivation: Option<Derivation>,
     /// What the worker offered to leave with a `donate/` prefix, in basis
     /// points, before any operator fee; zero when it offered nothing. Kept
     /// apart from `payout`, which only knows the combined number and, with
@@ -211,6 +228,7 @@ impl Channel {
         pow: PowType,
         share_target: [u8; 32],
         payout: PayoutPlan,
+        derivation: Option<Derivation>,
         donation_basis_points: u32,
         worker: String,
         payout_address: String,
@@ -233,6 +251,7 @@ impl Channel {
                 ChannelKind::Extended { .. } => job::extranonce_prefix(id),
             },
             payout,
+            derivation,
             donation_basis_points,
             worker,
             payout_address,
@@ -385,6 +404,52 @@ impl Channel {
         )
     }
 
+    /// The plan for the next job, with what it pays as text and, on a
+    /// descriptor channel, the index it was derived at.
+    ///
+    /// Read from the ledger every time rather than once at open, so two
+    /// channels on one key move together: when one finds a block, the
+    /// other's next job pays the index after it.
+    fn payout_for_next_job(&self) -> Result<(PayoutPlan, String, Option<u32>)> {
+        let Some(derivation) = &self.derivation else {
+            return Ok((self.payout.clone(), self.payout_address.clone(), None));
+        };
+        let descriptor = &derivation.descriptor;
+        let index = derivation.ledger.next_index(&descriptor.canonical());
+        // BIP32 says a key that fails to derive is skipped. The ledger is not
+        // moved for it here, because this runs per job rather than per block
+        // and would have to move it under every channel on the key; the job
+        // fails instead, which the log names and which the next block on any
+        // channel sharing the key would also have to work around.
+        let address = descriptor
+            .address_at(index)
+            .map_err(|e| Error::Protocol(format!("{descriptor} cannot pay index {index}: {e}")))?;
+        let mut payout = self.payout.clone();
+        payout.worker_script = address.script_pubkey();
+        Ok((payout, address.encode(derivation.network), Some(index)))
+    }
+
+    /// What this channel's next block pays, with its index, on a channel that
+    /// pays a descriptor. `None` on one that pays an address.
+    pub fn next_payout(&self) -> Option<(String, u32)> {
+        let derivation = self.derivation.as_ref()?;
+        let index = derivation
+            .ledger
+            .next_index(&derivation.descriptor.canonical());
+        let address = derivation.descriptor.address_at(index).ok()?;
+        Some((address.encode(derivation.network), index))
+    }
+
+    /// The text that identifies this miner from one block to the next: the
+    /// address, or the extended key the addresses come from. Both are the
+    /// worker's own and both are the same across every channel it opens.
+    pub fn payout_key(&self) -> &str {
+        match &self.derivation {
+            Some(derivation) => &derivation.descriptor.key_text,
+            None => &self.payout_address,
+        }
+    }
+
     /// Pushes one round of work onto the channel.
     ///
     /// The whole round goes out under one lock, in the order doc/sv2.md
@@ -409,16 +474,19 @@ impl Channel {
         let job_id = state.next_job_id;
         state.next_job_id = state.next_job_id.wrapping_add(1).max(1);
 
+        let (payout, pays, pays_index) = self.payout_for_next_job()?;
         let mut job = job::build(
             job_id,
             &work.template,
             prev,
             &work.constraints,
-            &self.payout,
+            &payout,
             &self.coinbase_tag,
             self.shape(job_id),
             activate,
         )?;
+        job.pays = pays;
+        job.pays_index = pays_index;
 
         if job::pow_type_of(&job)? != self.pow {
             return Err(Error::Protocol(format!(
@@ -659,6 +727,8 @@ impl Channel {
                     nonce: submission.nonce,
                     coinbase: job.coinbase(&submission.extranonce)?,
                     hash,
+                    pays: job.pays.clone(),
+                    pays_index: job.pays_index,
                 }))
             }
         }
