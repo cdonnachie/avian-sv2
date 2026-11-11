@@ -17,6 +17,7 @@
 
 use std::fmt;
 
+use crate::bip32::{Bip32Error, ExtendedPubKey, HARDENED};
 use crate::block::sha256d;
 
 /// The base58 alphabet, which notably excludes `0`, `O`, `I`, `l` and `.`.
@@ -153,6 +154,13 @@ pub enum AddressError {
     /// should be told, not quietly billed the wrong amount or quietly
     /// charged nothing, and the amount is money either way.
     BadDonation(String),
+    /// A descriptor this pool cannot pay: not `pkh(...)` or `wpkh(...)`, not
+    /// ranged, or a path component that is not a number.
+    BadDescriptor(String),
+    /// A descriptor carried a `#checksum` and it did not match.
+    BadDescriptorChecksum,
+    /// The extended key inside a descriptor.
+    ExtendedKey(Bip32Error),
 }
 
 impl AddressError {
@@ -160,14 +168,23 @@ impl AddressError {
     pub fn code(&self) -> &'static str {
         match self {
             AddressError::Empty => "missing-payout-address",
-            AddressError::WrongNetwork { .. } | AddressError::WrongBech32Hrp { .. } => {
-                "wrong-network-address"
-            }
+            AddressError::WrongNetwork { .. }
+            | AddressError::WrongBech32Hrp { .. }
+            | AddressError::ExtendedKey(Bip32Error::WrongVersion { .. }) => "wrong-network-address",
             AddressError::UnsupportedWitnessVersion(_)
             | AddressError::UnsupportedProgramLength(_) => "unsupported-address-type",
             AddressError::BadDonation(_) => "invalid-donation",
+            AddressError::BadDescriptor(_)
+            | AddressError::BadDescriptorChecksum
+            | AddressError::ExtendedKey(_) => "invalid-payout-descriptor",
             _ => "invalid-payout-address",
         }
+    }
+}
+
+impl From<Bip32Error> for AddressError {
+    fn from(e: Bip32Error) -> Self {
+        AddressError::ExtendedKey(e)
     }
 }
 
@@ -208,6 +225,13 @@ impl fmt::Display for AddressError {
                      as in donate/2/<address> or donate/0.5/<address>"
                 )
             }
+            AddressError::BadDescriptor(why) => {
+                write!(f, "{why}; expected pkh(xpub.../0/*) or wpkh(xpub.../0/*)")
+            }
+            AddressError::BadDescriptorChecksum => {
+                write!(f, "the descriptor's #checksum does not match it")
+            }
+            AddressError::ExtendedKey(e) => write!(f, "{e}"),
         }
     }
 }
@@ -269,12 +293,271 @@ impl Address {
         payload.extend_from_slice(&self.program);
         Some(base58check_encode(&payload))
     }
+
+    /// Re-encodes a segwit v0 address as bech32. Only for `WitnessV0`.
+    pub fn encode_bech32(&self, network: Network) -> Option<String> {
+        if self.kind != AddressKind::WitnessV0 {
+            return None;
+        }
+        let hrp = network.bech32_hrp();
+        let mut values = vec![0u8];
+        values.extend(convert_bits(&self.program, 8, 5, true)?);
+        // The checksum: the polymod of hrp, data and six zeros, xor the
+        // bech32 constant, read out five bits at a time.
+        let mut checked = bech32_hrp_expanded(hrp);
+        checked.extend_from_slice(&values);
+        checked.extend_from_slice(&[0u8; 6]);
+        let polymod = bech32_polymod(&checked) ^ 1;
+        let mut out = String::with_capacity(hrp.len() + 1 + values.len() + 6);
+        out.push_str(hrp);
+        out.push('1');
+        for value in &values {
+            out.push(BECH32[*value as usize] as char);
+        }
+        for i in 0..6 {
+            out.push(BECH32[((polymod >> (5 * (5 - i))) & 31) as usize] as char);
+        }
+        Some(out)
+    }
+
+    /// The address as a wallet would print it: base58 for P2PKH and P2SH,
+    /// bech32 for segwit.
+    pub fn encode(&self, network: Network) -> String {
+        match self.kind {
+            AddressKind::WitnessV0 => self.encode_bech32(network),
+            _ => self.encode_base58(network),
+        }
+        .unwrap_or_default()
+    }
 }
 
 /// Every human-readable part Avian uses, so an address for another network is
 /// recognised as bech32 and refused as the wrong network rather than being
 /// put through base58 and refused as gibberish.
 const BECH32_HRPS: [&str; 4] = ["avnrt", "tavn4", "tavn", "avn"];
+
+/// Which script a descriptor pays. The two single-key forms a wallet makes
+/// from one extended key; nothing with a redeem script, because the pool holds
+/// no script to put in one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorKind {
+    /// `pkh(...)`: P2PKH, a base58 address.
+    Pkh,
+    /// `wpkh(...)`: P2WPKH, a bech32 address.
+    Wpkh,
+}
+
+impl DescriptorKind {
+    fn name(self) -> &'static str {
+        match self {
+            DescriptorKind::Pkh => "pkh",
+            DescriptorKind::Wpkh => "wpkh",
+        }
+    }
+}
+
+/// `pkh(xpub.../0/*)` or `wpkh(xpub.../0/*)`: a fresh address for every block.
+///
+/// The ranged single-key descriptors Avian Core itself uses, so a miner can
+/// paste one out of `listdescriptors` and import the same string back with
+/// `importdescriptors` to watch the payouts. A key origin in front of the key,
+/// `[fingerprint/84'/0'/0']`, is accepted and ignored: it tells a wallet where
+/// the key came from and changes nothing about what the key derives.
+///
+/// Unhardened only, which is all a public key can do; the path is whatever
+/// precedes the `*`, and the `*` is required, since a descriptor with no range
+/// is one address, and that is what a plain address is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Descriptor {
+    pub kind: DescriptorKind,
+    pub key: ExtendedPubKey,
+    /// The unhardened steps between the key and the `*`.
+    pub path: Vec<u32>,
+    /// The extended key as the miner wrote it. What identifies the miner on
+    /// a page, since the addresses it pays change with every block.
+    pub key_text: String,
+}
+
+impl Descriptor {
+    pub fn parse(text: &str, network: Network) -> Result<Self, AddressError> {
+        let bad = |why: &str| AddressError::BadDescriptor(why.to_string());
+
+        // An optional checksum, verified when present. A miner that pasted a
+        // whole descriptor out of their wallet gets told about a copy error
+        // rather than mined to a key with one character wrong.
+        let body = match text.split_once('#') {
+            Some((body, checksum)) => {
+                if descriptor_checksum(body) != checksum {
+                    return Err(AddressError::BadDescriptorChecksum);
+                }
+                body
+            }
+            None => text,
+        };
+
+        let Some(inner) = body.strip_suffix(')') else {
+            return Err(bad("a descriptor ends in )"));
+        };
+        let Some((function, inner)) = inner.split_once('(') else {
+            return Err(bad("a descriptor is a function of a key"));
+        };
+        let kind = match function {
+            "pkh" => DescriptorKind::Pkh,
+            "wpkh" => DescriptorKind::Wpkh,
+            other => return Err(bad(&format!("{other}() is not a script this pool pays"))),
+        };
+        if inner.contains('(') {
+            return Err(bad("nested functions are not a script this pool pays"));
+        }
+
+        // The key origin, if any, is dropped whole.
+        let inner = match inner.strip_prefix('[') {
+            Some(rest) => match rest.split_once(']') {
+                Some((_, after)) => after,
+                None => return Err(bad("an unclosed [ in the key origin")),
+            },
+            None => inner,
+        };
+
+        let mut parts = inner.split('/');
+        let key_text = parts.next().unwrap_or("");
+        let key = ExtendedPubKey::decode(key_text, network)?;
+
+        let steps: Vec<&str> = parts.collect();
+        let Some((&"*", path_text)) = steps.split_last() else {
+            return Err(bad(
+                "a descriptor the pool pays must end in /* so each block gets its own address",
+            ));
+        };
+        let mut path = Vec::with_capacity(path_text.len());
+        for step in path_text {
+            if step.ends_with('\'') || step.ends_with('h') {
+                let index = step[..step.len() - 1].parse::<u32>().unwrap_or(0);
+                return Err(Bip32Error::Hardened(index | HARDENED).into());
+            }
+            let index: u32 = step
+                .parse()
+                .map_err(|_| bad(&format!("{step:?} is not a derivation index")))?;
+            if index & HARDENED != 0 {
+                return Err(Bip32Error::Hardened(index).into());
+            }
+            path.push(index);
+        }
+
+        Ok(Self {
+            kind,
+            key,
+            path,
+            key_text: key_text.to_string(),
+        })
+    }
+
+    /// The address for one index under the `*`.
+    pub fn address_at(&self, index: u32) -> Result<Address, Bip32Error> {
+        let child = self.key.derive_path(&self.path)?.derive(index)?;
+        let program = child.pubkey_hash().to_vec();
+        Ok(match self.kind {
+            DescriptorKind::Pkh => Address {
+                kind: AddressKind::P2pkh,
+                program,
+            },
+            DescriptorKind::Wpkh => Address {
+                kind: AddressKind::WitnessV0,
+                program,
+            },
+        })
+    }
+
+    /// The descriptor without origin or checksum: what two miners who typed
+    /// it differently have in common, and the key a ledger stores it under.
+    pub fn canonical(&self) -> String {
+        let mut out = format!("{}({}", self.kind.name(), self.key_text);
+        for step in &self.path {
+            out.push('/');
+            out.push_str(&step.to_string());
+        }
+        out.push_str("/*)");
+        out
+    }
+}
+
+impl fmt::Display for Descriptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.canonical())
+    }
+}
+
+/// Where a channel's coinbase output goes: one address for the life of the
+/// channel, or a new one for every block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Payout {
+    Address(Address),
+    Descriptor(Descriptor),
+}
+
+impl Payout {
+    pub fn is_derived(&self) -> bool {
+        matches!(self, Payout::Descriptor(_))
+    }
+}
+
+/// The checksum Avian Core puts after `#` on a descriptor, as
+/// `getdescriptorinfo` computes it. Bitcoin Core's algorithm: a BCH code over
+/// the descriptor's characters, each contributing its low five bits directly
+/// and its high bits in groups of three.
+pub fn descriptor_checksum(descriptor: &str) -> String {
+    const INPUT: &str = "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ ";
+
+    fn polymod(mut c: u64, value: u64) -> u64 {
+        let c0 = c >> 35;
+        c = ((c & 0x7_ffff_ffff) << 5) ^ value;
+        if c0 & 1 != 0 {
+            c ^= 0xf5_dee5_1989;
+        }
+        if c0 & 2 != 0 {
+            c ^= 0xa9_fdca_3312;
+        }
+        if c0 & 4 != 0 {
+            c ^= 0x1b_ab10_e32d;
+        }
+        if c0 & 8 != 0 {
+            c ^= 0x37_06b1_677a;
+        }
+        if c0 & 16 != 0 {
+            c ^= 0x64_4d62_6ffd;
+        }
+        c
+    }
+
+    let mut c: u64 = 1;
+    let mut cls: u64 = 0;
+    let mut count = 0;
+    for ch in descriptor.chars() {
+        // A character outside the set has no position; Core calls that an
+        // invalid descriptor. Here it is folded in as position zero so the
+        // function stays total, and the checksum then cannot match one Core
+        // produced, which is the right outcome.
+        let position = INPUT.find(ch).unwrap_or(0) as u64;
+        c = polymod(c, position & 31);
+        cls = cls * 3 + (position >> 5);
+        count += 1;
+        if count == 3 {
+            c = polymod(c, cls);
+            cls = 0;
+            count = 0;
+        }
+    }
+    if count > 0 {
+        c = polymod(c, cls);
+    }
+    for _ in 0..8 {
+        c = polymod(c, 0);
+    }
+    c ^= 1;
+    (0..8)
+        .map(|j| BECH32[((c >> (5 * (7 - j))) & 31) as usize] as char)
+        .collect()
+}
 
 fn looks_like_bech32(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
@@ -488,11 +771,13 @@ fn convert_bits(data: &[u8], from: u32, to: u32, pad: bool) -> Option<Vec<u8>> {
 /// `bc1q…lnl43dd.bitaxe-1`. A bare address with no label is accepted too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
-    pub address: Address,
+    /// An address, or a descriptor that yields one per block.
+    pub payout: Payout,
     /// Whatever followed the first `.`. Empty when there was none. For the
     /// operator's benefit only: it never affects the payout.
     pub worker: String,
-    /// The address exactly as the miner wrote it, for logging.
+    /// The address, or descriptor, exactly as the miner wrote it, for
+    /// logging.
     pub address_text: String,
     /// What the miner chose to leave to the pool, in hundredths of a percent.
     /// Zero unless a `donate/<percent>/` prefix asked otherwise, which is the
@@ -518,8 +803,18 @@ pub fn parse_identity(identity: &str, network: Network) -> Result<Identity, Addr
         Some(at) => (&rest[..at], &rest[at + 1..]),
         None => (rest, ""),
     };
+    // A descriptor is a function of a key and an address is not, and `(`
+    // appears in neither base58 nor bech32, so the parenthesis decides.
+    // Everything in a descriptor is also dot-free: letters, digits, the
+    // brackets, `'`, `/`, `*` and `#`, so the split above still found the
+    // label.
+    let payout = if address_text.contains('(') {
+        Payout::Descriptor(Descriptor::parse(address_text, network)?)
+    } else {
+        Payout::Address(Address::decode(address_text, network)?)
+    };
     Ok(Identity {
-        address: Address::decode(address_text, network)?,
+        payout,
         worker: worker.to_string(),
         address_text: address_text.to_string(),
         donation_basis_points,
@@ -569,9 +864,7 @@ fn parse_percent(text: &str) -> Result<u32, AddressError> {
     if whole.is_empty() || frac.len() > 2 {
         return Err(bad());
     }
-    if !whole.bytes().all(|b| b.is_ascii_digit())
-        || !frac.bytes().all(|b| b.is_ascii_digit())
-    {
+    if !whole.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
         return Err(bad());
     }
     let whole: u32 = whole.parse().map_err(|_| bad())?;
@@ -763,12 +1056,12 @@ mod tests {
         let labelled =
             parse_identity(&format!("{REGTEST_P2PKH}.bitaxe-1"), Network::Regtest).unwrap();
         assert_eq!(labelled.worker, "bitaxe-1");
-        assert_eq!(labelled.address, plain.address);
+        assert_eq!(labelled.payout, plain.payout);
 
         // Splitting on the first dot, so a dotted label survives.
         let dotted = parse_identity(&format!("{REGTEST_P2PKH}.rig.1"), Network::Regtest).unwrap();
         assert_eq!(dotted.worker, "rig.1");
-        assert_eq!(dotted.address, plain.address);
+        assert_eq!(dotted.payout, plain.payout);
 
         // An empty label is odd but not a reason to refuse.
         let empty = parse_identity(&format!("{REGTEST_P2PKH}."), Network::Regtest).unwrap();
@@ -866,15 +1159,15 @@ mod tests {
         // Every one of these would be a silent 0% under a lenient parser,
         // which is a miner being told nothing while their intent is dropped.
         for bad in [
-            "donate//addr",          // no percentage
-            "donate/abc/addr",       // not a number
-            "donate/-1/addr",        // negative
-            "donate/101/addr",       // over everything
-            "donate/1.234/addr",     // finer than a basis point
-            "donate/.5/addr",        // no whole part
-            "donate/1.2.3/addr",     // two points
-            "donate/ 2/addr",        // space
-            "donate/2",              // no second slash, so no address either
+            "donate//addr",      // no percentage
+            "donate/abc/addr",   // not a number
+            "donate/-1/addr",    // negative
+            "donate/101/addr",   // over everything
+            "donate/1.234/addr", // finer than a basis point
+            "donate/.5/addr",    // no whole part
+            "donate/1.2.3/addr", // two points
+            "donate/ 2/addr",    // space
+            "donate/2",          // no second slash, so no address either
         ] {
             let err = parse_identity(bad, Network::Regtest).unwrap_err();
             assert!(
@@ -958,6 +1251,178 @@ mod key_format_tests {
             encoded.len()
         );
     }
+}
 
+#[cfg(test)]
+mod descriptor_tests {
+    use super::*;
+    use crate::wire::hex;
 
+    // BIP32 test vector 1's m/0H key, re-versioned as a tpub, and what a
+    // regtest Avian node derives from it with `deriveaddresses` for indices 0
+    // to 2 under /0/*. Ground truth: if this module disagrees with these it
+    // is wrong, whatever it thinks. The two checksums are the node's too,
+    // from `getdescriptorinfo`.
+    const TPUB: &str = "tpubD8eQVK4Kdxg3gHrF62jGP7dKVCoYiEB8dFSpuTawkL5YxTus5j5pf83vaKnii4bc6v2NVEy81P2gYrJczYne3QNNwMTS53p5uzDyHvnw2jm";
+    const PKH_ADDRESSES: [&str; 3] = [
+        "mrSeAixYDXL17YZm6VEcxn9REZ6jK8DDgL",
+        "mqXQcixBZXWbBCtdU1Vrn2ufk3kTwMd7Gp",
+        "msYJDb6RrztKjdARFKW4zWuLXb8jyj7cmr",
+    ];
+    const WPKH_ADDRESSES: [&str; 3] = [
+        "avnrt1qwlvfdv8ctae2ureaqjrugv4j8s5tw9ynfdxjct",
+        "avnrt1qdhrn4uwfdlmga8daant52wadtxlseqay3eve3a",
+        "avnrt1qs03guehmy9wlhjtcf60cala470cmq9gdc9c5ph",
+    ];
+    const PKH_CHECKSUM: &str = "p50sutnp";
+    const WPKH_CHECKSUM: &str = "xu7zxyjn";
+
+    // A mainnet wallet's own receive descriptor, as `getaddressinfo` prints
+    // it in `parent_desc`, with the address and scriptPubKey the same call
+    // gave for index 2 of it.
+    const MAIN_DESC: &str = "wpkh([595898c5/84h/921h/0h]xpub6BzVp1bdNVtet67LPtvPYk1zDmmoGq4PUJzmmkQmNAadbd8PvkozwAJeJJPddRjjfmhxd8GKo4FrDJiULSeYgHECnQ9GY3WD7DDiBpT1eLt/0/*)#08kg29g5";
+    const MAIN_INDEX_2: &str = "avn1qmyqedhpwefp8qgpdd4enxe043nxe8kulvmavrx";
+    const MAIN_INDEX_2_SCRIPT: &str = "0014d90196dc2eca4270202d6d733365f58ccd93db9f";
+
+    fn pkh() -> String {
+        format!("pkh({TPUB}/0/*)")
+    }
+
+    fn wpkh() -> String {
+        format!("wpkh({TPUB}/0/*)")
+    }
+
+    #[test]
+    fn the_addresses_match_what_the_node_derives() {
+        let pkh = Descriptor::parse(&pkh(), Network::Regtest).unwrap();
+        let wpkh = Descriptor::parse(&wpkh(), Network::Regtest).unwrap();
+        for index in 0..3u32 {
+            let legacy = pkh.address_at(index).unwrap();
+            assert_eq!(
+                legacy.encode(Network::Regtest),
+                PKH_ADDRESSES[index as usize]
+            );
+            assert_eq!(
+                legacy,
+                Address::decode(PKH_ADDRESSES[index as usize], Network::Regtest).unwrap()
+            );
+            let segwit = wpkh.address_at(index).unwrap();
+            assert_eq!(
+                segwit.encode(Network::Regtest),
+                WPKH_ADDRESSES[index as usize]
+            );
+            assert_eq!(
+                segwit,
+                Address::decode(WPKH_ADDRESSES[index as usize], Network::Regtest).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_wallets_own_descriptor_pays_the_address_the_wallet_shows() {
+        let descriptor = Descriptor::parse(MAIN_DESC, Network::Main).unwrap();
+        let address = descriptor.address_at(2).unwrap();
+        assert_eq!(address.encode(Network::Main), MAIN_INDEX_2);
+        assert_eq!(hex(&address.script_pubkey()), MAIN_INDEX_2_SCRIPT);
+        // The origin is dropped from the canonical form and the checksum
+        // with it, so the ledger keys this and the bare spelling together.
+        assert_eq!(
+            descriptor.canonical(),
+            format!("wpkh({}/0/*)", descriptor.key_text)
+        );
+        assert_eq!(descriptor.path, vec![0]);
+    }
+
+    #[test]
+    fn the_checksum_is_the_nodes() {
+        assert_eq!(descriptor_checksum(&pkh()), PKH_CHECKSUM);
+        assert_eq!(descriptor_checksum(&wpkh()), WPKH_CHECKSUM);
+        let (body, checksum) = MAIN_DESC.split_once('#').unwrap();
+        assert_eq!(descriptor_checksum(body), checksum);
+    }
+
+    #[test]
+    fn a_wrong_checksum_refuses_the_descriptor() {
+        let wrong = format!("{}#{}", wpkh(), PKH_CHECKSUM);
+        assert_eq!(
+            Descriptor::parse(&wrong, Network::Regtest),
+            Err(AddressError::BadDescriptorChecksum)
+        );
+        let right = format!("{}#{}", wpkh(), WPKH_CHECKSUM);
+        assert!(Descriptor::parse(&right, Network::Regtest).is_ok());
+    }
+
+    #[test]
+    fn a_descriptor_in_an_identity_keeps_the_label_and_the_donation() {
+        let identity = format!("donate/1.5/{MAIN_DESC}.rig.2");
+        let parsed = parse_identity(&identity, Network::Main).unwrap();
+        assert_eq!(parsed.worker, "rig.2");
+        assert_eq!(parsed.donation_basis_points, 150);
+        assert_eq!(parsed.address_text, MAIN_DESC);
+        assert!(parsed.payout.is_derived());
+        // And without a label.
+        let bare = parse_identity(MAIN_DESC, Network::Main).unwrap();
+        assert_eq!(bare.worker, "");
+        assert!(bare.payout.is_derived());
+    }
+
+    #[test]
+    fn what_the_pool_will_not_pay() {
+        let cases: Vec<(String, &str)> = vec![
+            // A bare key is not a descriptor and says nothing about the
+            // script; the error names both forms the pool does take.
+            (TPUB.to_string(), "invalid-payout-address"),
+            (format!("wpkh({TPUB})"), "invalid-payout-descriptor"),
+            (format!("wpkh({TPUB}/0)"), "invalid-payout-descriptor"),
+            (format!("wpkh({TPUB}/0'/*)"), "invalid-payout-descriptor"),
+            (format!("wpkh({TPUB}/0h/*)"), "invalid-payout-descriptor"),
+            (format!("wpkh({TPUB}/x/*)"), "invalid-payout-descriptor"),
+            (format!("sh(wpkh({TPUB}/0/*))"), "invalid-payout-descriptor"),
+            (format!("tr({TPUB}/0/*)"), "invalid-payout-descriptor"),
+            (format!("wpkh({TPUB}/0/*"), "invalid-payout-descriptor"),
+            (
+                format!("wpkh([abcd/0h{TPUB}/0/*)"),
+                "invalid-payout-descriptor",
+            ),
+            // The right key for the wrong chain.
+            (MAIN_DESC.to_string(), "wrong-network-address"),
+        ];
+        for (text, code) in cases {
+            let error = parse_identity(&text, Network::Regtest)
+                .err()
+                .unwrap_or_else(|| panic!("{text} should be refused"));
+            assert_eq!(error.code(), code, "{text}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_key_origin_changes_nothing() {
+        let with = Descriptor::parse(MAIN_DESC, Network::Main).unwrap();
+        let bare = Descriptor::parse(&with.canonical(), Network::Main).unwrap();
+        assert_eq!(with, bare);
+        assert_eq!(with.address_at(7).unwrap(), bare.address_at(7).unwrap());
+    }
+
+    #[test]
+    fn each_index_is_a_different_address() {
+        let descriptor = Descriptor::parse(&wpkh(), Network::Regtest).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for index in 0..64u32 {
+            assert!(seen.insert(descriptor.address_at(index).unwrap().program));
+        }
+    }
+
+    #[test]
+    fn bech32_encoding_round_trips_the_nodes_address() {
+        let address = Address::decode(REGTEST_BECH32_FOR_ENCODING, Network::Regtest).unwrap();
+        assert_eq!(
+            address.encode(Network::Regtest),
+            REGTEST_BECH32_FOR_ENCODING
+        );
+        assert_eq!(address.encode_base58(Network::Regtest), None);
+        let main = Address::decode(MAIN_INDEX_2, Network::Main).unwrap();
+        assert_eq!(main.encode(Network::Main), MAIN_INDEX_2);
+    }
+
+    const REGTEST_BECH32_FOR_ENCODING: &str = "avnrt1qmyfxjmnhquher0k8lhrpg082rv4j7thpf3suvx";
 }

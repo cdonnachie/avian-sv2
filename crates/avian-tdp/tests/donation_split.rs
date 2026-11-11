@@ -7,7 +7,7 @@
 //! It lives here because it needs both crates and avian-tdp is the one that
 //! depends on the other.
 
-use avian_sv2::address::{parse_identity, Network};
+use avian_sv2::address::{parse_identity, Network, Payout};
 use avian_tdp::coinbase::PayoutPlan;
 
 /// A regtest address from a real node, as the other tests here use.
@@ -18,8 +18,11 @@ const SUBSIDY: u64 = 5_000_000_000;
 
 fn plan_for(identity: &str) -> PayoutPlan {
     let id = parse_identity(identity, Network::Regtest).expect("identity parses");
+    let Payout::Address(address) = id.payout else {
+        panic!("a plain address, not a descriptor");
+    };
     PayoutPlan {
-        worker_script: id.address.script_pubkey(),
+        worker_script: address.script_pubkey(),
         fee_script: vec![0x51],
         fee_basis_points: id.donation_basis_points,
     }
@@ -73,5 +76,8 @@ fn rounding_always_favours_the_miner() {
     let kept = outputs[0].value;
     assert_eq!(kept + donated, odd, "nothing may be burned");
     let exact = (odd as u128 * 333) / 10_000;
-    assert_eq!(donated as u128, exact, "the fee is truncated, not rounded up");
+    assert_eq!(
+        donated as u128, exact,
+        "the fee is truncated, not rounded up"
+    );
 }

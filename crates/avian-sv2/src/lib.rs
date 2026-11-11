@@ -36,6 +36,7 @@
 pub mod address;
 pub mod authority;
 pub mod avian;
+pub mod bip32;
 pub mod block;
 pub mod capi;
 pub mod client;
